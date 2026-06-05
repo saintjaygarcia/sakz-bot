@@ -105,7 +105,7 @@ def run_hist_backtest(
     tf_key:     str  = '4h',
     total_bars: int  = 500,
     min_conf:   int  = 5,
-    exchange:   str  = 'BYBIT',
+    exchange:   str  = 'MEXC',
     fee_pct:    float = FEE_PCT,
 ) -> dict:
     """

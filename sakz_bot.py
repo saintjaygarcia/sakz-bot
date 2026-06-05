@@ -746,7 +746,7 @@ def _pro_format_gainer_card(row: dict, rank: int = 1) -> str:
         "   • Momentum likely to continue short-term\n"
         f"\n"
         f"⚠️ Run /cscan {sym.replace('USDT', '')} for entry zone & stop-loss.\n"
-        "━━━━━━━━━━━━━━��━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━���━━━━━━━━━━━━━━━\n"
         f"📡 /pro alert  ·  /cscan {sym.replace('USDT', '')} for full signal"
     )
 
@@ -1047,18 +1047,89 @@ async def pro_gainers_job(context):
 
 # ── /pro Command handler ────────────────────────────────────────────────────────────
 
+def _pro_full_command_guide() -> str:
+    """Single source of truth for the bot's full PUBLIC command list.
+    Admin/hidden commands (/admin, /optimize, /xgtrain, /rftrain, /dbcheck)
+    and secret commands are intentionally excluded."""
+    return (
+        "📖  SAKZ BOT — FULL COMMAND GUIDE\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Everything the bot can do, in one place.\n\n"
+        "🔭  SCANNING\n"
+        "/scan                Full market scan (4H, top pairs)\n"
+        "/scan BTC            Scan a specific pair\n"
+        "/scan BTC 1h         Specific pair on a custom timeframe\n"
+        "/scan new 24h        New listings scan (m/h/d/w units)\n"
+        "/cscan ZEC           Custom pair scan (auto-detect TF)\n"
+        "/cscan ZEC 15m       Custom pair on 15m / 1h / 4h / 1d\n"
+        "/scalp               Scalp mode — 15M + 1H signals\n"
+        "/scalp ETH           Scalp a specific pair\n"
+        "/swing               Swing mode — 4H + 1D signals\n"
+        "/swing BTC           Swing a specific pair\n"
+        "/scanmid             Mid-market scan (ranks 51-200)\n"
+        "/chart SOL 4h        Chart with full technical analysis\n\n"
+        "🎯  SIGNALS\n"
+        "/best                Highest confidence signal right now\n"
+        "/top5                Top 5 current signals\n"
+        "/top10               Top 10 current signals\n"
+        "/filter LONG 8       Filter by bias + min confidence\n"
+        "/confirm BTC         Re-validate a stored signal live\n"
+        "/tg                  Top 10 gainers (24h)\n"
+        "/tl                  Top 10 losers (24h)\n\n"
+        "💼  TRADE MANAGER\n"
+        "/pick                Track a trade with auto-reminders\n"
+        "/stoptrade           Stop tracking your current trade\n"
+        "/check BTC LONG 98000 95000\n"
+        "                     Validate an open trade vs live data\n"
+        "/pnl                 PnL calculator\n\n"
+        "📊  ANALYTICS\n"
+        "/compare             All signals vs current prices\n"
+        "/compare BTC         One pair — signal vs current price\n"
+        "/stats 168           Win rate stats (24 / 168 / 720 hrs)\n"
+        "/lb 24               Leaderboard (24 / 168 hrs)\n"
+        "/leaderboard 7       Best pairs (7-day leaderboard)\n"
+        "/backtest 720        Backtest over a time window\n"
+        "/fgi                 Fear & Greed Index + guidance\n"
+        "/calibrate BTC       ATR param calibration (adv.)\n\n"
+        "🔔  ALERTS & AUTOMATION\n"
+        "/alert BTCUSDT 8     Alert when confidence >= 8\n"
+        "/unalert BTCUSDT     Remove an alert\n"
+        "/watch BTCUSDT 7     Watchlist — auto-notify on signal\n"
+        "/unwatch BTCUSDT     Remove from watchlist\n"
+        "/autoscan            Toggle periodic auto-scan\n"
+        "/broadcast on|off    Toggle signal auto-posting here\n"
+        "/safemode            Toggle automatic dying-trend alerts\n\n"
+        "🔬  PRO ALERT SUITE\n"
+        "/pro                 Show this full command guide\n"
+        "/pro on | /pro off   Subscribe / unsubscribe to PRO alerts\n"
+        "/pro status          Live PRO tracking stats\n"
+        "/pro alerts          PRO alert suite overview\n\n"
+        "⚙️  GENERAL\n"
+        "/status              Bot health & uptime\n"
+        "/menu                Interactive command menu\n"
+        "/start               Welcome message\n"
+    )
+
+
 async def pro_command(update, context):
     """
-    /pro           — toggle PRO alert subscription on / off
+    /pro           — show the FULL command guide (all public commands + usage)
+    /pro on|off    — subscribe / unsubscribe to PRO alerts
     /pro status    — show live tracking stats
-    /pro help      — feature overview
+    /pro alerts    — PRO alert suite overview
     """
     _track(update)
     chat_id = update.effective_chat.id
     args    = context.args or []
-    cmd     = args[0].lower() if args else "toggle"
+    cmd     = args[0].lower() if args else "guide"
 
-    if cmd in ("help", "info"):
+    # Bare /pro (and /pro help|commands|manual|guide) shows the FULL command guide.
+    if cmd in ("guide", "help", "commands", "command", "manual", "menu", "list", ""):
+        await update.message.reply_text(_pro_full_command_guide())
+        return
+
+    # /pro alerts → PRO alert suite overview
+    if cmd in ("alerts", "alert", "suite", "info"):
         await update.message.reply_text(
             "🔬 PRO ALERT SUITE — OVERVIEW\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1073,9 +1144,10 @@ async def pro_command(update, context):
             "   micro-cap manipulation. Warns you BEFORE\n"
             "   you get dumped on.\n\n"
             "Commands:\n"
-            "  /pro          — toggle alerts on/off\n"
+            "  /pro on/off   — toggle alerts on/off\n"
             "  /pro status   — live tracking stats\n"
-            "  /pro help     — this menu\n\n"
+            "  /pro alerts   — this overview\n"
+            "  /pro          — full command guide\n\n"
             "🚀 Uptrend + 🚨 Manipulation: scans every 30 min\n"
             "🏆 Gainer persistence: checked every 4 hours."
         )
@@ -1090,7 +1162,7 @@ async def pro_command(update, context):
                       if not r["alert_sent"] and r["manip_score"] >= 60])
         badge  = "✅ ACTIVE" if sub else "❌ OFF"
         note   = ("Alerts will fire to you when conditions are met."
-                  if sub else "Use /pro to subscribe.")
+                  if sub else "Use /pro on to subscribe.")
         await update.message.reply_text(
             "🔬 PRO SUITE — STATUS\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1102,21 +1174,31 @@ async def pro_command(update, context):
             f"  🚨 Active manipulation flags: {m_ct}\n\n"
             "⚡ Uptrend/Manipulation: next scan ≤30 min\n"
             "🏆 Gainers: next check ≤4 hours\n"
-            "Use /pro to toggle your subscription."
+            "Use /pro on / /pro off to manage your subscription."
         )
         return
 
     # Toggle ─────────────────────��──────────────────────────────────────────────
-    if db_pro_is_subscribed(chat_id):
-        db_pro_unsubscribe(chat_id)
+    subscribed = db_pro_is_subscribed(chat_id)
+    if cmd == "on":
+        want_off = False
+    elif cmd == "off":
+        want_off = True
+    else:                       # /pro toggle / subscribe / unsubscribe → flip state
+        want_off = subscribed
+
+    if want_off:
+        if subscribed:
+            db_pro_unsubscribe(chat_id)
         await update.message.reply_text(
             "❌ PRO ALERTS DISABLED\n\n"
             "You've been unsubscribed from the PRO alert suite.\n"
-            "Use /pro to re-enable at any time.\n"
+            "Use /pro on to re-enable at any time.\n"
             "Your scan features (/scan, /cscan etc.) are unaffected."
         )
     else:
-        db_pro_subscribe(chat_id)
+        if not subscribed:
+            db_pro_subscribe(chat_id)
         await update.message.reply_text(
             "✅ PRO ALERTS ACTIVATED!\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1131,8 +1213,8 @@ async def pro_command(update, context):
             "   Gainers persistence: every 4 hours\n"
             "   Alerts fire the moment conditions are met.\n\n"
             "Use /pro status to see live tracking stats.\n"
-            "Use /pro help for feature details.\n"
-            "Use /pro to disable."
+            "Use /pro alerts for feature details.\n"
+            "Use /pro off to disable."
         )
 
 
@@ -1174,7 +1256,7 @@ def _safemode_store_signals(chat_id: int, signals: list):
     safemode_last_signals[chat_id] = merged[-_SAFEMODE_MAX_SIGNALS:]
 
 
-# ── Concurrency & caching ─────────────────────
+# ── Concurrency & caching ────────────────────��
 from concurrent.futures import ThreadPoolExecutor
 
 SCAN_EXECUTOR  = ThreadPoolExecutor(max_workers=3)   # max 3 simultaneous scans
@@ -1190,7 +1272,7 @@ _scan_cache_lock   = asyncio.Lock()   # prevents cache stampede
 _btc_regime_cache     = None
 _btc_regime_cache_ttl = 900  # 15 minutes — same as scan cache
 
-# ── BTC Dominance Cache ───────────────────────────────────────────���─────────
+# ── BTC Dominance Cache ───────────────────────────────────────────�����─────────
 # BTC.D rising = capital flowing out of alts → penalise altcoin LONGs
 # Fetched from Bybit BTCDOMUSDT or Binance BTCDOMUSDT (may not always be available)
 # { 'btcd': float, 'trend': 'rising'|'falling'|'flat', 'time': datetime }
@@ -1431,7 +1513,7 @@ def _load_best_params():
 
 
 
-# ─────────────────────────────────────────────
+# ─────────────������──────────────────────────────
 # ─────────────────────────────────────────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
@@ -1612,7 +1694,7 @@ def add_indicators(df, timeframe='4h'):
         df['clv']    = ((2 * c - h - l) / hl_range).fillna(0)
         df['clv_ma'] = df['clv'].rolling(5).mean().shift(1)   # shift: exclude current bar
 
-        # FIX #9 — use window=5 for 4H (crypto moves fast); daily stays at 14
+        # FIX #9 �� use window=5 for 4H (crypto moves fast); daily stays at 14
         stoch_window = 5 if timeframe == '4h' else 14
         stoch        = ta.momentum.StochasticOscillator(h, l, c, window=stoch_window, smooth_window=3)
         df['stoch_k'] = stoch.stoch()
@@ -1874,7 +1956,7 @@ def get_btc_regime():
 # it's technically still mid-Asian-close, because the London open is the dominant
 # driver in that window.  The OVERLAP tag is given to 12:00–17:00 only, when both
 # London and NY are simultaneously active — this is the cleanest trend window.
-# ─────────────────────────────────────────────
+# ────────────────────────���────────────────────
 def session_context() -> dict:
     """
     Returns the current trading session and a score modifier for the signal bias.
@@ -2341,7 +2423,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         elif macd_d < 0:
             cross_g_s+=1; sr.append("MACD bearish Daily [closed candle]")
 
-        # ── EMA → position bucket ───────────────────────────────────────
+        # ── EMA → position bucket ───────────────────────────────��───��───
         if price > ema20 > ema50:   pos_g_l+=2; lr.append("Bullish EMA stack 4H")
         elif price < ema20 < ema50: pos_g_s+=2; sr.append("Bearish EMA stack 4H")
         elif price > ema20:         pos_g_l+=1; lr.append("Price above EMA20 4H")
@@ -2713,7 +2795,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         # through with a warning so /scan always shows the full analysis.
         regime_warning = None
 
-        # ── FIX #BTCD — BTC Dominance Filter ──────────────────────────
+        # ���─ FIX #BTCD — BTC Dominance Filter ──────────────────────────
         # BTC.D rising = capital rotating from alts to BTC → alt LONGs face headwind.
         # Apply a confidence penalty of −1 for altcoin LONGs when BTC.D is rising.
         # Attach a warning note; never hard-block (user may know why they're trading).
@@ -4229,6 +4311,23 @@ def run_full_scan():
         corr_long_count, corr_short_count, indep_count,
         over_cap, portfolio_summary['risk_level']
     )
+
+    # ── USER DIRECTIVE — ABANDON conflicting over-correlated signals ─────────
+    # Previously the gate only TAGGED over-cap correlated signals with ⚠️ and
+    # still displayed them.  Per user request we now DROP them entirely and keep
+    # only the optimum set:
+    #   • the top CORRELATED_SLOT_CAP regime-aligned signals per direction
+    #     (highest-confidence, since `results` is already sorted best-first), and
+    #   • all independent / counter-regime / NEUTRAL signals.
+    # Conflicting duplicates (corr_flagged == True) are no longer signalled.
+    _pre_filter_count = len(results)
+    results = [r for r in results if not r.get('corr_flagged')]
+    _dropped_corr = _pre_filter_count - len(results)
+    if _dropped_corr:
+        logger.info(
+            "Correlation gate: dropped %d conflicting over-correlated signal(s) "
+            "(kept %d optimum)", _dropped_corr, len(results)
+        )
 
     last_scan_results = results
     last_scan_time    = datetime.now()
@@ -6087,7 +6186,7 @@ def format_signal_details(r, rank):
     corr_type    = r.get('corr_type', 'independent')
     corr_slot    = r.get('corr_slot', 1)
     corr_flagged = r.get('corr_flagged', False)
-    cap          = 4
+    cap          = 3
     if corr_type in ('correlated_long', 'correlated_short'):
         direction = 'LONG' if corr_type == 'correlated_long' else 'SHORT'
         if corr_flagged:
@@ -6335,7 +6434,7 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     corr_type    = r.get('corr_type', 'independent')
     corr_slot    = r.get('corr_slot', 1)
     corr_flagged = r.get('corr_flagged', False)
-    cap          = 4   # CORRELATED_SLOT_CAP
+    cap          = 3   # CORRELATED_SLOT_CAP
     if corr_type in ('correlated_long', 'correlated_short'):
         direction = 'LONG' if corr_type == 'correlated_long' else 'SHORT'
         if corr_flagged:
@@ -7333,40 +7432,8 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             "❓ *FULL COMMAND REFERENCE*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "🔍 *Scanning*\n"
-            "`/scan`              Full market scan — *4H timeframe only*\n"
-            "`/cscan ZEC`         Custom scan — auto-detects best timeframe\n"
-            "`/cscan ZEC 15m`     Custom scan on *15-min* (scalp, mins–2h hold)\n"
-            "`/cscan ZEC 1h`      Custom scan on *1H* (intraday, 30min–8h hold)\n"
-            "`/cscan ZEC 4h`      Custom scan on *4H* (swing, 4h–3d hold)\n"
-            "`/cscan ZEC 1d`      Custom scan on *Daily* (position, 1d–2wk hold)\n"
-            "`/top5`              Top 5 signals from last scan\n"
-            "`/top10`             Top 10 signals from last scan\n"
-            "`/best`              Best signal right now\n"
-            "`/filter LONG 8`     Filter by bias & confidence\n"
-            "`/chart SOL`         TA chart image\n\n"
-            "🔔 *Alerts & Tracking*\n"
-            "`/alert BTCUSDT 8`  Coin alert at conf ≥8\n"
-            "`/unalert BTCUSDT`  Remove alert\n"
-            "`/watch BTCUSDT 7`  Add to watchlist\n"
-            "`/unwatch BTCUSDT`  Remove from watchlist\n"
-            "`/autoscan`         Toggle 4h auto-scan\n"
-            "`/broadcast on`     Auto-post to channel\n"
-            "`/pick`             Pick & track a trade\n"
-            "`/stoptrade`        Stop trade reminders\n"
-            "`/pnl`              PnL calculator\n\n"
-            "📊 *Performance*\n"
-            "`/stats 168`        Win rate (7 days)\n"
-            "`/backtest`         Confidence calibration analysis\n"
-            "`/lb`               Leaderboard (short alias)\n"
-            "`/lb 7`             Best pairs (7 days)\n"
-            "`/tg`               Top gainers 24h\n"
-            "`/tl`               Top losers 24h\n"
-            "`/compare`          PnL vs entry prices\n\n"
-            "ℹ️ *Info*\n"
-            "`/status`           Bot status\n"
-            "`/menu`             This menu\n\n"
-            "_Trend-dying alerts fire automatically when your tracked trade weakens._",
+            "The complete command list now lives under a single command.\n\n"
+            "👉  Type /pro to see *all* commands and how to use them.",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -7507,7 +7574,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to Sakz Scan Bot!\n\n"
         "Crypto perpetuals scanner for\n"
         "Bybit, MEXC & Binance — free, no API key needed.\n\n"
-        "📋 /menu — see all commands\n"
+        "📋 /pro — see all commands\n"
         "🔍 /scan — run your first scan\n"
         "🔔 /autoscan — auto-updates every 4h\n\n"
         "⏳ First scan takes 5–10 minutes."
@@ -10030,7 +10097,7 @@ def snail_score_signal(r, df4h, df1d, funding):
                 elif rank and rank > 500:
                     fa_score -= 5;  fa_notes.append(f"⚠️ Rank #{rank} — small cap, higher manipulation risk")
                     manip_risk += 10
-                    manip_notes.append(f"🚩 Small-cap asset (rank #{rank}) — easier to manipulate")
+                    manip_notes.append(f"🚩 Small-cap asset (rank #{rank}) ��� easier to manipulate")
 
                 dev = cg.get('developer_data', {})
                 commits = dev.get('commit_count_4_weeks', 0) or 0
@@ -13388,9 +13455,10 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "📘  S A K Z B O T  —  U S E R  M A N U A L\n"
+        "📘  S A K Z B O T  —  C O M M A N D S\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + scanning + signals + trade + analytics + automation + general
+        "The full command guide now lives under a single command.\n\n"
+        "👉  Type /pro to see ALL commands and how to use them."
     )
 
 
@@ -14158,7 +14226,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── All other unknown commands → generic nudge ───────────────────────────
     await update.message.reply_text(
-        "❓ Unknown command.\n\nType /menu to see all available commands."
+        "❓ Unknown command.\n\nType /pro to see all available commands."
     )
 
 
