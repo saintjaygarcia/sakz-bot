@@ -28,14 +28,93 @@ if _USE_TURSO:
         _USE_TURSO = False
 
 
+# FIX M1 — libsql_experimental (Turso) ignores conn.row_factory, so fetched rows
+# come back as plain tuples and every row['col'] access (400+ across the codebase)
+# would raise. These thin wrappers convert rows to a dict-like object supporting
+# BOTH row['col'] and row[0], with zero changes to call sites. Only the Turso
+# path is wrapped; the local-sqlite path keeps native sqlite3.Row.
+class _DictRow:
+    __slots__ = ("_map", "_vals")
+    def __init__(self, cols, vals):
+        self._vals = tuple(vals)
+        self._map = {c: self._vals[i] for i, c in enumerate(cols)}
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._vals[key]
+        return self._map[key]
+    def get(self, key, default=None):
+        return self._map.get(key, default)
+    def keys(self):
+        return list(self._map.keys())
+    def __contains__(self, key):
+        return key in self._map
+    def __iter__(self):
+        return iter(self._vals)
+    def __len__(self):
+        return len(self._vals)
+    def __repr__(self):
+        return "_DictRow(%r)" % (self._map,)
+
+
+class _CursorWrapper:
+    def __init__(self, cur):
+        self._cur = cur
+    def _cols(self):
+        return [d[0] for d in self._cur.description] if self._cur.description else []
+    def execute(self, *a, **k):
+        self._cur.execute(*a, **k)
+        return self
+    def executemany(self, *a, **k):
+        self._cur.executemany(*a, **k)
+        return self
+    def executescript(self, *a, **k):
+        return self._cur.executescript(*a, **k)
+    def fetchone(self):
+        r = self._cur.fetchone()
+        return None if r is None else _DictRow(self._cols(), r)
+    def fetchall(self):
+        cols = self._cols()
+        return [_DictRow(cols, r) for r in self._cur.fetchall()]
+    def fetchmany(self, *a, **k):
+        cols = self._cols()
+        return [_DictRow(cols, r) for r in self._cur.fetchmany(*a, **k)]
+    def __iter__(self):
+        cols = self._cols()
+        for r in self._cur:
+            yield _DictRow(cols, r)
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _ConnWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+    def execute(self, *a, **k):
+        return _CursorWrapper(self._conn.execute(*a, **k))
+    def executescript(self, *a, **k):
+        return self._conn.executescript(*a, **k)
+    def cursor(self):
+        return _CursorWrapper(self._conn.cursor())
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def db_connect():
     if _USE_TURSO and libsql:
         conn = libsql.connect(
             database=TURSO_URL,
             auth_token=TURSO_TOKEN,
         )
-        conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row  # harmless if libsql ever honors it
+        except Exception:
+            pass
+        return _ConnWrapper(conn)   # FIX M1 — dict-row adapter for Turso path
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn

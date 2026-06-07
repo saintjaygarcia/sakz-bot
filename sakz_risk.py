@@ -12,6 +12,8 @@ Implements:
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 
@@ -128,15 +130,37 @@ class DrawdownGate:
     """
     threshold: float = 0.15
     peak_equity: float = 0.0
+    # FIX #7 — reject implausible equity spikes (> peak * this factor) so a bad
+    # high can never poison peak_equity.
+    max_jump_factor: float = 2.0
 
-    def update(self, equity: float) -> None:
+    def _is_valid_equity(self, equity) -> bool:
+        """True only for a finite, positive, non-spike equity reading."""
+        try:
+            e = float(equity)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(e) or e <= 0.0:
+            return False
+        if self.peak_equity > 0 and e > self.peak_equity * self.max_jump_factor:
+            return False
+        return True
+
+    def update(self, equity: float) -> bool:
+        # Only advance the peak on a validated reading; returns False if the
+        # value was rejected (inf/NaN/<=0/implausible spike).
+        if not self._is_valid_equity(equity):
+            return False
         if equity > self.peak_equity:
             self.peak_equity = equity
+        return True
 
     def drawdown(self, equity: float) -> float:
         return portfolio_drawdown(self.peak_equity, equity)
 
     def can_open(self, equity: float) -> bool:
-        # Update peak first so a fresh high never reads as a drawdown.
+        # FIX #7 — validate BEFORE touching peak; invalid equity fails closed.
+        if not self._is_valid_equity(equity):
+            return False
         self.update(equity)
         return self.drawdown(equity) < self.threshold

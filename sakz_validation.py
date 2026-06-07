@@ -11,8 +11,10 @@ from typing import Sequence
 
 import numpy as np
 
-WIN_OUTCOMES = ("t1_hit", "t2_hit", "t3_hit")
-LOSS_OUTCOMES = ("sl_hit",)
+# FIX #6 — single source of truth for outcome tuples (previously duplicated
+# here and in sakz_risk.py, which risked silent drift). sakz_risk is pure
+# stdlib so importing it here adds no heavy dependency.
+from sakz_risk import WIN_OUTCOMES, LOSS_OUTCOMES
 
 
 def walk_forward_splits(

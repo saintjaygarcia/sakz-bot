@@ -17,6 +17,11 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:  # pragma: no cover - very old urllib3 layout
+    from requests.packages.urllib3.util.retry import Retry
 import pandas as pd
 import ta
 import io
@@ -72,6 +77,43 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ─────────────────────────────────────────────
 load_dotenv()
+
+# FIX #8 — one shared HTTP session with automatic retry + backoff so transient
+# network blips / 429 / 5xx no longer bubble up as bogus empty or "neutral"
+# scan results. Drop-in: every http_get(...) below is routed via http_get().
+HTTP_RETRIES = int(os.environ.get("SAKZ_HTTP_RETRIES", "3"))
+HTTP_BACKOFF = float(os.environ.get("SAKZ_HTTP_BACKOFF", "0.5"))
+HTTP_TIMEOUT = int(os.environ.get("SAKZ_HTTP_TIMEOUT", "15"))
+
+
+def _make_retry():
+    common = dict(
+        total=HTTP_RETRIES, connect=HTTP_RETRIES, read=HTTP_RETRIES,
+        status=HTTP_RETRIES, backoff_factor=HTTP_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504), raise_on_status=False,
+    )
+    try:
+        return Retry(allowed_methods=frozenset(["GET", "POST"]), **common)
+    except TypeError:                     # older urllib3 used method_whitelist
+        return Retry(method_whitelist=frozenset(["GET", "POST"]), **common)
+
+
+def _build_http_session():
+    s = requests.Session()
+    adapter = HTTPAdapter(max_retries=_make_retry())
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+_HTTP_SESSION = _build_http_session()
+
+
+def http_get(url, **kwargs):
+    """Drop-in replacement for requests.get with retry/backoff + default timeout."""
+    kwargs.setdefault("timeout", HTTP_TIMEOUT)
+    return _HTTP_SESSION.get(url, **kwargs)
+
 
 # === Extracted data-access layer (sakz_db.py) ===
 from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
@@ -212,11 +254,25 @@ PICK_TRADE   = 1
 ASK_REMINDER = 2
 ASK_INTERVAL = 3
 
+# FIX H3 — bound the per-chat caches so they can't grow without limit (OOM guard).
+class _BoundedDict(dict):
+    """dict with FIFO eviction once it exceeds max_size entries."""
+    def __init__(self, max_size=2000):
+        super().__init__()
+        self._max_size = max_size
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= self._max_size:
+            try:
+                del self[next(iter(self))]
+            except StopIteration:
+                pass
+        super().__setitem__(key, value)
+
 # Custom scan results per chat { chat_id: [signals] }
-cscan_results    = {}
+cscan_results    = _BoundedDict(2000)
 # Stores per-chat scan context so any Refresh knows which result set to use.
 # Key: chat_id  Value: {'source': 'scan'|'scalp'|'swing'|'custom', 'results': [...], 'title': str}
-_chat_scan_ctx   = {}
+_chat_scan_ctx   = _BoundedDict(2000)
 # Snapshot taken at scan time for /compare PnL { chat_id: {symbol: {entry_price, leverage, bias, scan_time}} }
 compare_snapshot = {}
 # Signal card cache for Details/Back button { cache_key: {signal, rank, primary_kb} }
@@ -350,7 +406,7 @@ def _pro_fetch_top_gainers(limit: int = 20) -> list:
             "?vs_currency=usd&order=price_change_percentage_24h_desc"
             f"&per_page={limit}&page=1&sparkline=false"
         )
-        resp = requests.get(url, timeout=10, headers=HEADERS)
+        resp = http_get(url, timeout=10, headers=HEADERS)
         if resp.status_code == 200:
             for c in resp.json():
                 chg = c.get("price_change_percentage_24h", 0) or 0
@@ -369,9 +425,9 @@ def _pro_fetch_top_gainers(limit: int = 20) -> list:
     except Exception as _e:
         logger.debug("_pro_fetch_top_gainers CoinGecko: %s", _e)
 
-    # MEXC fallback ─────────────────────────────────────────────────────────────
+    # MEXC fallback ───────────────────────────��─────────────────────────────────
     try:
-        resp = requests.get(
+        resp = http_get(
             "https://api.mexc.com/api/v3/ticker/24hr", timeout=10, headers=HEADERS
         )
         if resp.status_code == 200:
@@ -615,7 +671,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
         # 5-7 — CoinGecko fundamentals (best-effort) ────────────────────────────
         try:
             slug    = symbol.replace("USDT", "").lower()
-            cg_resp = requests.get(
+            cg_resp = http_get(
                 f"https://api.coingecko.com/api/v3/coins/{slug}",
                 timeout=6, headers=HEADERS
             )
@@ -734,7 +790,7 @@ def _pro_format_gainer_card(row: dict, rank: int = 1) -> str:
     return (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🏆 PRO ALERT — PERSISTENT TOP-10 GAINER\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━\n"
         f"#{rank}  {sym}\n"
         f"\n"
         f"📈 IN TOP-10 GAINERS:  {times}x check(s)\n"
@@ -827,7 +883,7 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
     if not HEALTH_CHECK_URL:
         return
     try:
-        requests.get(HEALTH_CHECK_URL, timeout=5)
+        http_get(HEALTH_CHECK_URL, timeout=5)
         logger.debug("Heartbeat ping sent ✅")
     except Exception as e:
         logger.warning("Heartbeat ping failed: %s", e)
@@ -1416,7 +1472,7 @@ except ImportError:
     _OPTIMIZE_AVAILABLE = False
     logger.warning("optimize.py not found — /optimize disabled")
 
-# ─────────────────────────────────────────────
+# ───────────��─────────────────────────────────
 # HISTORICAL WALK-FORWARD BACKTEST — sakz_backtest_hist.py
 # ─────────────────────────────────────────────
 try:
@@ -1513,7 +1569,7 @@ def _load_best_params():
 
 
 
-# ─────────────������──────────────────────────────
+# ─────────────��������──────────────────────────────
 # ─────────────────────────────────────────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
@@ -2084,7 +2140,7 @@ def fib_confluence_score(df, price: float, support: float, resistance: float,
 
         swing_range = sh_price - sl_price
         if swing_range < atr * 0.5:
-            # Swing range too small to be meaningful — skip
+            # Swing range too small to be meaningful �� skip
             return 0, [], ""
 
         # Compute Fibonacci levels (retracement from the swing extremes)
@@ -2423,7 +2479,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         elif macd_d < 0:
             cross_g_s+=1; sr.append("MACD bearish Daily [closed candle]")
 
-        # ── EMA → position bucket ───────────────────────────────��───��───
+        # ── EMA → position bucket ─────────────────────────────��─��───��───
         if price > ema20 > ema50:   pos_g_l+=2; lr.append("Bullish EMA stack 4H")
         elif price < ema20 < ema50: pos_g_s+=2; sr.append("Bearish EMA stack 4H")
         elif price > ema20:         pos_g_l+=1; lr.append("Price above EMA20 4H")
@@ -3197,7 +3253,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
 #   binance_pri  — Binance interval string for primary
 #   binance_con  — Binance interval string for confirmation
 #   min_candles  — minimum closed candles required on the primary TF
-#   label        — human-readable label shown in signals
+#   label        ��� human-readable label shown in signals
 #   hold_map     — dur_score → (hold_hours, hold_label) overrides for this TF
 #   weight       — confidence multiplier when auto-selecting best TF
 #                  (lower TFs get slight penalty to avoid noise dominance)
@@ -4059,7 +4115,7 @@ def _get_symbol_volume(exchange: str, symbol: str) -> float:
     vol = 0.0
     try:
         if exchange == 'BYBIT':
-            r    = requests.get(
+            r    = http_get(
                 f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}",
                 headers=HEADERS, timeout=8
             )
@@ -4069,7 +4125,7 @@ def _get_symbol_volume(exchange: str, symbol: str) -> float:
 
         elif exchange == 'MEXC':
             _sym_c = symbol.upper().replace('_USDT', 'USDT'); futures_sym = (_sym_c[:-4] + '_USDT') if _sym_c.endswith('USDT') else (_sym_c + '_USDT')
-            r    = requests.get(
+            r    = http_get(
                 f"https://contract.mexc.com/api/v1/contract/ticker?symbol={futures_sym}",
                 headers=HEADERS, timeout=8
             )
@@ -4079,7 +4135,7 @@ def _get_symbol_volume(exchange: str, symbol: str) -> float:
                 vol = float(d.get('amount24', 0) or d.get('volume24', 0) or 0)
 
         elif exchange == 'BINANCE':
-            r    = requests.get(
+            r    = http_get(
                 f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}",
                 headers=HEADERS, timeout=8
             )
@@ -4140,7 +4196,7 @@ def run_full_scan():
             import time as _t
             now = _t.time()
             if exchange == 'BYBIT':
-                r    = requests.get("https://api.bybit.com/v5/market/tickers?category=linear",
+                r    = http_get("https://api.bybit.com/v5/market/tickers?category=linear",
                                     headers=HEADERS, timeout=15)
                 data = r.json()
                 if data.get('retCode') == 0:
@@ -4150,7 +4206,7 @@ def run_full_scan():
                             vol = float(t.get('turnover24h', 0) or 0)
                             _vol_cache[f"BYBIT_{sym}"] = (vol, now)
             elif exchange == 'MEXC':
-                r    = requests.get("https://contract.mexc.com/api/v1/contract/ticker",
+                r    = http_get("https://contract.mexc.com/api/v1/contract/ticker",
                                     headers=HEADERS, timeout=15)
                 data = r.json()
                 if data.get('success') and data.get('data'):
@@ -4161,7 +4217,7 @@ def run_full_scan():
                             vol = float(t.get('amount24', 0) or 0)
                             _vol_cache[f"MEXC_{clean_sym}"] = (vol, now)
             elif exchange == 'BINANCE':
-                r    = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
+                r    = http_get("https://fapi.binance.com/fapi/v1/ticker/24hr",
                                     headers=HEADERS, timeout=15)
                 for t in r.json():
                     sym = t.get('symbol', '')
@@ -5688,7 +5744,10 @@ async def mid_scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     # Refresh the cache so the next continuous_scan_job tick sees the mid-tier
     # signals and pushes any that clear the confidence gate.
-    _scan_cache = {'results': merged, 'time': datetime.now()}
+    # FIX C2 — write under the cache lock so this can't race with
+    # get_scan_results()/continuous_scan_job readers (torn/partial cache).
+    async with _scan_cache_lock:
+        _scan_cache = {'results': merged, 'time': datetime.now()}
     logger.info("mid_scan_job merged %d new mid-tier signals into scan cache (%d total)",
                 added, len(merged))
 
@@ -6121,7 +6180,7 @@ def format_signal_details(r, rank):
     lines = [
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"#{rank}  {exchange} | {r['symbol']}  [{c['tf_label']}] — DETAILS",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━���━━━━━━━",
         f"",
         regime_line,
         f"",
@@ -6461,7 +6520,7 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─────────────────────────────────────────────
 # TRADE REMINDER JOB
-# ─────────────────────────────────────────────
+# ───────────────────��─────────────────────────
 async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     chat_id  = context.job.chat_id
     trade_id = (context.job.data or {}).get('trade_id')
@@ -6998,7 +7057,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
         f"   Move: {sl_pct:+.2f}%  →  {'🔴 -$' if sl_pnl < 0 else '🟢 +$'}{abs(sl_pnl):,.2f}",
         f"",
         f"🎯 Target 1    ${t1:.6f}",
-        f"   Move: {t1_pct:+.2f}%  →  🟢 +${t1_pnl:,.2f}",
+        f"   Move: {t1_pct:+.2f}%  ��  🟢 +${t1_pnl:,.2f}",
         f"",
         f"🎯 Target 2    ${t2:.6f}",
         f"   Move: {t2_pct:+.2f}%  →  🟢 +${t2_pnl:,.2f}",
@@ -7020,6 +7079,145 @@ def build_pnl_card(signal, leverage, capital, custom=False):
     return "\n".join(lines)
 
 
+def render_pnl_card_image(signal, current_price, leverage, capital=None):
+    """Render a branded live-PnL card as PNG bytes (matplotlib).
+
+    Shows leveraged PnL %. The $ amount is included only when `capital` is given.
+    """
+    from matplotlib.patches import FancyBboxPatch, Rectangle
+
+    # Palette — intentionally distinct from the other cards in this bot.
+    BG_OUTER  = "#05070A"
+    PANEL     = "#0E1318"
+    PANEL_EDG = "#1E2730"
+    ACCENT    = "#F0A91B"   # amber brand accent
+    GREEN     = "#2ECC71"
+    RED       = "#E74C3C"
+    WHITE     = "#F5F7FA"
+    GRAY      = "#7A8794"
+
+    name = os.environ.get("BOT_NAME", "SAKZ").upper()
+
+    entry = float(signal.get('price') or 0) or current_price
+    bias  = str(signal.get('bias', 'LONG')).upper()
+    if entry > 0:
+        raw_pct = ((current_price - entry) / entry * 100) if bias == 'LONG' \
+                  else ((entry - current_price) / entry * 100)
+    else:
+        raw_pct = 0.0
+    lev_pct = raw_pct * leverage
+    up      = lev_pct >= 0
+    pnl_col = GREEN if up else RED
+
+    raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
+    disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith('USDT') else raw_sym
+    exch     = str(signal.get('exchange', '')).upper()
+    exit_lbl = str(signal.get('exit_mode') or signal.get('exit') or 'Manual')
+
+    pct_str = f"{lev_pct:+.2f}%"
+    dollar_str = None
+    if capital:
+        dollar = capital * lev_pct / 100.0
+        dollar_str = f"{'+' if dollar >= 0 else '-'}${abs(dollar):,.2f}"
+
+    fig = plt.figure(figsize=(9, 4.8), dpi=200, facecolor=BG_OUTER)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+
+    # Panel
+    ax.add_patch(FancyBboxPatch(
+        (0.025, 0.05), 0.95, 0.90,
+        boxstyle="round,pad=0.0,rounding_size=0.03",
+        linewidth=1.2, edgecolor=PANEL_EDG, facecolor=PANEL,
+        transform=ax.transAxes))
+
+    # Brand lockup: accent tick + wordmark
+    ax.add_patch(FancyBboxPatch(
+        (0.060, 0.852), 0.016, 0.052,
+        boxstyle="round,pad=0.0,rounding_size=0.010",
+        linewidth=0, facecolor=ACCENT, transform=ax.transAxes))
+    ax.text(0.088, 0.878, name, color=WHITE, fontsize=15, fontweight='bold',
+            va='center', ha='left')
+
+    # Exchange (top-right)
+    ax.text(0.940, 0.878, exch, color=GRAY, fontsize=11, va='center', ha='right')
+
+    # Symbol
+    ax.text(0.060, 0.700, disp_sym, color=WHITE, fontsize=27, fontweight='bold',
+            va='center', ha='left')
+
+    # PnL highlight box + accent bar + big %
+    ax.add_patch(FancyBboxPatch(
+        (0.052, 0.452), 0.34, 0.150,
+        boxstyle="round,pad=0.0,rounding_size=0.02",
+        linewidth=0, facecolor=pnl_col, alpha=0.10, transform=ax.transAxes))
+    ax.add_patch(Rectangle((0.052, 0.452), 0.012, 0.150, facecolor=pnl_col,
+                           edgecolor='none', transform=ax.transAxes))
+    ax.text(0.085, 0.527, pct_str, color=pnl_col, fontsize=30, fontweight='bold',
+            va='center', ha='left')
+
+    # Dollar amount (top-right, below exchange) — only when capital provided
+    if dollar_str:
+        ax.text(0.940, 0.610, dollar_str, color=pnl_col, fontsize=18,
+                fontweight='bold', va='center', ha='right')
+
+    # Divider
+    ax.plot([0.060, 0.940], [0.360, 0.360], color=PANEL_EDG, lw=1.0,
+            transform=ax.transAxes)
+
+    # Detail row: EXIT | LEVERAGE
+    ax.text(0.060, 0.285, "EXIT", color=GRAY, fontsize=9.5, va='center', ha='left')
+    ax.text(0.060, 0.205, exit_lbl, color=WHITE, fontsize=14, va='center', ha='left')
+    ax.text(0.520, 0.285, "LEVERAGE", color=GRAY, fontsize=9.5, va='center', ha='left')
+    ax.text(0.520, 0.205, f"{leverage}x", color=WHITE, fontsize=14, va='center', ha='left')
+
+    # Bottom accent line (decorative)
+    ax.add_patch(Rectangle((0.060, 0.080), 0.090, 0.008, facecolor=ACCENT,
+                           edgecolor='none', transform=ax.transAxes))
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=BG_OUTER, edgecolor='none')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+async def send_pnl_image_card(update, context):
+    """Fetch live price, render the branded PnL card image, and send it with buttons."""
+    msg = update.effective_message
+    signal = context.user_data.get('pnl_signal')
+    if not signal:
+        await msg.reply_text("⚠️ Signal data lost. Run /pnl again.")
+        return
+
+    capital  = context.user_data.get('pnl_capital')
+    lev_data = signal.get('leverage')
+    leverage = lev_data['suggested'] if lev_data else 10
+
+    current = _get_live_price(signal['symbol'], signal.get('exchange', ''))
+    if not current or current <= 0:
+        await msg.reply_text("⚠️ Couldn't fetch the live price right now. Try again in a moment.")
+        return
+
+    try:
+        png = render_pnl_card_image(signal, current, leverage, capital)
+    except Exception as e:
+        logger.exception("PnL card render failed")
+        await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
+        return
+
+    raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
+    cap_note = f" • capital ${capital:,.0f}" if capital else ""
+    caption  = f"📈 Live PnL • {signal.get('exchange', '')} {raw_sym} • {leverage}x{cap_note}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 Add capital", callback_data="pnlimg_cap"),
+         InlineKeyboardButton("🔄 Refresh",     callback_data="pnlimg_refresh")],
+        [InlineKeyboardButton("✅ Done",         callback_data="pnlimg_done")],
+    ])
+    await msg.reply_photo(photo=io.BytesIO(png), caption=caption, reply_markup=keyboard)
+
+
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point — user picks a signal to calculate PnL for."""
     _track(update)
@@ -7029,7 +7227,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total = len(last_scan_results)
-    lines = [f"💰 PNL CALCULATOR\n\nPick a signal:\n"]
+    lines = [f"��� PNL CALCULATOR\n\nPick a signal:\n"]
     for i, r in enumerate(last_scan_results[:20], 1):
         emoji  = "🟢" if r['bias'] == "LONG" else "🔴"
         lev    = r.get('leverage')
@@ -7056,14 +7254,24 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             if n < 1 or n > len(last_scan_results):
                 await update.message.reply_text(f"⚠️ Enter 1–{len(last_scan_results)}.")
                 return
-            context.user_data['pnl_signal'] = last_scan_results[n - 1]
-            context.user_data['pnl_step']   = 'capital'
-            await update.message.reply_text(
-                "💵 How much capital are you trading with? (USDT)\n"
-                "Examples: 50  100  500  1000"
-            )
+            context.user_data['pnl_signal']  = last_scan_results[n - 1]
+            context.user_data['pnl_capital'] = None
+            context.user_data['pnl_step']    = None   # image PnL-card flow takes over
+            await send_pnl_image_card(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Reply with a number only.")
+
+    elif step == 'pnlimg_capital':
+        try:
+            capital = float(text.replace(',', ''))
+            if capital <= 0:
+                await update.message.reply_text("⚠️ Capital must be greater than 0.")
+                return
+            context.user_data['pnl_capital'] = capital
+            context.user_data['pnl_step']    = None
+            await send_pnl_image_card(update, context)
+        except ValueError:
+            await update.message.reply_text("⚠️ Enter a valid number (e.g. 100 or 500).")
 
     elif step == 'capital':
         try:
@@ -7145,6 +7353,29 @@ async def pnl_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # ─────────────────────────────────────────────
 # /best
 # ─────────────────────────────────────────────
+async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons under the image PnL card: add capital / refresh / done."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'pnlimg_cap':
+        if not context.user_data.get('pnl_signal'):
+            await query.message.reply_text("⚠️ Signal data lost. Run /pnl again.")
+            return
+        context.user_data['pnl_step'] = 'pnlimg_capital'
+        await query.message.reply_text(
+            "💵 Enter your capital in USDT (e.g. 100, 500, 1000):"
+        )
+    elif data == 'pnlimg_refresh':
+        await send_pnl_image_card(update, context)
+    elif data == 'pnlimg_done':
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     if not last_scan_results:
@@ -7912,7 +8143,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /top[n]
-# ─────────────────────────────────────────────
+# ────────────────────��────────────────────────
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     text  = update.message.text.strip()
@@ -8200,7 +8431,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _chat_scan_ctx[chat_id] = {
                     'source':   'custom',
                     'results':  valid_regime,
-                    'title':    f"📡 {best_r['symbol']}  [{tf_display}]",
+                    'title':    f"���� {best_r['symbol']}  [{tf_display}]",
                     'max_show': 15,
                 }
                 _safemode_store_signals(chat_id, valid_regime)
@@ -9311,7 +9542,7 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
 
     total_done = winners + losers
     lines.append(f"{'━'*30}")
-    lines.append(f"🟢 Winning: {winners}  🔴 Losing: {losers}  📊 Tracked: {total_done}")
+    lines.append(f"�� Winning: {winners}  🔴 Losing: {losers}  📊 Tracked: {total_done}")
     if best_pnl[0]:  lines.append(f"🏆 Best:  {best_pnl[0]}  {best_pnl[1]:+.2f}%")
     if worst_pnl[0]: lines.append(f"💀 Worst: {worst_pnl[0]}  {worst_pnl[1]:+.2f}%")
     lines.append(f"\n💡 /compare ZEC — track a specific pair")
@@ -9328,7 +9559,7 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
 
 
 # Filters out signals older than their hold_hours
-# ─────────────────────────────────────────────
+# ───────────────��─────────────────────────────
 def filter_live_signals(results):
     """Return signals that have not yet exceeded their recommended hold duration."""
     now = datetime.now()
@@ -10084,7 +10315,7 @@ def snail_score_signal(r, df4h, df1d, funding):
         coin_slug = r['symbol'].replace('USDT','').lower()
         try:
             cg_url  = f"https://api.coingecko.com/api/v3/coins/{coin_slug}"
-            cg_resp = requests.get(cg_url, timeout=8, headers=HEADERS)
+            cg_resp = http_get(cg_url, timeout=8, headers=HEADERS)
             if cg_resp.status_code == 200:
                 cg  = cg_resp.json()
                 mkt = cg.get('market_data', {})
@@ -10664,7 +10895,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════���═══════════════════════════════════════════════════════
 # ── FEATURE BLOCK — v5 additions ────────────────────────────────
 # 1. Timeframe argument for /scan and /cscan  (e.g. /scan t15m)
 # 2. Trend-dying notification job
@@ -10755,7 +10986,7 @@ def _cscan_pair_tf(symbol: str, tf: str):
                 # Spot 1d fallback
                 logger.debug("MEXC %s: futures 1d thin — trying spot 1d", symbol)
                 try:
-                    r_spot    = requests.get(
+                    r_spot    = http_get(
                         "https://api.mexc.com/api/v3/klines",
                         params={'symbol': symbol, 'interval': '1d', 'limit': 60},
                         headers=HEADERS, timeout=15
@@ -11159,7 +11390,7 @@ def _get_new_listings_mexc(since_seconds: int):
     Returns list of symbol strings (BTCUSDT format).
     """
     try:
-        r    = requests.get("https://contract.mexc.com/api/v1/contract/ticker",
+        r    = http_get("https://contract.mexc.com/api/v1/contract/ticker",
                             headers=HEADERS, timeout=15)
         data = r.json()
         if not data.get('success') or not data.get('data'):
@@ -11178,7 +11409,7 @@ def _get_new_listings_mexc(since_seconds: int):
                     continue
                 clean = sym.replace('_USDT', 'USDT')
                 # Probe: fetch 1D candles and check how far back data goes
-                r2 = requests.get(
+                r2 = http_get(
                     f"https://contract.mexc.com/api/v1/contract/kline/{sym}",
                     params={'interval': 'Day1', 'limit': 10},
                     headers=HEADERS, timeout=8
@@ -11211,7 +11442,7 @@ def _get_new_listings_bybit(since_seconds: int):
     if sakz_exchanges.BYBIT_AVAILABLE is False:
         return []
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/instruments-info",
+        r    = http_get("https://api.bybit.com/v5/market/instruments-info",
                             params={'category': 'linear', 'limit': 1000},
                             headers=HEADERS, timeout=15)
         data = r.json()
@@ -11674,7 +11905,7 @@ async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
 
-# ─── SNAIL 2x TARGET — leverage-aware ─────────────────────────
+# ─── SNAIL 2x TARGET — leverage-aware ���────────────────────────
 def _snail_2x_target(r: dict) -> tuple[float, str]:
     """
     Calculate what '2x' means based on leverage.
@@ -12414,7 +12645,7 @@ async def _send_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TY
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆕 NEW TODAY ({len(new_today)})\n"
         f"{new_block}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━��━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 TOP USERS BY ACTIVITY\n"
         f"{top_block}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -12533,7 +12764,7 @@ async def lb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _fetch_fgi():
     """Fetch Fear & Greed Index from alternative.me. Returns dict or None."""
     try:
-        r    = requests.get("https://api.alternative.me/fng/?limit=7",
+        r    = http_get("https://api.alternative.me/fng/?limit=7",
                             headers=HEADERS, timeout=10)
         data = r.json()
         return data.get('data', [])
@@ -14505,6 +14736,7 @@ def main():
     app.add_handler(CallbackQueryHandler(chart_tf_refresh_callback,        pattern=r'^chart_tf_refresh\|'))
     app.add_handler(CallbackQueryHandler(pnl_callback_handler,             pattern=r'^pnl_bot\|'))
     app.add_handler(CallbackQueryHandler(pnl_callback_handler,             pattern=r'^pnl_custom\|'))
+    app.add_handler(CallbackQueryHandler(pnl_img_callback,                 pattern=r'^pnlimg_'))
     app.add_handler(CallbackQueryHandler(view_signal_callback,             pattern=r'^view_signal\|'))
     app.add_handler(CallbackQueryHandler(pnl_from_signal_callback,         pattern=r'^pnl_from_signal\|'))
     app.add_handler(CallbackQueryHandler(pnl_from_cscan_callback,          pattern=r'^pnl_from_cscan\|'))
