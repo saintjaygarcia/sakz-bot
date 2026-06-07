@@ -2199,7 +2199,7 @@ def candle_quality_score(candle, bias: str) -> tuple:
     score < 0.0  → quality penalty (min -1.0 applied as confidence demotion)
     score = 0.0  → neutral / indeterminate candle
 
-    Three sub-scores (each –1 to +1), averaged then clamped to [–1, +1]:
+    Three sub-scores (each ���1 to +1), averaged then clamped to [–1, +1]:
 
     1. BODY RATIO  — body / total range
        A candle whose body fills > 60 % of its range committed to a direction.
@@ -5263,7 +5263,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "   No band with ≥50% win rate yet — not enough data.\n")
 
     msg = (
-        f"🔬 BACKTEST ANALYSIS — {label}\n"
+        f"��� BACKTEST ANALYSIS — {label}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Confirmed trades: {tot}  |  Overall WR: {overall_wr:.1f}%\n\n"
         f"📊 WIN RATE BY CONFIDENCE BAND\n"
@@ -5882,7 +5882,7 @@ async def autoscan_custom_tf_handler(update: Update, context: ContextTypes.DEFAU
 # ─────────────────────────────────────────────
 # FORMAT SIGNAL
 # IMPROVEMENT #8 — deeplinks to exchange added
-# ─────────────────────────────────────────────
+# ──────��──────────────────────────────────────
 def get_exchange_link(exchange, symbol):
     clean = symbol.replace('_USDT', 'USDT').replace('/', '')
     if exchange == 'BYBIT':
@@ -5920,13 +5920,38 @@ def _panel_type(tf_label):
 
 
 def _rr_ratio(r):
-    """Compute R:R ratio from signal fields. Returns float or None."""
+    """Compute R:R ratio for the trade the user ACTUALLY takes.
+
+    FIX RR-ENTRY — risk/reward must be measured from the entry zone, not the
+    signal candle close. FIX #TL deliberately offsets the entry zone away from
+    `price` (a pullback below close for LONGs, a bounce above close for SHORTs),
+    so measuring from `price` described a trade nobody enters and systematically
+    understated the real R:R.
+
+    We anchor to the *worst realistic fill* — the side of the entry zone closest
+    to price (entry_high for LONG, entry_low for SHORT) — so the displayed R:R
+    is conservative and never overstates. Falls back to `price` only if the
+    entry-zone fields are missing (e.g. legacy/edge signal payloads).
+    Returns float or None.
+    """
     try:
         price     = r['price']
         stop_loss = r['stop_loss']
         t1        = r['t1']
-        risk      = abs(price - stop_loss)
-        reward    = abs(t1 - price)
+        bias      = str(r.get('bias', 'LONG')).upper()
+        # Worst realistic fill = the edge of the entry zone nearest to price.
+        if bias == 'LONG':
+            entry = r.get('entry_high', price)
+        else:
+            entry = r.get('entry_low', price)
+        try:
+            entry = float(entry)
+        except (TypeError, ValueError):
+            entry = price
+        if not entry or entry <= 0:
+            entry = price
+        risk      = abs(entry - stop_loss)
+        reward    = abs(t1 - entry)
         if risk > 0:
             return reward / risk
     except Exception:
@@ -6073,7 +6098,7 @@ def format_signal_primary(r, rank):
     lev_mult = lev['suggested'] if lev else 1
 
     lev_str = f"{lev_mult}x" if lev else "1x"
-    rr_str  = f"1:{rr:.1f}" if rr else "N/A"
+    rr_str  = f"1:{rr:.1f}" if rr is not None else "N/A"
 
     # counter-trend warning prefix
     ct_line = "⚠️ COUNTER-TREND — Higher risk\n" if r.get('counter_trend') else ""
@@ -11753,7 +11778,7 @@ async def cscan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_signal_primary(best, 1), reply_markup=keyboard)
 
 
-# ─── TREND-DYING MONITOR ──────────────────────────────────────
+# ─── TREND-DYING MONITOR ─────────────────────────────���────────
 # Stored as { chat_id: { symbol+exchange: {signal, notified_dying} } }
 _trend_monitor_cache = {}
 
@@ -13085,7 +13110,7 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   /calibrate              — BTCUSDT on Bybit, 500 candles
 #   /calibrate ETH          — ETHUSDT on Bybit
 #   /calibrate SOL BINANCE  — SOLUSDT on Binance
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────��
 
 def _calib_score_fast(df4h_slice, df1d_slice, funding=0.0):
     """
@@ -14461,7 +14486,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
