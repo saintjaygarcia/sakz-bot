@@ -11384,23 +11384,23 @@ def render_fgi_card(data):
     ax.text(0.05, 0.690, "FEAR & GREED", color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=3)
 
     # ── score badge ───────────────────────────────────────────────────────
-    bx, by, bw, bh = 0.05, 0.40, 0.38, 0.165
+    # Badge is wide enough to hold score + classif + trend without overlapping bars
+    bx, by, bw, bh = 0.05, 0.385, 0.455, 0.195
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
         boxstyle="round,pad=0,rounding_size=0.03",
         linewidth=0, facecolor=AMBER_DK, alpha=0.18, zorder=2))
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
         boxstyle="round,pad=0,rounding_size=0.03",
         linewidth=1.6, edgecolor=AMBER_DK, facecolor='none', zorder=3))
-    ax.text(bx+0.032, by+bh-0.042, "SCORE",
+    ax.text(bx+0.022, by+bh-0.035, "SCORE",
             color=AMBER, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.030, by+0.058, f"{value}/100",
+    ax.text(bx+0.022, by+bh-0.105, f"{value}/100",
             color=AMBER, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
-
-    # classification + 24h trend — right of badge
-    ax.text(0.472, by+bh-0.040, classif.upper(),
-            color=AMBER, fontsize=13, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(0.472, by+0.082, f"{trend_str} vs yesterday",
-            color=trend_col, fontsize=10.5, fontweight='bold', va='center', ha='left', zorder=4)
+    # classification inside badge (bottom-left) + trend (top-right)
+    ax.text(bx+0.022, by+0.040, classif.upper(),
+            color=AMBER, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.260, by+bh-0.035, f"{trend_str} vs yesterday",
+            color=trend_col, fontsize=10, fontweight='bold', va='center', ha='left', zorder=4)
 
     # ── 7-day bar chart ───────────────────────────────────────────────────
     cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
@@ -11422,7 +11422,7 @@ def render_fgi_card(data):
         ax.add_patch(FancyBboxPatch((bx_, cy0), bar_w, bh_,
             boxstyle="round,pad=0,rounding_size=0.008",
             linewidth=0, facecolor=bar_col, alpha=alpha_, zorder=3))
-        ax.text(bx_ + bar_w/2, cy0 - 0.030, dt[-5:],
+        ax.text(bx_ + bar_w/2, cy0 - 0.030, dt,
                 color=GRAY, fontsize=7.5, va='center', ha='center', zorder=4)
         ax.text(bx_ + bar_w/2, cy0 + bh_ + 0.025, str(v),
                 color=AMBER if i == 0 else SOFT,
