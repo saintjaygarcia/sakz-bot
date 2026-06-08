@@ -328,8 +328,8 @@ def _get_btc_price_cached() -> float:
             if df is not None and len(df) >= 1:
                 price = float(df['close'].iloc[-1])
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("btc price fetch failed for %s: %s", sym, e)
     state._btc_price_cache = {'price': price, 'time': now}
     return price
 

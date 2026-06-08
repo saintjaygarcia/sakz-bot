@@ -388,8 +388,8 @@ def db_save_scan(results):
                 (now, r['exchange'], r['symbol'], r['bias'],
                  r['confidence'], r['score'], json.dumps(data, default=str))
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("db save scan_result failed for %s: %s", r.get('symbol', '?'), e)
     conn.commit()
     conn.close()
 
@@ -413,8 +413,8 @@ def db_load_last_scan():
             if 'scan_time_str' in d:
                 d['scan_time'] = datetime.fromisoformat(d['scan_time_str'])
             results.append(d)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("skipping unparseable scan_result row: %s", e)
     scan_time = datetime.fromisoformat(last_ts) if results else None
     return results, scan_time
 
@@ -510,8 +510,8 @@ def db_load_card_cache() -> dict:
     for r in rows:
         try:
             result[r["cache_key"]] = json.loads(r["data_json"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("skipping unparseable cache row: %s", e)
     return result
 
 def db_register_outcome(signal, scan_row_id=None):
@@ -697,8 +697,8 @@ def db_load_all_tracking():
                 'interval':    r['interval_min'],
                 'job':         None
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("skipping unparseable tracked-trade row: %s", e)
     return result
 
 def db_save_trade(chat_id: int, trade_id: str, signal: dict, entry_price: float,
@@ -752,8 +752,8 @@ def db_load_all_trades() -> dict:
                 'job':         None,
                 'trade_id':    tid,
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("skipping unparseable tracked-trade row (with id): %s", e)
     return result
 
 def db_save_price_alert(chat_id: int, symbol: str, exchange: str,

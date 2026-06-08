@@ -976,8 +976,8 @@ async def pro_fast_job(context):
         if uptrend and uptrend.get("qualifies"):
             try:
                 db_pro_upsert_uptrend(sym, exchange, uptrend["daily_gains"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("pro_scan: db_pro_upsert_uptrend failed for %s/%s: %s", sym, exchange, e)
             existing_row    = existing_ut.get((sym, exchange))
             already_alerted = existing_row and existing_row.get("alert_sent", 0)
             if not already_alerted and ut_key not in _pro_alerted_uptrend:
@@ -985,16 +985,16 @@ async def pro_fast_job(context):
                 _pro_alerted_uptrend.add(ut_key)
                 try:
                     db_pro_mark_uptrend_alerted(sym, exchange)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("pro_scan: db_pro_mark_uptrend_alerted failed for %s/%s: %s", sym, exchange, e)
 
         # Manipulation ─────────────────────────────────────────────────────────
         if manip and manip.get("is_scam") and manip["manip_score"] >= 60:
             mk = f"{sym}_{exchange}"
             try:
                 db_pro_upsert_manip(sym, exchange, manip["manip_score"], manip["reasons"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("pro_scan: db_pro_upsert_manip failed for %s/%s: %s", sym, exchange, e)
             if mk not in _pro_alerted_manip:
                 already = any(
                     r["symbol"] == sym and r["exchange"] == exchange and r["alert_sent"]
@@ -1005,8 +1005,8 @@ async def pro_fast_job(context):
                     _pro_alerted_manip.add(mk)
                     try:
                         db_pro_mark_manip_alerted(sym, exchange)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("pro_scan: db_pro_mark_manip_alerted failed for %s/%s: %s", sym, exchange, e)
 
     # Broadcast ────────────────────────────────────────────────────────────────
     if not (uptrend_alerts or manip_alerts):
@@ -1067,8 +1067,8 @@ async def pro_gainers_job(context):
         if g.get("price_change_24h", 0) >= 8.0:
             try:
                 db_pro_upsert_gainer(g["symbol"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("pro_scan: db_pro_upsert_gainer failed for %s: %s", g.get("symbol", "?"), e)
 
     persistent_gainer_alerts = []
     cutoff_6h = (datetime.now() - timedelta(hours=6)).isoformat()
@@ -1088,8 +1088,8 @@ async def pro_gainers_job(context):
         _pro_alerted_gainers.add(sym)
         try:
             db_pro_mark_gainer_alerted(sym)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("pro_scan: db_pro_mark_gainer_alerted failed for %s: %s", sym, e)
 
     if not persistent_gainer_alerts:
         return
@@ -1470,7 +1470,7 @@ def _load_best_params():
 
 
 
-# ───────��─────��������──────────────────────────────
+# ───────���─────��������──────────────────────────────
 # ─────────────────────────────────────────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
@@ -2863,7 +2863,7 @@ async def get_scan_results(force=False):
         return results, False  # (results, from_cache)
 
 
-# ───��─────────────────────────────────────────
+# ──����─────────────────────────────────────────
 # IMPROVEMENT #3 — SIGNAL OUTCOME TRACKER
 # Background job that checks signal outcomes at
 # 4h, 8h, 24h, 48h intervals and updates the DB.
@@ -4355,8 +4355,8 @@ def _build_signal_common(r):
     live_price = 0
     try:
         live_price = _get_live_price(symbol, exchange)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("signal refresh: live price lookup failed for %s/%s: %s", symbol, exchange, e)
     display_price = live_price if live_price > 0 else scan_price
 
     scan_time = r.get('scan_time')
@@ -4558,6 +4558,12 @@ def format_signal_primary(r, rank):
         # Trim long strings
         _pd_display = _primary_driver[:90] + '…' if len(_primary_driver) > 90 else _primary_driver
         lines.append(f"🔑 Key driver: {_pd_display}")
+
+    # FIX #AUTOREFRESH-VISIBILITY — live "updated" stamp. Makes each 30s tick
+    # visible to the user AND guarantees the rendered text changes every
+    # refresh, so Telegram never suppresses the edit as "message not modified".
+    lines.append("")
+    lines.append(f"🔄 Live • updated {datetime.now().strftime('%H:%M:%S')} (auto every {AUTO_REFRESH_SECS}s)")
 
     return "\n".join(lines)
 
@@ -5577,12 +5583,74 @@ async def send_pnl_image_card(update, context):
     await msg.reply_photo(photo=io.BytesIO(png), caption=caption, reply_markup=keyboard)
 
 
+def _resolve_pnl_signal(arg: str, results: list):
+    """Resolve a /pnl argument to a signal from the last scan.
+
+    Accepts either a 1-based rank number (e.g. "1") or a symbol as it was
+    shown on the bot (e.g. "btc", "btcusdt", "ton"). Returns the matching
+    signal dict, or None if nothing matched.
+    """
+    arg = (arg or '').strip()
+    if not arg:
+        return None
+
+    # Numeric rank: /pnl 1
+    if arg.isdigit():
+        n = int(arg)
+        if 1 <= n <= len(results):
+            return results[n - 1]
+        return None
+
+    # Symbol match: /pnl btc  (normalise away separators + optional USDT quote)
+    def _norm(s):
+        return str(s or '').upper().replace('/', '').replace('_', '')
+    q      = _norm(arg)
+    q_full = q if q.endswith('USDT') else q + 'USDT'
+
+    # 1) exact symbol match (with or without the USDT quote)
+    for r in results:
+        sym = _norm(r.get('symbol'))
+        if sym == q_full or sym == q:
+            return r
+    # 2) prefix match on the base symbol (e.g. "ton" -> TONCOINUSDT)
+    for r in results:
+        if _norm(r.get('symbol')).startswith(q):
+            return r
+    return None
+
+
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point — user picks a signal to calculate PnL for."""
+    """Entry point — pick a signal, or look one up directly via /pnl <rank|symbol>."""
     _track(update)
+
+    # Starting /pnl cancels any pending autoscan TF entry so the dispatch chain
+    # doesn't mistake a PnL reply (e.g. "6") for a timeframe.
+    try:
+        _autoscan_awaiting_tf.discard(update.effective_chat.id)
+    except Exception as e:
+        logger.debug("pnl_command: could not clear autoscan TF state: %s", e)
 
     if not state.last_scan_results:
         await update.message.reply_text("⚠️ No scan data yet. Run /scan first.")
+        return
+
+    results = state.last_scan_results
+
+    # Direct lookup: /pnl 1   or   /pnl btc
+    args = context.args or []
+    if args:
+        sig = _resolve_pnl_signal(args[0], results)
+        if sig is None:
+            await update.message.reply_text(
+                f"⚠️ Couldn't match \"{args[0]}\" to a signal from the last scan.\n"
+                f"Send /pnl on its own to see the numbered list, or use the symbol as shown "
+                f"(e.g. /pnl btc or /pnl 1)."
+            )
+            return
+        context.user_data['pnl_signal']  = sig
+        context.user_data['pnl_capital'] = None
+        context.user_data['pnl_step']    = None
+        await send_pnl_image_card(update, context)
         return
 
     total = len(state.last_scan_results)
@@ -5912,7 +5980,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "  `/cscan ZEC 15m`   15-min chart → scalp signals (mins–2h)\n"
             "  `/cscan ZEC 1h`    1H chart → intraday signals (30min–8h)\n"
             "  `/cscan ZEC 4h`    4H chart → swing signals (4h–3 days)\n"
-            "  `/cscan ZEC 1d`    Daily chart → position signals (1d–2wks)\n\n"
+            "  `/cscan ZEC 1d`    Daily chart → position signals (1d��2wks)\n\n"
             "• *New Listings* — `/scan new 24h` scans recently listed pairs\n"
             "• *Best Trade Now* — highest conviction signal from last scan\n"
             "• *Top 5 / Top 10* — ranked list of the best current signals\n"
@@ -8100,8 +8168,8 @@ async def funding_alert_job(context: ContextTypes.DEFAULT_TYPE):
                     bias_hint = "SHORT squeeze risk 🚀" if fp < 0 else "LONG squeeze risk 📉"
                     extremes.append({'symbol': sym, 'exchange': 'BYBIT', 'rate': fp, 'hint': bias_hint})
                 await asyncio.sleep(0.05)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("funding scan (BYBIT) skipped %s: %s", sym, e)
 
     # Check Binance top symbols
     if sakz_exchanges.BINANCE_AVAILABLE:
@@ -8114,8 +8182,8 @@ async def funding_alert_job(context: ContextTypes.DEFAULT_TYPE):
                     bias_hint = "SHORT squeeze risk 🚀" if fp < 0 else "LONG squeeze risk 📉"
                     extremes.append({'symbol': sym, 'exchange': 'BINANCE', 'rate': fp, 'hint': bias_hint})
                 await asyncio.sleep(0.05)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("funding scan (BINANCE) skipped %s: %s", sym, e)
 
     if not extremes:
         return
@@ -8567,7 +8635,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             if 40 <= rsi_d <= 60:
                 score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) — sustainable")
 
-        # ── 4. VOLUME CONVICTION ─────────────────────────────
+        # ── 4. VOLUME CONVICTION ─��───────────────────────────
         vol_ratio       = vol / vol_ma if vol_ma > 0 else 1.0
         price_change_pct = abs(price - P['close']) / P['close'] * 100 if P['close'] > 0 else 0
 
@@ -11007,7 +11075,7 @@ async def _send_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TY
         f"━━━━━��━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 TOP USERS BY ACTIVITY\n"
         f"{top_block}\n\n"
-        f"━━━━��━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"��━━━��━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 BOT STATUS\n"
         f"   Last scan signals: {len(state.last_scan_results)}\n"
         f"   Tracking active:   {len(state.user_tracking)}\n"
@@ -11298,7 +11366,7 @@ async def fgi_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(msg, reply_markup=keyboard)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────���───────────────────────────────────────────────────────────
 # CEILING #6 — MID-TIER UNIVERSE SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 # Problem:  The standard /scan covers only the top-50 pairs by volume on each
@@ -12414,8 +12482,8 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row:
             prev_bias = row['bias']
             prev_conf = row['confidence']
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("signal bias lookup failed: %s", e)
 
     # Compare fresh vs previous
     if prev_bias is None:
@@ -12826,7 +12894,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────────
 # AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
-# ──────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────��────────────────────────────────────
 # Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
 # cadence (default 30s) — WITHOUT removing the manual button (users can still
 # tap it whenever they want).
@@ -13379,6 +13447,11 @@ def main():
     async def _admin_pw_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         consumed = await admin_password_handler(update, context)
         if not consumed:
+            # An active PnL conversation takes priority over the autoscan TF
+            # catch, so a reply like "6" reaches the PnL flow, not the TF parser.
+            if context.user_data.get('pnl_step'):
+                await pnl_message_handler(update, context)
+                return
             consumed = await autoscan_custom_tf_handler(update, context)
         if not consumed:
             await pnl_message_handler(update, context)
