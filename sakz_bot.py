@@ -1470,7 +1470,7 @@ def _load_best_params():
 
 
 
-# ─────────────��������──────────────────────────────
+# ───────��─────��������──────────────────────────────
 # ─────────────────────────────────────────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
@@ -2863,7 +2863,7 @@ async def get_scan_results(force=False):
         return results, False  # (results, from_cache)
 
 
-# ─────────────────────────────────────────────
+# ───��─────────────────────────────────────────
 # IMPROVEMENT #3 — SIGNAL OUTCOME TRACKER
 # Background job that checks signal outcomes at
 # 4h, 8h, 24h, 48h intervals and updates the DB.
@@ -3588,7 +3588,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Win rate by confidence band ────────────────────────────────────
+    # ── Win rate by confidence band ���───────────────────────────────────
     bands = [
         ('4–5', lambda r: r['confidence'] in (4, 5)),
         ('6–7', lambda r: r['confidence'] in (6, 7)),
@@ -4793,143 +4793,6 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text(format_signal_primary(r, rank), reply_markup=restored_kb)
 
 
-        age_min = int((datetime.now() - scan_time).total_seconds() / 60)
-        age_str = f"{age_min}m ago" if age_min < 60 else f"{age_min // 60}h {age_min % 60}m ago"
-    else:
-        age_str = "unknown"
-
-    # Zone status using live price
-    entry_low  = r['entry_low']
-    entry_high = r['entry_high']
-    bias       = r['bias']
-
-    if entry_low <= display_price <= entry_high:
-        zone_status = "✅ IN ZONE — price is within entry range"
-    elif bias == 'LONG' and display_price < entry_low:
-        gap_pct = ((entry_low - display_price) / display_price) * 100
-        zone_status = f"📉 BELOW ZONE by {gap_pct:.2f}% — overshooting pullback, wait for bounce"
-    elif bias == 'LONG' and display_price > entry_high:
-        gap_pct = ((display_price - entry_high) / entry_high) * 100
-        zone_status = f"📈 ABOVE ZONE by {gap_pct:.2f}% — price ran, wait for pullback to zone"
-    elif bias == 'SHORT' and display_price > entry_high:
-        gap_pct = ((display_price - entry_high) / entry_high) * 100
-        zone_status = f"📈 ABOVE ZONE by {gap_pct:.2f}% — overshooting bounce, wait for rejection"
-    elif bias == 'SHORT' and display_price < entry_low:
-        gap_pct = ((entry_low - display_price) / entry_low) * 100
-        zone_status = f"📉 BELOW ZONE by {gap_pct:.2f}% — price dumped past zone, wait for bounce into zone"
-    else:
-        zone_status = "⚪ ZONE STATUS UNKNOWN"
-
-    lines = [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"#{rank}  {exchange} | {r['symbol']}  [{tf_label}]{' 🏷[MID]' if r.get('tier') == 'MID' else ''}",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"{bias_emoji} BIAS: {r['bias']}",
-        f"⭐ CONVICTION:  {conf_bar}",
-    ]
-
-    # FIX #8 — surface counter-trend warning prominently in signal card
-    if r.get('counter_trend'):
-        lines.append(f"⚠️  COUNTER-TREND — Daily EMA opposes this trade. Higher risk.")
-
-    # FIX #RG — show BTC regime context so user knows the macro backdrop
-    regime = r.get('btc_regime', 'NEUTRAL')
-    regime_emoji = {
-        'STRONG_BULL': '🟢🟢', 'BULL': '🟢',
-        'NEUTRAL': '⚪',
-        'BEAR': '🔴', 'STRONG_BEAR': '🔴🔴'
-    }.get(regime, '⚪')
-    is_aligned   = (regime in ('STRONG_BULL', 'BULL') and r['bias'] == 'LONG') or \
-                   (regime in ('STRONG_BEAR', 'BEAR') and r['bias'] == 'SHORT')
-    is_divergent = (regime in ('STRONG_BULL', 'BULL') and r['bias'] == 'SHORT') or \
-                   (regime in ('STRONG_BEAR', 'BEAR') and r['bias'] == 'LONG')
-    lines.append(f"{regime_emoji} BTC REGIME: {regime}"
-                 + (" — regime-aligned ✅" if is_aligned
-                    else " — regime-divergent ⚠️" if is_divergent
-                    else " — choppy/transitioning ⚠️"))
-
-    # FIX #VA — show volatility regime so user understands target sizing context
-    vr = r.get('vol_regime', 'MEDIUM')
-    vr_emoji = {'RANGING': '😴', 'LOW': '🐢', 'MEDIUM': '⚖️', 'HIGH': '⚡', 'EXTREME': '🌪️'}.get(vr, '⚖️')
-    lines.append(f"{vr_emoji} VOL REGIME: {vr} — targets sized accordingly")
-
-    lines += [
-        f"",
-        f"⏱ HOLD DURATION: {r['hold']}",
-        f"📌 {r['tf_note']}",
-        f"",
-        f"💰 SIGNAL PRICE: ${scan_price:.6f}  (scanned {age_str})",
-        f"💰 LIVE PRICE:   ${display_price:.6f}" + (" ⚠️ [fetch failed — using scan price]" if live_price == 0 else ""),
-        f"📥 ENTRY ZONE:   ${entry_low:.6f} → ${entry_high:.6f}",
-        f"   {zone_status}",
-        # Legacy stale-zone warning removed — zone_status covers this case
-
-        f"🛑 STOP LOSS:  ${r['stop_loss']:.6f}",
-        f"🎯 TARGET 1:   ${r['t1']:.6f}",
-        f"🎯 TARGET 2:   ${r['t2']:.6f}",
-        f"🎯 TARGET 3:   ${r['t3']:.6f}",
-        f"",
-        f"📊 RSI 4H:    {r['rsi4']:.1f}",
-        f"📊 RSI Daily: {r['rsi_d']:.1f}  (closed candle)",
-        f"📊 Stoch K:   {r['stoch_k']:.1f}",
-        f"📊 Funding:   {r['funding']:.4f}%",
-        f"📊 ATR:       ${r['atr']:.6f}",
-    ]
-
-    if lev and conf >= 8:
-        note = {10: "★ 10/10 — Full leverage authorized",
-                9:  "★ 9/10 — Near-max leverage authorized"}.get(conf,
-                    "★ 8/10 — Conservative leverage applied")
-        lines += [
-            f"",
-            f"⚡ LEVERAGE (Isolated Margin)",
-            f"   Suggested:        {lev['suggested']}x",
-            f"   Max Safe:         {lev['max_safe']}x",
-            f"   Volatility:       {lev['vol_label']} ({lev['atr_pct']:.2f}% ATR)",
-            f"   SL Distance:      {lev['sl_dist']:.2f}%",
-            f"   Liq Distance:     ~{lev['liq_dist']:.2f}%",
-            f"   Fluctuation Room: {lev['fluct']:.2f}%",
-            f"   {note}",
-        ]
-    elif conf < 8:
-        lines += [f"", f"⚠️ LEVERAGE: Not recommended (confidence < 8/10)"]
-
-    lines += [f"", f"✅ CONVICTION REASONS:"]
-    for reason in r['reasons']:
-        lines.append(f"   • {reason}")
-
-    if dur_reasons:
-        lines += [f"", f"🕐 DURATION ANALYSIS:"]
-        for reason in dur_reasons:
-            lines.append(f"   • {reason}")
-
-    # FIX #DD — Portfolio correlation context
-    corr_type    = r.get('corr_type', 'independent')
-    corr_slot    = r.get('corr_slot', 1)
-    corr_flagged = r.get('corr_flagged', False)
-    cap          = 3   # CORRELATED_SLOT_CAP
-    if corr_type in ('correlated_long', 'correlated_short'):
-        direction = 'LONG' if corr_type == 'correlated_long' else 'SHORT'
-        if corr_flagged:
-            lines += [
-                f"",
-                f"⚠️ PORTFOLIO RISK — Correlated {direction} #{corr_slot} of {corr_slot}",
-                f"   This is signal #{corr_slot} in the same BTC-correlated direction.",
-                f"   Recommended cap: {cap}. Opening this adds concentrated exposure.",
-                f"   All {direction}s in this regime stop out together on a BTC reversal.",
-            ]
-        else:
-            lines += [
-                f"",
-                f"📊 PORTFOLIO SLOT — Correlated {direction} #{corr_slot}/{cap}",
-            ]
-    else:
-        lines += [f"", f"📊 PORTFOLIO SLOT — Independent signal (counter-regime or NEUTRAL)"]
-
-    # IMPROVEMENT #8 — Exchange deeplink
-    lines += [f"", f"🔗 Trade on {exchange}: {link}"]
-
-    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -11144,7 +11007,7 @@ async def _send_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TY
         f"━━━━━��━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 TOP USERS BY ACTIVITY\n"
         f"{top_block}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━��━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 BOT STATUS\n"
         f"   Last scan signals: {len(state.last_scan_results)}\n"
         f"   Tracking active:   {len(state.user_tracking)}\n"
@@ -12397,12 +12260,13 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_event_loop()
     results = await loop.run_in_executor(SCAN_EXECUTOR, lambda: _cscan_pair_mtf(symbol, tf_key='4h'))
 
-    # Get live price
+    # Get live price (WS-first; exchange hint is only used for REST fallback)
+    exchange   = ''
     live_price = 0
     try:
         live_price = _get_live_price(symbol, exchange)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("check_command: live price lookup failed for %s: %s", symbol, e)
 
     if not live_price:
         live_price = entry_price  # fallback

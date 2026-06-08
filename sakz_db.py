@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from config import (  # centralised configuration (single source of truth)
     TURSO_URL, TURSO_TOKEN, _USE_TURSO, DB_PATH, ACTIVE_WINDOW_MIN,
 )
+from sakz_errors import SakzDBError  # typed DB failure (vs silent empty result)
 
 logger = logging.getLogger(__name__)
 
@@ -105,19 +106,27 @@ class _ConnWrapper:
 
 
 def db_connect():
-    if _USE_TURSO and libsql:
-        conn = libsql.connect(
-            database=TURSO_URL,
-            auth_token=TURSO_TOKEN,
-        )
-        try:
-            conn.row_factory = sqlite3.Row  # harmless if libsql ever honors it
-        except Exception:
-            pass
-        return _ConnWrapper(conn)   # FIX M1 — dict-row adapter for Turso path
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        if _USE_TURSO and libsql:
+            conn = libsql.connect(
+                database=TURSO_URL,
+                auth_token=TURSO_TOKEN,
+            )
+            try:
+                conn.row_factory = sqlite3.Row  # harmless if libsql ever honors it
+            except Exception:
+                pass
+            return _ConnWrapper(conn)   # FIX M1 — dict-row adapter for Turso path
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except SakzDBError:
+        raise
+    except Exception as e:
+        # A dropped Turso/SQLite connection must NOT masquerade as "no data".
+        backend = "turso" if (_USE_TURSO and libsql) else "sqlite"
+        logger.error("db_connect failed (%s backend): %s", backend, e)
+        raise SakzDBError(f"database connection failed: {e}") from e
 
 def db_init():
     conn = db_connect()

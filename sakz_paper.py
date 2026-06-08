@@ -98,10 +98,29 @@ from typing import Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PAPER_CONF_MIN    = 8      # minimum confidence to auto-open a position
+PAPER_CONF_MIN    = 8      # baseline minimum confidence to auto-open a position
 PAPER_MAX_OPEN    = 12     # maximum concurrent open positions
 PAPER_FEE_PCT     = 0.00075  # 0.075% per side (taker)
 PAPER_MAX_HOLD_H  = 72     # force-expire after this many hours
+
+# ── Adaptive confidence floor (Flaw 5) ─────────────────────────────────────────
+# PAPER_CONF_MIN above is only the *baseline*. The floor actually used to open
+# positions is recalibrated from realised paper performance: the summary already
+# tracks conf>=9 win-rate (hi_conf_wr) vs conf-8 win-rate (lo_conf_wr). When the
+# conf-8 bucket clearly underperforms (a bear-regime tell), raise the floor so we
+# stop opening weak conf-8 trades; when conf-8 is performing strongly, allow a
+# slightly lower floor to capture more edge. Always bounded + sample-gated.
+PAPER_CONF_FLOOR_MIN   = 7      # never require less than this
+PAPER_CONF_FLOOR_MAX   = 10     # never require more than this
+PAPER_ADAPT_LOOKBACK_H = 336    # 14 days of closed trades for a stable read
+PAPER_ADAPT_MIN_SAMPLE = 10     # need this many trades in a bucket to trust it
+PAPER_ADAPT_WR_WEAK    = 45.0   # win-rate below this = weak bucket
+PAPER_ADAPT_WR_STRONG  = 58.0   # win-rate above this = strong bucket
+PAPER_ADAPT_DELTA      = 12.0   # hi-vs-lo win-rate gap that justifies raising
+_ADAPTIVE_TTL          = timedelta(minutes=30)  # recompute the floor at most this often
+
+_adaptive_conf_min     = PAPER_CONF_MIN   # cached effective floor
+_adaptive_conf_min_at  = None             # datetime of last recompute (UTC)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DB SCHEMA
@@ -150,6 +169,69 @@ def paper_init_db(db_connect: Callable):
 # OPEN POSITION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def paper_adaptive_conf_min(db_connect: Callable) -> int:
+    """
+    Derive the effective minimum confidence from realised paper performance.
+
+    Uses the hi_conf_wr (conf >= 9) vs lo_conf_wr (conf 8) delta that
+    paper_summary already computes. Result is bounded to
+    [PAPER_CONF_FLOOR_MIN, PAPER_CONF_FLOOR_MAX] and falls back to the static
+    PAPER_CONF_MIN whenever there isn't enough data to judge.
+    """
+    try:
+        s = paper_summary(db_connect, lookback_hours=PAPER_ADAPT_LOOKBACK_H)
+    except Exception as e:
+        logger.warning("paper_adaptive_conf_min: summary failed: %s", e)
+        return PAPER_CONF_MIN
+
+    if s.get('error') or s.get('trades', 0) == 0:
+        return PAPER_CONF_MIN
+
+    lo_n  = s.get('lo_conf_n', 0)
+    hi_n  = s.get('hi_conf_n', 0)
+    lo_wr = s.get('lo_conf_wr', 0.0)
+    hi_wr = s.get('hi_conf_wr', 0.0)
+
+    # Not enough conf-8 trades to judge - keep the baseline.
+    if lo_n < PAPER_ADAPT_MIN_SAMPLE:
+        return PAPER_CONF_MIN
+
+    floor = PAPER_CONF_MIN  # 8
+
+    # Conf-8 bucket is weak AND clearly worse than conf>=9 -> stop opening conf-8.
+    if (lo_wr < PAPER_ADAPT_WR_WEAK
+            and (hi_wr - lo_wr) >= PAPER_ADAPT_DELTA
+            and hi_n >= PAPER_ADAPT_MIN_SAMPLE):
+        floor = 9
+        # Even the conf>=9 bucket is poor -> demand only the strongest signals.
+        if hi_wr < PAPER_ADAPT_WR_WEAK:
+            floor = 10
+    # Conf-8 bucket is performing strongly -> capture a little more edge.
+    elif lo_wr >= PAPER_ADAPT_WR_STRONG:
+        floor = 7
+
+    return max(PAPER_CONF_FLOOR_MIN, min(PAPER_CONF_FLOOR_MAX, floor))
+
+
+def _effective_conf_min(db_connect: Callable) -> int:
+    """Cached wrapper around paper_adaptive_conf_min (recomputes every 30 min)."""
+    global _adaptive_conf_min, _adaptive_conf_min_at
+    now = datetime.utcnow()
+    if _adaptive_conf_min_at is not None and (now - _adaptive_conf_min_at) < _ADAPTIVE_TTL:
+        return _adaptive_conf_min
+    try:
+        new_floor = paper_adaptive_conf_min(db_connect)
+    except Exception as e:
+        logger.warning("_effective_conf_min: %s", e)
+        new_floor = PAPER_CONF_MIN
+    if new_floor != _adaptive_conf_min:
+        logger.info("\U0001F4C8 Paper adaptive confidence floor: %d \u2192 %d",
+                    _adaptive_conf_min, new_floor)
+    _adaptive_conf_min    = new_floor
+    _adaptive_conf_min_at = now
+    return _adaptive_conf_min
+
+
 def paper_maybe_open(signal: dict, db_connect: Callable) -> bool:
     """
     Conditionally open a paper position from a scan result dict.
@@ -163,7 +245,8 @@ def paper_maybe_open(signal: dict, db_connect: Callable) -> bool:
     Returns True if a position was opened.
     """
     conf = int(signal.get('confidence', 0))
-    if conf < PAPER_CONF_MIN:
+    conf_min = _effective_conf_min(db_connect)
+    if conf < conf_min:
         return False
 
     symbol   = signal.get('symbol', '').upper()
@@ -184,8 +267,6 @@ def paper_maybe_open(signal: dict, db_connect: Callable) -> bool:
 
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
-
         c = conn.cursor()
 
         # Already open for this symbol?
@@ -237,7 +318,6 @@ def paper_mark_all(db_connect: Callable,
     closed = []
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
         c    = conn.cursor()
         c.execute("SELECT * FROM paper_positions WHERE outcome='OPEN'")
         rows = c.fetchall()
@@ -273,7 +353,6 @@ def paper_close_expired(db_connect: Callable,
     cutoff   = (datetime.utcnow() - timedelta(hours=PAPER_MAX_HOLD_H)).isoformat()
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
         c    = conn.cursor()
         c.execute(
             "SELECT * FROM paper_positions WHERE outcome='OPEN' AND opened_at < ?",
@@ -341,7 +420,6 @@ def paper_get_open(db_connect: Callable) -> List[dict]:
     """Return all currently open paper positions."""
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
         c    = conn.cursor()
         c.execute("SELECT * FROM paper_positions WHERE outcome='OPEN' ORDER BY opened_at DESC")
         cols = [d[0] for d in c.description]
@@ -357,7 +435,6 @@ def paper_get_closed(db_connect: Callable, limit: int = 20) -> List[dict]:
     """Return the most recent closed paper positions."""
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
         c    = conn.cursor()
         c.execute(
             "SELECT * FROM paper_positions WHERE outcome!='OPEN' ORDER BY closed_at DESC LIMIT ?",
@@ -380,7 +457,6 @@ def paper_summary(db_connect: Callable, lookback_hours: int = 168) -> dict:
     since = (datetime.utcnow() - timedelta(hours=lookback_hours)).isoformat()
     try:
         conn = db_connect()
-        conn.execute(_SCHEMA)
         c    = conn.cursor()
         c.execute(
             """SELECT * FROM paper_positions
