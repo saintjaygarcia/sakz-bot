@@ -54,6 +54,16 @@ except ImportError:
 
 # ---- engine constants ----
 _MIN_SIGNAL_RR = max(0.1, float(os.getenv("MIN_SIGNAL_RR", "1.5")))
+
+# ---- signal SURFACING thresholds (display only — NOT the paper execution floor) ----
+SCAN_DISPLAY_CONF_MIN = max(0.0, float(os.getenv("SCAN_DISPLAY_CONF_MIN", "7")))
+# Autoscan pushes are unsolicited; allow a stricter floor (defaults to same).
+AUTOSCAN_DISPLAY_CONF_MIN = max(
+    SCAN_DISPLAY_CONF_MIN,
+    float(os.getenv("AUTOSCAN_DISPLAY_CONF_MIN", str(SCAN_DISPLAY_CONF_MIN))),
+)
+
+_SCAN_SHOW_ALL_FLAGS = {"all", "low", "everything", "full"}
 _btc_regime_cache_ttl = 900
 _BTCD_TTL = 1800
 _BTC_PRICE_TTL = 60
@@ -1745,3 +1755,66 @@ def _rr_ratio(r):
     except Exception:
         pass
     return None
+
+
+# ---- Phase 0: display-floor helpers ----
+
+def _conf_of(r) -> float:
+    """Safe confidence extractor — returns 0.0 on any failure."""
+    try:
+        return float(r.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def passes_display_floor(r, floor: float = None) -> bool:
+    """True when r's confidence meets the display floor."""
+    if floor is None:
+        floor = SCAN_DISPLAY_CONF_MIN
+    return _conf_of(r) >= floor
+
+
+def risk_reasons(r) -> list:
+    """Data-driven reasons a signal is low quality.
+    Returns a non-empty list — at minimum a generic caution line.
+    Reused by the on-demand scan path and (Phase 1) the geometry validator.
+    """
+    reasons = []
+    conf = _conf_of(r)
+    if conf < SCAN_DISPLAY_CONF_MIN:
+        reasons.append(f"Low confidence ({conf:.0f}/10, below {SCAN_DISPLAY_CONF_MIN:.0f})")
+    try:
+        rr = _rr_ratio(r)
+        if rr is not None and rr < _MIN_SIGNAL_RR:
+            reasons.append(f"Reward:risk {rr:.2f} is below the {_MIN_SIGNAL_RR:.1f} minimum")
+    except Exception:
+        pass
+    try:
+        entry = r.get("entry_low") or r.get("price")
+        sl = r.get("stop_loss")
+        if entry and sl:
+            dist = abs(float(entry) - float(sl)) / float(entry) * 100
+            if dist < 0.3:
+                reasons.append(f"Stop very tight ({dist:.2f}%) — likely noise-stopped")
+            elif dist > 12:
+                reasons.append(f"Stop very wide ({dist:.1f}%) — outsized risk")
+    except Exception:
+        pass
+    vol = r.get("quote_volume") or r.get("volume_usd") or r.get("volume")
+    try:
+        if vol is not None and float(vol) < 1_000_000:
+            reasons.append("Thin 24h liquidity — slippage / manipulation risk")
+    except (TypeError, ValueError):
+        pass
+    regime = (r.get("btc_regime") or "").lower()
+    bias = (r.get("bias") or "").upper()
+    if regime and bias:
+        if bias == "LONG" and "bear" in regime:
+            reasons.append("BTC regime is bearish — headwind for a LONG")
+        elif bias == "SHORT" and "bull" in regime:
+            reasons.append("BTC regime is bullish — headwind for a SHORT")
+    if not reasons:
+        reasons.append("Setup quality is marginal; size carefully")
+    return reasons
+
+

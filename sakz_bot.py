@@ -245,6 +245,13 @@ from sakz_scanner import (
     _get_btc_dominance,
     _get_btc_price_cached,
     session_context,
+    # Phase 0 — signal surfacing
+    SCAN_DISPLAY_CONF_MIN,
+    AUTOSCAN_DISPLAY_CONF_MIN,
+    _SCAN_SHOW_ALL_FLAGS,
+    _conf_of,
+    passes_display_floor,
+    risk_reasons,
 )
 
 # Reason constants — used for aggregation in cscan_command
@@ -4045,7 +4052,8 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
     if not results:
         return
 
-    high_conf = [r for r in results if r['confidence'] >= _AUTOSCAN_MIN_CONF]
+    # Phase 0: use AUTOSCAN_DISPLAY_CONF_MIN (env-tunable, >= SCAN_DISPLAY_CONF_MIN)
+    high_conf = [r for r in results if passes_display_floor(r, AUTOSCAN_DISPLAY_CONF_MIN)]
     if not high_conf:
         return
 
@@ -5403,23 +5411,25 @@ def _fetch_sparkline_closes(exchange, symbol, limit=60):
 
 
 def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None):
-    """Render the branded live-PnL card (PNG bytes).
+    """Render the upgraded SAKZ PnL card (PNG bytes).
 
-    Dark 'SAKZ' layout: wings emblem + tagline, exchange pill, pair, big
-    leveraged PnL %, a purple price sparkline, and an EXIT / LEVERAGE / HELD FOR
-    detail row. Leveraged PnL %% always shown; $ amount only when capital given.
+    Teal/green colour system. Area-fill sparkline with endpoint dot.
+    Badge mirrors the FGI score box style. Amber logo unchanged.
     """
     import math
     from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
+    from matplotlib.path import Path
+    import matplotlib.patches as mpatches
 
-    BG="#0A0B0E"; PANEL="#0C0E13"; PANEL_ED="#1B1F27"
-    GREEN="#2FD477"; RED="#F0556B"
-    WHITE="#FFFFFF"; SOFT="#C5CBD3"; GRAY="#8A93A0"
-    CHIP_BG="#12151B"; CHIP_ED="#262B34"
-    PURPLE="#9A6CFF"; PURPLE2="#6D45D6"; PURPLE_LT="#C9B0FF"
-    GOLD="#E7B23C"; GOLD_DK="#B8822A"
+    BG       = "#0c0d10"; PANEL    = "#0e0f13"; PANEL_ED = "#1c2030"
+    TEAL     = "#5DCAA5"; TEAL_DK  = "#1D9E75"; TEAL_XDK = "#0F6E56"
+    WHITE    = "#FFFFFF"; SOFT     = "#C5CBD3"; GRAY     = "#8A93A0"
+    CHIP_BG  = "#111318"; CHIP_ED  = "#222832"
+    RED      = "#F0556B"
+    GOLD     = "#E7B23C"; GOLD_DK  = "#B8822A"
 
     ASPECT = 10.24 / 5.36
+
     def disc(x, y, r, **kw):
         ax.add_patch(Ellipse((x, y), width=2*r/ASPECT, height=2*r, **kw))
 
@@ -5428,14 +5438,16 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     entry = float(signal.get('price') or 0) or current_price
     bias  = str(signal.get('bias', 'LONG')).upper()
     if entry > 0:
-        raw_pct = ((current_price - entry)/entry*100) if bias == 'LONG' else ((entry - current_price)/entry*100)
+        raw_pct = ((current_price - entry) / entry * 100) if bias == 'LONG' \
+                  else ((entry - current_price) / entry * 100)
     else:
         raw_pct = 0.0
-    lev = leverage or 1
+    lev     = leverage or 1
     lev_pct = raw_pct * lev
-    up  = lev_pct >= 0
-    col = GREEN if up else RED
-    arrow = "\u25B2" if up else "\u25BC"
+    up      = lev_pct >= 0
+    col     = TEAL if up else RED
+    col_dk  = TEAL_DK if up else "#A32D2D"
+    arrow   = "\u25B2" if up else "\u25BC"
 
     raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
     disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith('USDT') else raw_sym
@@ -5443,97 +5455,123 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     exit_lbl = str(signal.get('exit_mode') or signal.get('exit') or 'Manual')
     held_str = _fmt_held_for(signal.get('scan_time'))
 
-    pct_str = f"{lev_pct:+.2f}%"
+    pct_str    = f"{lev_pct:+.2f}%"
     dollar_str = None
     if capital:
         d = capital * lev_pct / 100.0
         dollar_str = f"{'+' if d >= 0 else '-'}${abs(d):,.2f}"
 
     fig = plt.figure(figsize=(10.24, 5.36), dpi=100, facecolor=BG)
-    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
+    # ── card panel ────────────────────────────────────────────────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
 
+    # ── glow accent (top-right) ───────────────────────────────────────────
+    from matplotlib.colors import to_rgba
+    import numpy as np
+    _gx = np.linspace(0, 1, 200); _gy = np.linspace(0, 1, 200)
+    _GX, _GY = np.meshgrid(_gx, _gy)
+    _dist = np.sqrt((_GX - 0.92)**2 + (_GY - 0.92)**2)
+    _alpha = np.clip(0.12 - _dist * 0.55, 0, 0.12)
+    ax.imshow(_alpha, extent=[0, 1, 0, 1], aspect='auto', origin='lower',
+              cmap='Greens', alpha=0.6, zorder=0, interpolation='bilinear')
+
+    # ── wings logo ────────────────────────────────────────────────────────
     lx, ly = 0.072, 0.872
-    left_wing  = [(lx-0.030, ly+0.000),(lx-0.004, ly+0.026),(lx-0.010, ly+0.008),(lx-0.003, ly+0.016),(lx-0.003, ly-0.010)]
-    right_wing = [(lx+0.030, ly+0.000),(lx+0.004, ly+0.026),(lx+0.010, ly+0.008),(lx+0.003, ly+0.016),(lx+0.003, ly-0.010)]
-    body       = [(lx-0.005, ly-0.004),(lx+0.005, ly-0.004),(lx, ly-0.030)]
+    left_wing  = [(lx-0.030,ly+0.000),(lx-0.004,ly+0.026),(lx-0.010,ly+0.008),(lx-0.003,ly+0.016),(lx-0.003,ly-0.010)]
+    right_wing = [(lx+0.030,ly+0.000),(lx+0.004,ly+0.026),(lx+0.010,ly+0.008),(lx+0.003,ly+0.016),(lx+0.003,ly-0.010)]
+    body       = [(lx-0.005,ly-0.004),(lx+0.005,ly-0.004),(lx,ly-0.030)]
     for poly in (left_wing, right_wing, body):
         ax.add_patch(Polygon(poly, closed=True, facecolor=GOLD, edgecolor=GOLD_DK, linewidth=0.6, zorder=3))
     disc(lx, ly+0.014, 0.006, facecolor=GOLD, edgecolor=GOLD_DK, lw=0.5, zorder=4)
-
     ax.text(0.122, 0.892, name, color=WHITE, fontsize=21, fontweight='bold', va='center', ha='left', zorder=3)
     ax.text(0.123, 0.836, "T R A D I N G   M A D E   E A S I E R", color=GRAY, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=3)
 
+    # ── exchange pill ─────────────────────────────────────────────────────
     if exch:
-        pw = 0.0135*len(exch) + 0.052
+        pw = 0.0135 * len(exch) + 0.052
         px = 0.96 - pw
         ax.add_patch(FancyBboxPatch((px, 0.850), pw, 0.058,
             boxstyle="round,pad=0,rounding_size=0.016",
             linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
         ax.text(px+0.022, 0.879, exch, color=SOFT, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
-        ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=PURPLE, edgecolor='none', zorder=4))
+        ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=TEAL_DK, edgecolor='none', zorder=4))
 
+    # ── pair name ─────────────────────────────────────────────────────────
     ax.text(0.05, 0.665, disp_sym, color=WHITE, fontsize=36, fontweight='bold', va='center', ha='left', zorder=3)
 
+    # ── PnL badge ─────────────────────────────────────────────────────────
     bx, by, bw, bh = 0.05, 0.40, 0.40, 0.165
-    ax.add_patch(FancyBboxPatch((bx, by), bw, bh, boxstyle="round,pad=0,rounding_size=0.03",
-        linewidth=0, facecolor=col, alpha=0.13, zorder=2))
-    ax.add_patch(FancyBboxPatch((bx, by), bw, bh, boxstyle="round,pad=0,rounding_size=0.03",
-        linewidth=1.4, edgecolor=col, facecolor='none', zorder=3))
-    ax.text(bx+0.032, by+bh-0.042, "PNL", color=col, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.030, by+0.058, f"{pct_str}  {arrow}", color=col, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
+        boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=0, facecolor=col_dk, alpha=0.18, zorder=2))
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
+        boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=1.6, edgecolor=col_dk, facecolor='none', zorder=3))
+    ax.text(bx+0.032, by+bh-0.042, "PNL",
+            color=col, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.030, by+0.058, f"{pct_str}  {arrow}",
+            color=col, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
     if dollar_str:
         ax.text(0.96, 0.60, dollar_str, color=col, fontsize=16, fontweight='bold', va='center', ha='right', zorder=4)
 
+    # ── sparkline area chart ──────────────────────────────────────────────
     cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
     pts = list(closes) if (closes and len(closes) >= 3) else None
     if pts is None:
         base = entry or current_price or 1.0
         end  = current_price or base
-        n = 24
-        pts = [base + (end-base)*(i/(n-1)) + (end-base)*0.18*math.sin((i/(n-1))*6.0) for i in range(n)]
-    n = len(pts)
-    lo, hi = min(pts), max(pts); rng = (hi-lo) or 1.0
-    xs = [cx0 + (cx1-cx0)*i/(n-1) for i in range(n)]
-    ys = [cy0 + (cy1-cy0)*((p-lo)/rng) for p in pts]
-    ax.fill_between(xs, ys, cy0-0.02, color=PURPLE, alpha=0.16, zorder=2, linewidth=0)
-    ax.fill_between(xs, ys, cy0-0.02, color=PURPLE2, alpha=0.10, zorder=2, linewidth=0)
-    ax.plot(xs, ys, color=PURPLE, lw=2.6, solid_capstyle='round', solid_joinstyle='round', zorder=3)
-    disc(xs[-1], ys[-1], 0.020, facecolor=PURPLE, alpha=0.22, edgecolor='none', zorder=3)
-    disc(xs[-1], ys[-1], 0.009, facecolor=PURPLE_LT, edgecolor='none', zorder=4)
+        n = 30
+        pts = [base + (end - base) * (i / (n-1)) + (end - base) * 0.15 * math.sin((i / (n-1)) * 5.5) for i in range(n)]
+    n   = len(pts)
+    lo, hi = min(pts), max(pts); rng = (hi - lo) or 1.0
+    xs  = [cx0 + (cx1 - cx0) * i / (n-1) for i in range(n)]
+    ys  = [cy0 + (cy1 - cy0) * ((p - lo) / rng) for p in pts]
 
+    # area fill
+    ax.fill_between(xs, ys, cy0 - 0.01, color=TEAL_DK, alpha=0.22, zorder=2, linewidth=0)
+    ax.fill_between(xs, ys, cy0 - 0.01, color=TEAL, alpha=0.06, zorder=2, linewidth=0)
+    # line
+    ax.plot(xs, ys, color=TEAL, lw=2.4, solid_capstyle='round', solid_joinstyle='round', zorder=3)
+    # endpoint dot
+    disc(xs[-1], ys[-1], 0.022, facecolor=PANEL, edgecolor=TEAL, lw=1.8, zorder=4)
+    disc(xs[-1], ys[-1], 0.008, facecolor=TEAL, edgecolor='none', zorder=5)
+
+    # ── divider ───────────────────────────────────────────────────────────
     ax.plot([0.05, 0.95], [0.315, 0.315], color=PANEL_ED, lw=1.0, zorder=2)
 
+    # ── bottom detail chips ───────────────────────────────────────────────
     def chip(x, glyph):
-        cw, ch = 0.05, 0.095
-        cy = 0.135
-        ax.add_patch(FancyBboxPatch((x, cy), cw, ch, boxstyle="round,pad=0,rounding_size=0.018",
+        cw, ch, cy_chip = 0.05, 0.095, 0.135
+        ax.add_patch(FancyBboxPatch((x, cy_chip), cw, ch,
+            boxstyle="round,pad=0,rounding_size=0.018",
             linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
-        gx, gy = x+cw/2, cy+ch/2
+        gx, gy = x + cw/2, cy_chip + ch/2
         if glyph == 'exit':
-            ax.plot([gx-0.011, gx-0.011], [gy-0.020, gy+0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
-            ax.plot([gx-0.011, gx-0.002], [gy+0.020, gy+0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
-            ax.plot([gx-0.011, gx-0.002], [gy-0.020, gy-0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.plot([gx-0.011, gx-0.011], [gy-0.020, gy+0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.plot([gx-0.011, gx-0.002], [gy+0.020, gy+0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.plot([gx-0.011, gx-0.002], [gy-0.020, gy-0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
             ax.annotate('', xy=(gx+0.016, gy), xytext=(gx-0.004, gy),
-                        arrowprops=dict(arrowstyle='-|>', color=PURPLE, lw=1.8), zorder=4)
+                        arrowprops=dict(arrowstyle='-|>', color=TEAL_DK, lw=1.8), zorder=4)
         elif glyph == 'lev':
             ax.add_patch(Arc((gx, gy-0.006), width=0.046/ASPECT, height=0.046, angle=0,
-                             theta1=25, theta2=155, color=PURPLE, lw=1.8, zorder=4))
-            ax.plot([gx, gx-0.010], [gy-0.006, gy+0.014], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
-            disc(gx, gy-0.006, 0.004, facecolor=PURPLE, edgecolor='none', zorder=4)
+                             theta1=25, theta2=155, color=TEAL_DK, lw=1.8, zorder=4))
+            ax.plot([gx, gx-0.010], [gy-0.006, gy+0.014], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
+            disc(gx, gy-0.006, 0.004, facecolor=TEAL_DK, edgecolor='none', zorder=4)
         elif glyph == 'clock':
-            disc(gx, gy, 0.022, facecolor='none', edgecolor=PURPLE, lw=1.7, zorder=4)
-            ax.plot([gx, gx], [gy, gy+0.013], color=PURPLE, lw=1.7, zorder=4, solid_capstyle='round')
-            ax.plot([gx, gx+0.009/ASPECT], [gy, gy], color=PURPLE, lw=1.7, zorder=4, solid_capstyle='round')
+            disc(gx, gy, 0.022, facecolor='none', edgecolor=TEAL_DK, lw=1.7, zorder=4)
+            ax.plot([gx, gx], [gy, gy+0.013], color=TEAL_DK, lw=1.7, zorder=4, solid_capstyle='round')
+            ax.plot([gx, gx+0.009/ASPECT], [gy, gy], color=TEAL_DK, lw=1.7, zorder=4, solid_capstyle='round')
 
-    def detail(x, glyph, label, value):
+    def detail(x, glyph, label, val_str, val_col=WHITE):
         chip(x, glyph)
         tx = x + 0.066
-        ax.text(tx, 0.205, label, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=4)
-        ax.text(tx, 0.135, value, color=WHITE, fontsize=14.5, fontweight='bold', va='center', ha='left', zorder=4)
+        ax.text(tx, 0.205, label,   color=GRAY,    fontsize=9.5,  fontweight='bold', va='center', ha='left', zorder=4)
+        ax.text(tx, 0.135, val_str, color=val_col, fontsize=14.5, fontweight='bold', va='center', ha='left', zorder=4)
 
     detail(0.05, 'exit',  "EXIT",     exit_lbl)
     detail(0.40, 'lev',   "LEVERAGE", f"{lev}x")
@@ -6542,26 +6580,46 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        longs        = sum(1 for r in results if r['bias'] == 'LONG')
-        shorts       = sum(1 for r in results if r['bias'] == 'SHORT')
-        high_conf    = sum(1 for r in results if r['confidence'] >= 8)
-        bybit_count  = sum(1 for r in results if r.get('exchange') == 'BYBIT')
-        mexc_count   = sum(1 for r in results if r.get('exchange') == 'MEXC')
-        bin_count    = sum(1 for r in results if r.get('exchange') == 'BINANCE')
+        # ── Phase 0: signal surfacing threshold ─────────────────────────────
+        _, _, show_all = parse_scan_args(context.args)
+
+        if show_all:
+            shown = sorted(results, key=_conf_of, reverse=True)
+        else:
+            passing = [r for r in results if passes_display_floor(r)]
+            shown   = sorted(passing, key=_conf_of, reverse=True)
+
+        hidden = len(results) - len(shown) if not show_all else 0
+
+        if not shown:
+            top = max(results, key=_conf_of, default=None)
+            msg = "⚠️ No high-confidence setups right now."
+            if top is not None:
+                msg += (
+                    f" Top scorer: {top.get('symbol')} at {_conf_of(top):.0f}/10.\n"
+                    f"Use /scan all to see everything."
+                )
+            await update.message.reply_text(msg)
+            return
+        # ────────────────────────────────────────────────────────────────────
+
+        bybit_count  = sum(1 for r in shown if r.get('exchange') == 'BYBIT')
+        bin_count    = sum(1 for r in shown if r.get('exchange') == 'BINANCE')
         bybit_note   = f"BYBIT: {bybit_count}" if sakz_exchanges.BYBIT_AVAILABLE else "BYBIT: skipped (blocked)"
         binance_note = f"BINANCE: {bin_count}"  if sakz_exchanges.BINANCE_AVAILABLE else "BINANCE: skipped (blocked)"
         cache_note   = "⚡ cached" if from_cache else "🔄 fresh"
-
-        # Summary folded into send_signal_cards title
-        pass
 
         if not from_cache:
             await notify_alerts(results, context.bot)
             await post_broadcast(results, context.bot)
 
+        title = f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}"
+        if hidden:
+            title += f"\n({hidden} lower-confidence setup(s) hidden — use /scan all to view)"
+
         await send_signal_cards(
-            update.message, results,
-            title=f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}",
+            update.message, shown,
+            title=title,
             max_show=20,
             chat_id=chat_id,
             source="scan"
@@ -9353,6 +9411,29 @@ def _parse_tf_arg(raw: str) -> str | None:
     s = re.sub(r'week?s?$',     'w', s)
     return s if s in TF_MAP_MEXC else None
 
+def parse_scan_args(args):
+    """Parse /scan [pair] [tf] [all] arguments.
+    Returns (pair, timeframe, show_all).
+    Distinguishes: symbol token vs timeframe token vs show-all flag.
+    """
+    pair = timeframe = None
+    show_all = False
+    for a in (args or []):
+        tok = str(a).strip().lower()
+        if not tok:
+            continue
+        if tok in _SCAN_SHOW_ALL_FLAGS:
+            show_all = True
+            continue
+        tf = _parse_tf_arg(tok)
+        if tf:
+            timeframe = tf
+            continue
+        if pair is None:
+            pair = tok
+    return pair, timeframe, show_all
+
+
 def _tf_display(tf: str) -> str:
     labels = {'1m':'1 Min','3m':'3 Min','5m':'5 Min','15m':'15 Min','30m':'30 Min',
               '1h':'1 Hour','2h':'2 Hour','4h':'4 Hour','6h':'6 Hour','12h':'12 Hour',
@@ -11187,7 +11268,7 @@ async def lb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /fgi — Fear & Greed Index
 # Uses alternative.me free API (no key needed)
 # Gives market sentiment + trading recommendation
-# ─���───────────────────────────────────────────
+# ─────────────────────────────────────────────
 def _fetch_fgi():
     """Fetch Fear & Greed Index from alternative.me. Returns dict or None."""
     try:
@@ -11199,74 +11280,207 @@ def _fetch_fgi():
         logger.warning("FGI fetch error: %s", e)
         return None
 
-def _fgi_bar(value):
-    """Visual bar for FGI value 0-100."""
-    filled = int(value / 10)
-    empty  = 10 - filled
-    return "█" * filled + "░" * empty
 
-def _fgi_interpretation(value, classification):
-    """Return trading guidance based on FGI value."""
-    if value <= 10:
-        return (
-            "🔴 EXTREME FEAR\n\n"
-            "📌 Market is in extreme panic. Historically this is when\n"
-            "   the best LONG opportunities appear.\n\n"
-            "✅ LONG bias favoured — but confirm with /scan first.\n"
-            "⚠️ Catching a falling knife is risky — wait for reversal signals."
-        )
-    elif value <= 25:
-        return (
-            "🔴 FEAR\n\n"
-            "📌 Market sentiment is bearish. Sellers dominate.\n\n"
-            "✅ Cautious LONG opportunities may exist on strong support.\n"
-            "✅ SHORT signals in this zone tend to be late — avoid chasing.\n"
-            "🎯 Best approach: /filter LONG 8 to find high-conviction longs."
-        )
-    elif value <= 45:
-        return (
-            "🟡 INDECISIVE / NEUTRAL (Leaning Fear)\n\n"
-            "📌 Market is uncertain. No clear directional dominance.\n\n"
-            "⚠️ This is a choppy zone — signals have higher failure rate.\n"
-            "🎯 Stick to signals with confidence ≥ 8/10 and short hold durations.\n"
-            "💡 /filter LONG 8 or /filter SHORT 8 recommended."
-        )
-    elif value <= 55:
-        return (
-            "🟡 NEUTRAL\n\n"
-            "📌 Market has no strong bias either way.\n\n"
-            "⚠️ Indecisive conditions — best to trade only the highest conviction signals.\n"
-            "🎯 Use /best and only take 9–10/10 confidence signals.\n"
-            "💡 Both LONG and SHORT can work — let the TA decide."
-        )
-    elif value <= 70:
-        return (
-            "🟠 GREED\n\n"
-            "📌 Market participants are optimistic. Buyers dominate.\n\n"
-            "✅ LONG signals in this zone can ride the momentum well.\n"
-            "⚠️ Approaching reversal territory — avoid over-leveraged longs.\n"
-            "🎯 Consider LONG entries but tighten stop losses."
-        )
-    elif value <= 90:
-        return (
-            "🔴 EXTREME GREED\n\n"
-            "📌 Market is overheated. Euphoria is high.\n\n"
-            "⚠️ LONG entries here are late and risky — smart money is selling.\n"
-            "✅ SHORT bias favoured — look for distribution signals.\n"
-            "🎯 Use /filter SHORT 8 for high-confidence short signals."
-        )
-    else:
-        return (
-            "🔴 MAXIMUM GREED\n\n"
-            "📌 Market is at peak euphoria. Contrarian SHORT setups are highest probability.\n\n"
-            "✅ Strong SHORT bias — this is historically a major top zone.\n"
-            "⚠️ Do NOT open new longs here without strong TA confirmation.\n"
-            "🎯 /filter SHORT 9 recommended."
-        )
+def _fgi_score_color(value):
+    """Return hex colour for a given FGI value."""
+    if value <= 25:   return "#F0556B"   # red   — fear
+    elif value <= 45: return "#F5D020"   # yellow — neutral/leaning fear
+    elif value <= 55: return "#C5CBD3"   # soft   — neutral
+    elif value <= 75: return "#F0A93C"   # orange — greed
+    else:             return "#F0556B"   # red    — extreme greed
+
+
+def _fgi_bias_line(value):
+    """One-line trading guidance for the card."""
+    if value <= 10:   return "Extreme panic — LONG setups historically strong"
+    elif value <= 25: return "Fear zone — cautious LONG on key support only"
+    elif value <= 45: return "Choppy — stick to 8+/10 confidence signals"
+    elif value <= 55: return "No strong bias — let TA lead, use /best"
+    elif value <= 75: return "Greed — LONG momentum valid, tighten stops"
+    elif value <= 90: return "Extreme greed — SHORT bias, smart money selling"
+    else:             return "Peak euphoria — high-probability SHORT zone"
+
+
+def render_fgi_card(data):
+    """Render the upgraded SAKZ FGI card (PNG bytes).
+
+    Amber/gold colour system. Bar chart with today highlighted bright,
+    prior days fading. Score badge with amber border. Amber glow accent.
+    """
+    import math
+    import numpy as np
+    from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
+
+    BG       = "#0e0e0f"; PANEL    = "#111215"; PANEL_ED = "#1e2028"
+    AMBER    = "#EF9F27"; AMBER_DK = "#BA7517"; AMBER_XDK = "#854F0B"
+    AMBER_LT = "#FAC775"
+    GREEN    = "#2FD477"; RED      = "#F0556B"
+    WHITE    = "#FFFFFF"; SOFT     = "#C5CBD3"; GRAY     = "#8A93A0"
+    CHIP_BG  = "#111318"; CHIP_ED  = "#222832"
+    GOLD     = "#E7B23C"; GOLD_DK  = "#B8822A"
+
+    ASPECT = 10.24 / 5.36
+
+    def disc(x, y, r, **kw):
+        ax.add_patch(Ellipse((x, y), width=2*r/ASPECT, height=2*r, **kw))
+
+    name    = os.environ.get("BOT_NAME", "SAKZ").upper()
+    current = data[0]
+    value   = int(current['value'])
+    classif = current['value_classification']
+    ts      = datetime.fromtimestamp(int(current['timestamp']))
+    score_col = _fgi_score_color(value)
+    bias_line = _fgi_bias_line(value)
+
+    delta     = value - int(data[1]['value']) if len(data) >= 2 else 0
+    trend_str = f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "±0")
+    trend_col = GREEN if delta > 0 else (RED if delta < 0 else SOFT)
+
+    history = []
+    for d in data[:7]:
+        history.append((int(d['value']),
+                        d['value_classification'],
+                        datetime.fromtimestamp(int(d['timestamp'])).strftime('%b %d')))
+
+    fig = plt.figure(figsize=(10.24, 5.36), dpi=100, facecolor=BG)
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+
+    # ── card panel ────────────────────────────────────────────────────────
+    ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
+        boxstyle="round,pad=0,rounding_size=0.035",
+        linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
+
+    # ── amber glow accent (top-right) ─────────────────────────────────────
+    _gx = np.linspace(0, 1, 200); _gy = np.linspace(0, 1, 200)
+    _GX, _GY = np.meshgrid(_gx, _gy)
+    _dist = np.sqrt((_GX - 0.95)**2 + (_GY - 0.95)**2)
+    _alpha = np.clip(0.14 - _dist * 0.60, 0, 0.14)
+    ax.imshow(_alpha, extent=[0, 1, 0, 1], aspect='auto', origin='lower',
+              cmap='YlOrBr', alpha=0.55, zorder=0, interpolation='bilinear')
+
+    # ── wings logo ────────────────────────────────────────────────────────
+    lx, ly = 0.072, 0.872
+    left_wing  = [(lx-0.030,ly+0.000),(lx-0.004,ly+0.026),(lx-0.010,ly+0.008),(lx-0.003,ly+0.016),(lx-0.003,ly-0.010)]
+    right_wing = [(lx+0.030,ly+0.000),(lx+0.004,ly+0.026),(lx+0.010,ly+0.008),(lx+0.003,ly+0.016),(lx+0.003,ly-0.010)]
+    body       = [(lx-0.005,ly-0.004),(lx+0.005,ly-0.004),(lx,ly-0.030)]
+    for poly in (left_wing, right_wing, body):
+        ax.add_patch(Polygon(poly, closed=True, facecolor=GOLD, edgecolor=GOLD_DK, linewidth=0.6, zorder=3))
+    disc(lx, ly+0.014, 0.006, facecolor=GOLD, edgecolor=GOLD_DK, lw=0.5, zorder=4)
+    ax.text(0.122, 0.892, name,                                color=WHITE, fontsize=21,  fontweight='bold', va='center', ha='left', zorder=3)
+    ax.text(0.123, 0.836, "T R A D I N G   M A D E   E A S I E R", color=GRAY, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=3)
+
+    # ── FGI pill ──────────────────────────────────────────────────────────
+    tag = "FGI"
+    pw  = 0.0135 * len(tag) + 0.052
+    px  = 0.96 - pw
+    ax.add_patch(FancyBboxPatch((px, 0.850), pw, 0.058,
+        boxstyle="round,pad=0,rounding_size=0.016",
+        linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
+    ax.text(px+0.022, 0.879, tag, color=SOFT, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=AMBER_DK, edgecolor='none', zorder=4))
+
+    # ── title ─────────────────────────────────────────────────────────────
+    ax.text(0.05, 0.690, "FEAR & GREED", color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=3)
+
+    # ── score badge ───────────────────────────────────────────────────────
+    bx, by, bw, bh = 0.05, 0.40, 0.38, 0.165
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
+        boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=0, facecolor=AMBER_DK, alpha=0.18, zorder=2))
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
+        boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=1.6, edgecolor=AMBER_DK, facecolor='none', zorder=3))
+    ax.text(bx+0.032, by+bh-0.042, "SCORE",
+            color=AMBER, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.030, by+0.058, f"{value}/100",
+            color=AMBER, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
+
+    # classification + 24h trend — right of badge
+    ax.text(0.472, by+bh-0.040, classif.upper(),
+            color=AMBER, fontsize=13, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(0.472, by+0.082, f"{trend_str} vs yesterday",
+            color=trend_col, fontsize=10.5, fontweight='bold', va='center', ha='left', zorder=4)
+
+    # ── 7-day bar chart ───────────────────────────────────────────────────
+    cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
+    n   = len(history)
+    gap = (cx1 - cx0) / n
+    bar_w = gap * 0.72
+    for i, (v, c, dt) in enumerate(history):
+        bx_  = cx0 + i * gap
+        bh_  = (cy1 - cy0) * (v / 100.0)
+        # colour hierarchy: today bright, yesterday mid, rest dim
+        if i == 0:
+            bar_col = AMBER;    alpha_ = 1.00
+        elif i == 1:
+            bar_col = AMBER_DK; alpha_ = 0.85
+        elif i <= 3:
+            bar_col = GRAY;     alpha_ = 0.35
+        else:
+            bar_col = AMBER_DK; alpha_ = 0.40
+        ax.add_patch(FancyBboxPatch((bx_, cy0), bar_w, bh_,
+            boxstyle="round,pad=0,rounding_size=0.008",
+            linewidth=0, facecolor=bar_col, alpha=alpha_, zorder=3))
+        ax.text(bx_ + bar_w/2, cy0 - 0.030, dt[-5:],
+                color=GRAY, fontsize=7.5, va='center', ha='center', zorder=4)
+        ax.text(bx_ + bar_w/2, cy0 + bh_ + 0.025, str(v),
+                color=AMBER if i == 0 else SOFT,
+                fontsize=7.5, va='center', ha='center',
+                fontweight='bold' if i == 0 else 'normal', zorder=4)
+
+    # ── divider ───────────────────────────────────────────────────────────
+    ax.plot([0.05, 0.95], [0.315, 0.315], color=PANEL_ED, lw=1.0, zorder=2)
+
+    # ── guidance line ─────────────────────────────────────────────────────
+    ax.text(0.05, 0.355, bias_line,
+            color=SOFT, fontsize=9.5, va='center', ha='left', zorder=4, style='italic')
+
+    # ── bottom detail chips ───────────────────────────────────────────────
+    def chip(x, glyph):
+        cw, ch, cy_chip = 0.05, 0.095, 0.135
+        ax.add_patch(FancyBboxPatch((x, cy_chip), cw, ch,
+            boxstyle="round,pad=0,rounding_size=0.018",
+            linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
+        gx, gy = x + cw/2, cy_chip + ch/2
+        if glyph == 'gauge':
+            disc(gx, gy, 0.022, facecolor='none', edgecolor=AMBER_DK, lw=1.7, zorder=4)
+            angle = math.pi * (1.0 - value / 100.0)
+            ax.plot([gx, gx + 0.013 * math.cos(angle) / ASPECT],
+                    [gy, gy + 0.013 * math.sin(angle)],
+                    color=AMBER_DK, lw=1.7, zorder=5, solid_capstyle='round')
+            disc(gx, gy, 0.004, facecolor=AMBER_DK, edgecolor='none', zorder=6)
+        elif glyph == 'trend':
+            col_a = GREEN if delta >= 0 else RED
+            ax.annotate('', xy=(gx, gy+0.018 if delta >= 0 else gy-0.018),
+                            xytext=(gx, gy-0.018 if delta >= 0 else gy+0.018),
+                            arrowprops=dict(arrowstyle='-|>', color=col_a, lw=1.8), zorder=4)
+        elif glyph == 'clock':
+            disc(gx, gy, 0.022, facecolor='none', edgecolor=AMBER_DK, lw=1.7, zorder=4)
+            ax.plot([gx, gx], [gy, gy+0.013], color=AMBER_DK, lw=1.7, zorder=4, solid_capstyle='round')
+            ax.plot([gx, gx+0.009/ASPECT], [gy, gy],    color=AMBER_DK, lw=1.7, zorder=4, solid_capstyle='round')
+
+    def detail(x, glyph, label, val_str, val_col=WHITE):
+        chip(x, glyph)
+        tx = x + 0.066
+        ax.text(tx, 0.205, label,   color=GRAY,    fontsize=9.5,  fontweight='bold', va='center', ha='left', zorder=4)
+        ax.text(tx, 0.135, val_str, color=val_col, fontsize=14.5, fontweight='bold', va='center', ha='left', zorder=4)
+
+    updated_str = ts.strftime('%b %d  %H:%M')
+    detail(0.05, 'gauge', 'INDEX',   f"{value}/100", val_col=AMBER)
+    detail(0.38, 'trend', '24H CHG', trend_str,      val_col=trend_col)
+    detail(0.71, 'clock', 'UPDATED', updated_str)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
 
 async def fgi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /fgi    — current Fear & Greed Index + 7-day history + trading guidance
+    /fgi    — current Fear & Greed Index as a branded image card
     """
     _track(update)
     await update.message.reply_text("📊 Fetching Fear & Greed Index...")
@@ -11281,89 +11495,57 @@ async def fgi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Current reading
-    current   = data[0]
-    value     = int(current['value'])
-    classif   = current['value_classification']
-    ts        = datetime.fromtimestamp(int(current['timestamp']))
-    guidance  = _fgi_interpretation(value, classif)
-    bar       = _fgi_bar(value)
+    try:
+        png = await loop.run_in_executor(None, render_fgi_card, data)
+    except Exception as e:
+        logger.warning("FGI card render error: %s", e)
+        await update.message.reply_text("⚠️ Could not render FGI card. Try again shortly.")
+        return
 
-    # 7-day history trend
-    history_lines = []
-    for d in data[:7]:
-        v     = int(d['value'])
-        c     = d['value_classification']
-        dt    = datetime.fromtimestamp(int(d['timestamp'])).strftime('%b %d')
-        hbar  = "█" * int(v/10) + "░" * (10-int(v/10))
-        emoji = "🟢" if v <= 40 else ("🟡" if v <= 60 else "🔴")
-        history_lines.append(f"{emoji} {dt}  {hbar}  {v:>3}  {c}")
-
-    # Trend direction
-    if len(data) >= 2:
-        delta = value - int(data[1]['value'])
-        trend = f"📈 +{delta} (improving)" if delta > 0 else (f"📉 {delta} (worsening)" if delta < 0 else "➡️ unchanged")
-    else:
-        trend = "N/A"
-
-    msg = (
-        f"😨 FEAR & GREED INDEX\n"
-        f"{'━'*30}\n\n"
-        f"📅 {ts.strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"{bar}  {value}/100\n"
-        f"Classification: {classif}\n"
-        f"24h Change: {trend}\n\n"
-        f"{'━'*30}\n"
-        f"📊 7-DAY HISTORY\n"
-        f"{'━'*30}\n"
-        f"{chr(10).join(history_lines)}\n\n"
-        f"{'━'*30}\n"
-        f"🧭 TRADING GUIDANCE\n"
-        f"{'━'*30}\n"
-        f"{guidance}\n\n"
-        f"{'━'*30}\n"
-        f"ℹ️ Data: alternative.me/fng\n"
-        f"Updates every ~1 hour."
-    )
+    value  = int(data[0]['value'])
+    classif = data[0]['value_classification']
+    caption = f"😨 Fear & Greed Index — {value}/100 · {classif}"
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Refresh FGI",  callback_data="fgi_refresh"),
-        InlineKeyboardButton("🔍 Scan Now",     callback_data="menu_run|scan")
+        InlineKeyboardButton("🔄 Refresh", callback_data="fgi_refresh"),
+        InlineKeyboardButton("🔍 Scan Now", callback_data="menu_run|scan"),
     ]])
-    await update.message.reply_text(msg, reply_markup=keyboard)
+    await update.message.reply_photo(
+        photo=io.BytesIO(png), caption=caption, reply_markup=keyboard
+    )
 
 
 async def fgi_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Refresh button on FGI card."""
+    """Refresh button on FGI card — sends a fresh card as a new photo."""
     query = update.callback_query
     await query.answer("Fetching latest FGI...")
+
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _fetch_fgi)
     if not data:
         await query.answer("⚠️ FGI API unavailable", show_alert=True)
         return
-    current  = data[0]
-    value    = int(current['value'])
-    classif  = current['value_classification']
-    ts       = datetime.fromtimestamp(int(current['timestamp'])).strftime('%H:%M:%S')
-    bar      = _fgi_bar(value)
-    guidance = _fgi_interpretation(value, classif)
-    msg = (
-        f"😨 FEAR & GREED — REFRESHED [{ts}]\n"
-        f"{'━'*30}\n\n"
-        f"{bar}  {value}/100\n"
-        f"{classif}\n\n"
-        f"{'━'*30}\n"
-        f"{guidance}"
-    )
+
+    try:
+        png = await loop.run_in_executor(None, render_fgi_card, data)
+    except Exception as e:
+        logger.warning("FGI card render error (refresh): %s", e)
+        await query.answer("⚠️ Render failed", show_alert=True)
+        return
+
+    value   = int(data[0]['value'])
+    classif = data[0]['value_classification']
+    ts      = datetime.fromtimestamp(int(data[0]['timestamp'])).strftime('%H:%M:%S')
+    caption = f"😨 Fear & Greed Index — {value}/100 · {classif} · refreshed {ts}"
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh again", callback_data="fgi_refresh"),
-        InlineKeyboardButton("🔍 Scan Now",      callback_data="menu_run|scan")
+        InlineKeyboardButton("🔍 Scan Now",      callback_data="menu_run|scan"),
     ]])
-    try:
-        await query.edit_message_text(msg, reply_markup=keyboard)
-    except Exception:
-        await query.message.reply_text(msg, reply_markup=keyboard)
+    await query.message.reply_photo(
+        photo=io.BytesIO(png), caption=caption, reply_markup=keyboard
+    )
+
 
 
 # ─────────────────���───────────────────────────────────────────────────────────
