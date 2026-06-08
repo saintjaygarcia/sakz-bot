@@ -6339,6 +6339,9 @@ async def signal_details_callback(update: Update, context: ContextTypes.DEFAULT_
     r    = entry['signal']
     rank = entry['rank']
     link = get_exchange_link(r.get('exchange', ''), r['symbol'])
+    # FIX #AUTOREFRESH — pause the 30s timer while the Details sub-view is open
+    # so the card isn't yanked back to the primary view mid-read.
+    _autorefresh_pause(query)
     details_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ Back",     callback_data=f"sig_back|{key}"),
         InlineKeyboardButton("🔗 Trade Now", url=link),
@@ -6368,6 +6371,8 @@ async def signal_refresh_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     r    = entry['signal']
     rank = entry['rank']
+    # FIX #AUTOREFRESH — back on the primary card, resume the 30s timer
+    _autorefresh_resume(query)
     # Rebuild card — _build_signal_common fetches a fresh live price
     _, keyboard = cache_signal_card(r, rank, InlineKeyboardMarkup([]))
     try:
@@ -6390,6 +6395,8 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     r    = entry['signal']
     rank = entry['rank']
+    # FIX #AUTOREFRESH — back on the primary card, resume the 30s timer
+    _autorefresh_resume(query)
     # Restore original keyboard (already has the Details button baked in)
     existing_rows = entry['primary_kb'].inline_keyboard if entry['primary_kb'] else []
     restored_kb   = InlineKeyboardMarkup(list(existing_rows) + [
@@ -7104,104 +7111,185 @@ def build_pnl_card(signal, leverage, capital, custom=False):
     return "\n".join(lines)
 
 
-def render_pnl_card_image(signal, current_price, leverage, capital=None):
-    """Render a branded live-PnL card as PNG bytes (matplotlib).
+def _fmt_held_for(scan_time):
+    """Human 'Xd Yh Zm' duration since scan_time (datetime or ISO string)."""
+    if not scan_time:
+        return "\u2014"
+    try:
+        st = datetime.fromisoformat(scan_time) if isinstance(scan_time, str) else scan_time
+        if not isinstance(st, datetime):
+            return "\u2014"
+        secs = int((datetime.now() - st.replace(tzinfo=None)).total_seconds())
+        secs = max(secs, 0)
+        days, rem = divmod(secs, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        if days > 0:
+            return f"{days}d {hours}h {mins}m"
+        if hours > 0:
+            return f"{hours}h {mins}m"
+        return f"{mins}m"
+    except Exception:
+        return "\u2014"
 
-    Shows leveraged PnL %. The $ amount is included only when `capital` is given.
+
+def _fetch_sparkline_closes(exchange, symbol, limit=60):
+    """Recent 1h close prices for the PnL-card sparkline (oldest-first floats)."""
+    try:
+        exch = (exchange or '').upper()
+        if exch == 'BYBIT':
+            df = bybit_fetch_ohlcv(symbol, '60', limit)
+        elif exch == 'BINANCE':
+            df = binance_fetch_ohlcv(symbol, '1h', limit)
+        else:
+            df = mexc_fetch_ohlcv(symbol, '1h', limit)
+        if df is None or len(df) == 0:
+            return []
+        return [float(c) for c in df['close'].tolist()]
+    except Exception as e:
+        logger.warning("sparkline fetch failed %s %s: %s", exchange, symbol, e)
+        return []
+
+
+def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None):
+    """Render the branded live-PnL card (PNG bytes).
+
+    Dark 'SAKZ' layout: wings emblem + tagline, exchange pill, pair, big
+    leveraged PnL %, a purple price sparkline, and an EXIT / LEVERAGE / HELD FOR
+    detail row. Leveraged PnL %% always shown; $ amount only when capital given.
     """
-    from matplotlib.patches import FancyBboxPatch, Rectangle
+    import math
+    from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
 
-    # Palette — intentionally distinct from the other cards in this bot.
-    BG_OUTER  = "#05070A"
-    PANEL     = "#0E1318"
-    PANEL_EDG = "#1E2730"
-    ACCENT    = "#F0A91B"   # amber brand accent
-    GREEN     = "#2ECC71"
-    RED       = "#E74C3C"
-    WHITE     = "#F5F7FA"
-    GRAY      = "#7A8794"
+    BG="#0A0B0E"; PANEL="#0C0E13"; PANEL_ED="#1B1F27"
+    GREEN="#2FD477"; RED="#F0556B"
+    WHITE="#FFFFFF"; SOFT="#C5CBD3"; GRAY="#8A93A0"
+    CHIP_BG="#12151B"; CHIP_ED="#262B34"
+    PURPLE="#9A6CFF"; PURPLE2="#6D45D6"; PURPLE_LT="#C9B0FF"
+    GOLD="#E7B23C"; GOLD_DK="#B8822A"
+
+    ASPECT = 10.24 / 5.36
+    def disc(x, y, r, **kw):
+        ax.add_patch(Ellipse((x, y), width=2*r/ASPECT, height=2*r, **kw))
 
     name = os.environ.get("BOT_NAME", "SAKZ").upper()
 
     entry = float(signal.get('price') or 0) or current_price
     bias  = str(signal.get('bias', 'LONG')).upper()
     if entry > 0:
-        raw_pct = ((current_price - entry) / entry * 100) if bias == 'LONG' \
-                  else ((entry - current_price) / entry * 100)
+        raw_pct = ((current_price - entry)/entry*100) if bias == 'LONG' else ((entry - current_price)/entry*100)
     else:
         raw_pct = 0.0
-    lev_pct = raw_pct * leverage
-    up      = lev_pct >= 0
-    pnl_col = GREEN if up else RED
+    lev = leverage or 1
+    lev_pct = raw_pct * lev
+    up  = lev_pct >= 0
+    col = GREEN if up else RED
+    arrow = "\u25B2" if up else "\u25BC"
 
     raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
     disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith('USDT') else raw_sym
     exch     = str(signal.get('exchange', '')).upper()
     exit_lbl = str(signal.get('exit_mode') or signal.get('exit') or 'Manual')
+    held_str = _fmt_held_for(signal.get('scan_time'))
 
     pct_str = f"{lev_pct:+.2f}%"
     dollar_str = None
     if capital:
-        dollar = capital * lev_pct / 100.0
-        dollar_str = f"{'+' if dollar >= 0 else '-'}${abs(dollar):,.2f}"
+        d = capital * lev_pct / 100.0
+        dollar_str = f"{'+' if d >= 0 else '-'}${abs(d):,.2f}"
 
-    fig = plt.figure(figsize=(9, 4.8), dpi=200, facecolor=BG_OUTER)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+    fig = plt.figure(figsize=(10.24, 5.36), dpi=100, facecolor=BG)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # Panel
-    ax.add_patch(FancyBboxPatch(
-        (0.025, 0.05), 0.95, 0.90,
-        boxstyle="round,pad=0.0,rounding_size=0.03",
-        linewidth=1.2, edgecolor=PANEL_EDG, facecolor=PANEL,
-        transform=ax.transAxes))
+    ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
+        boxstyle="round,pad=0,rounding_size=0.035",
+        linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
 
-    # Brand lockup: accent tick + wordmark
-    ax.add_patch(FancyBboxPatch(
-        (0.060, 0.852), 0.016, 0.052,
-        boxstyle="round,pad=0.0,rounding_size=0.010",
-        linewidth=0, facecolor=ACCENT, transform=ax.transAxes))
-    ax.text(0.088, 0.878, name, color=WHITE, fontsize=15, fontweight='bold',
-            va='center', ha='left')
+    lx, ly = 0.072, 0.872
+    left_wing  = [(lx-0.030, ly+0.000),(lx-0.004, ly+0.026),(lx-0.010, ly+0.008),(lx-0.003, ly+0.016),(lx-0.003, ly-0.010)]
+    right_wing = [(lx+0.030, ly+0.000),(lx+0.004, ly+0.026),(lx+0.010, ly+0.008),(lx+0.003, ly+0.016),(lx+0.003, ly-0.010)]
+    body       = [(lx-0.005, ly-0.004),(lx+0.005, ly-0.004),(lx, ly-0.030)]
+    for poly in (left_wing, right_wing, body):
+        ax.add_patch(Polygon(poly, closed=True, facecolor=GOLD, edgecolor=GOLD_DK, linewidth=0.6, zorder=3))
+    disc(lx, ly+0.014, 0.006, facecolor=GOLD, edgecolor=GOLD_DK, lw=0.5, zorder=4)
 
-    # Exchange (top-right)
-    ax.text(0.940, 0.878, exch, color=GRAY, fontsize=11, va='center', ha='right')
+    ax.text(0.122, 0.892, name, color=WHITE, fontsize=21, fontweight='bold', va='center', ha='left', zorder=3)
+    ax.text(0.123, 0.836, "T R A D I N G   M A D E   E A S I E R", color=GRAY, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=3)
 
-    # Symbol
-    ax.text(0.060, 0.700, disp_sym, color=WHITE, fontsize=27, fontweight='bold',
-            va='center', ha='left')
+    if exch:
+        pw = 0.0135*len(exch) + 0.052
+        px = 0.96 - pw
+        ax.add_patch(FancyBboxPatch((px, 0.850), pw, 0.058,
+            boxstyle="round,pad=0,rounding_size=0.016",
+            linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
+        ax.text(px+0.022, 0.879, exch, color=SOFT, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
+        ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=PURPLE, edgecolor='none', zorder=4))
 
-    # PnL highlight box + accent bar + big %
-    ax.add_patch(FancyBboxPatch(
-        (0.052, 0.452), 0.34, 0.150,
-        boxstyle="round,pad=0.0,rounding_size=0.02",
-        linewidth=0, facecolor=pnl_col, alpha=0.10, transform=ax.transAxes))
-    ax.add_patch(Rectangle((0.052, 0.452), 0.012, 0.150, facecolor=pnl_col,
-                           edgecolor='none', transform=ax.transAxes))
-    ax.text(0.085, 0.527, pct_str, color=pnl_col, fontsize=30, fontweight='bold',
-            va='center', ha='left')
+    ax.text(0.05, 0.665, disp_sym, color=WHITE, fontsize=36, fontweight='bold', va='center', ha='left', zorder=3)
 
-    # Dollar amount (top-right, below exchange) — only when capital provided
+    bx, by, bw, bh = 0.05, 0.40, 0.40, 0.165
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh, boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=0, facecolor=col, alpha=0.13, zorder=2))
+    ax.add_patch(FancyBboxPatch((bx, by), bw, bh, boxstyle="round,pad=0,rounding_size=0.03",
+        linewidth=1.4, edgecolor=col, facecolor='none', zorder=3))
+    ax.text(bx+0.032, by+bh-0.042, "PNL", color=col, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.030, by+0.058, f"{pct_str}  {arrow}", color=col, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
     if dollar_str:
-        ax.text(0.940, 0.610, dollar_str, color=pnl_col, fontsize=18,
-                fontweight='bold', va='center', ha='right')
+        ax.text(0.96, 0.60, dollar_str, color=col, fontsize=16, fontweight='bold', va='center', ha='right', zorder=4)
 
-    # Divider
-    ax.plot([0.060, 0.940], [0.360, 0.360], color=PANEL_EDG, lw=1.0,
-            transform=ax.transAxes)
+    cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
+    pts = list(closes) if (closes and len(closes) >= 3) else None
+    if pts is None:
+        base = entry or current_price or 1.0
+        end  = current_price or base
+        n = 24
+        pts = [base + (end-base)*(i/(n-1)) + (end-base)*0.18*math.sin((i/(n-1))*6.0) for i in range(n)]
+    n = len(pts)
+    lo, hi = min(pts), max(pts); rng = (hi-lo) or 1.0
+    xs = [cx0 + (cx1-cx0)*i/(n-1) for i in range(n)]
+    ys = [cy0 + (cy1-cy0)*((p-lo)/rng) for p in pts]
+    ax.fill_between(xs, ys, cy0-0.02, color=PURPLE, alpha=0.16, zorder=2, linewidth=0)
+    ax.fill_between(xs, ys, cy0-0.02, color=PURPLE2, alpha=0.10, zorder=2, linewidth=0)
+    ax.plot(xs, ys, color=PURPLE, lw=2.6, solid_capstyle='round', solid_joinstyle='round', zorder=3)
+    disc(xs[-1], ys[-1], 0.020, facecolor=PURPLE, alpha=0.22, edgecolor='none', zorder=3)
+    disc(xs[-1], ys[-1], 0.009, facecolor=PURPLE_LT, edgecolor='none', zorder=4)
 
-    # Detail row: EXIT | LEVERAGE
-    ax.text(0.060, 0.285, "EXIT", color=GRAY, fontsize=9.5, va='center', ha='left')
-    ax.text(0.060, 0.205, exit_lbl, color=WHITE, fontsize=14, va='center', ha='left')
-    ax.text(0.520, 0.285, "LEVERAGE", color=GRAY, fontsize=9.5, va='center', ha='left')
-    ax.text(0.520, 0.205, f"{leverage}x", color=WHITE, fontsize=14, va='center', ha='left')
+    ax.plot([0.05, 0.95], [0.315, 0.315], color=PANEL_ED, lw=1.0, zorder=2)
 
-    # Bottom accent line (decorative)
-    ax.add_patch(Rectangle((0.060, 0.080), 0.090, 0.008, facecolor=ACCENT,
-                           edgecolor='none', transform=ax.transAxes))
+    def chip(x, glyph):
+        cw, ch = 0.05, 0.095
+        cy = 0.135
+        ax.add_patch(FancyBboxPatch((x, cy), cw, ch, boxstyle="round,pad=0,rounding_size=0.018",
+            linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
+        gx, gy = x+cw/2, cy+ch/2
+        if glyph == 'exit':
+            ax.plot([gx-0.011, gx-0.011], [gy-0.020, gy+0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.plot([gx-0.011, gx-0.002], [gy+0.020, gy+0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.plot([gx-0.011, gx-0.002], [gy-0.020, gy-0.020], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
+            ax.annotate('', xy=(gx+0.016, gy), xytext=(gx-0.004, gy),
+                        arrowprops=dict(arrowstyle='-|>', color=PURPLE, lw=1.8), zorder=4)
+        elif glyph == 'lev':
+            ax.add_patch(Arc((gx, gy-0.006), width=0.046/ASPECT, height=0.046, angle=0,
+                             theta1=25, theta2=155, color=PURPLE, lw=1.8, zorder=4))
+            ax.plot([gx, gx-0.010], [gy-0.006, gy+0.014], color=PURPLE, lw=1.8, zorder=4, solid_capstyle='round')
+            disc(gx, gy-0.006, 0.004, facecolor=PURPLE, edgecolor='none', zorder=4)
+        elif glyph == 'clock':
+            disc(gx, gy, 0.022, facecolor='none', edgecolor=PURPLE, lw=1.7, zorder=4)
+            ax.plot([gx, gx], [gy, gy+0.013], color=PURPLE, lw=1.7, zorder=4, solid_capstyle='round')
+            ax.plot([gx, gx+0.009/ASPECT], [gy, gy], color=PURPLE, lw=1.7, zorder=4, solid_capstyle='round')
+
+    def detail(x, glyph, label, value):
+        chip(x, glyph)
+        tx = x + 0.066
+        ax.text(tx, 0.205, label, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=4)
+        ax.text(tx, 0.135, value, color=WHITE, fontsize=14.5, fontweight='bold', va='center', ha='left', zorder=4)
+
+    detail(0.05, 'exit',  "EXIT",     exit_lbl)
+    detail(0.40, 'lev',   "LEVERAGE", f"{lev}x")
+    detail(0.70, 'clock', "HELD FOR", held_str)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', facecolor=BG_OUTER, edgecolor='none')
+    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none')
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
@@ -7212,7 +7300,7 @@ async def send_pnl_image_card(update, context):
     msg = update.effective_message
     signal = context.user_data.get('pnl_signal')
     if not signal:
-        await msg.reply_text("⚠️ Signal data lost. Run /pnl again.")
+        await msg.reply_text("⚠�� Signal data lost. Run /pnl again.")
         return
 
     capital  = context.user_data.get('pnl_capital')
@@ -7225,7 +7313,8 @@ async def send_pnl_image_card(update, context):
         return
 
     try:
-        png = render_pnl_card_image(signal, current, leverage, capital)
+        closes = _fetch_sparkline_closes(signal.get('exchange', ''), signal['symbol'])
+        png = render_pnl_card_image(signal, current, leverage, capital, closes)
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
@@ -14265,7 +14354,7 @@ async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ RF training failed: {e}")
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────���──────────────────
 # /btfull — Historical Walk-Forward Backtest
 # Requires sakz_backtest_hist.py in the same directory.
 # ─────────────────────────────────────────────
@@ -14489,6 +14578,258 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────────
+# AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
+# ──────────────────────────────────────────────────────────────────────────────────
+# Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
+# cadence (default 30s) — WITHOUT removing the manual button (users can still
+# tap it whenever they want).
+#
+# How it works (no duplicated render logic):
+#   We reuse the EXACT callback the manual 🔄 button fires. A tiny headless
+#   CallbackQuery/Update shim lets us invoke that callback on a timer with no
+#   real button press. The shim:
+#     • routes edit_message_text/caption/reply_markup to bot.edit_* on the
+#       stored (chat_id, message_id), so the card refreshes IN PLACE;
+#     • makes query.answer(...) and message.reply_*(...) no-ops, so a scheduled
+#       refresh never pops a toast or posts a brand-new message (no spam);
+#     • cancels its own timer if the card was deleted or the bot was blocked.
+#
+# Scheduling — one central hook:
+#   We wrap bot.send_message once at startup. Whenever an outgoing TEXT card
+#   carries a known refresh button, we arm a repeating job for that message.
+#   Image cards (charts, PnL image) go out via send_photo and post a NEW photo
+#   on each refresh, so they are intentionally NOT auto-fired (that would spam
+#   the chat and is compute-heavy). Their manual button still works.
+#
+# Env knobs:
+#   AUTO_REFRESH_SECS        interval seconds                (default 30)
+#   AUTO_REFRESH_MAX_CYCLES  auto-stop after N ticks, 0=never (default 60 = 30m)
+#   AUTO_REFRESH_MAX_JOBS    global cap on concurrent timers  (default 400)
+# ──────────────────────────────────────────────────────────────────────────────────
+AUTO_REFRESH_SECS       = max(5, int(os.getenv("AUTO_REFRESH_SECS", "30")))
+AUTO_REFRESH_MAX_CYCLES = int(os.getenv("AUTO_REFRESH_MAX_CYCLES", "60"))
+AUTO_REFRESH_MAX_JOBS   = int(os.getenv("AUTO_REFRESH_MAX_JOBS", "400"))
+
+# Live timers (job names) and cards paused because a sub-view is open.
+_autorefresh_jobs   = set()
+_autorefresh_paused = set()
+_autorefresh_installed = False
+
+
+def _autorefresh_dispatch():
+    """callback_data prefix -> the existing handler the manual button fires.
+    Only IN-PLACE text cards are listed; image cards are excluded on purpose."""
+    return {
+        "sig_refresh":            signal_refresh_callback,
+        "cscan_refresh":          cscan_refresh_callback,
+        "feed_refresh":           feed_refresh_callback,
+        "cmp_refresh":            compare_refresh_callback,
+        "cmp_full_refresh":       compare_full_refresh_callback,
+        "custom_compare_refresh": custom_compare_refresh_callback,
+        "fgi_refresh":            fgi_refresh_callback,
+    }
+
+
+def _autorefresh_handler_for(callback_data):
+    """Return the handler for a refresh callback_data, or None."""
+    if not callback_data:
+        return None
+    prefix = callback_data.split("|", 1)[0]
+    return _autorefresh_dispatch().get(prefix)
+
+
+def _autorefresh_pause(query):
+    """Pause auto-refresh for this card (e.g. user opened the Details sub-view)."""
+    try:
+        m = query.message
+        _autorefresh_paused.add((m.chat_id, m.message_id))
+    except Exception:
+        pass
+
+
+def _autorefresh_resume(query):
+    """Resume auto-refresh for this card (user returned to the primary view)."""
+    try:
+        m = query.message
+        _autorefresh_paused.discard((m.chat_id, m.message_id))
+    except Exception:
+        pass
+
+
+class _HeadlessMessage:
+    """Stand-in for query.message during a scheduled refresh. All sends are
+    no-ops so a timer can never post a new message or a toast."""
+    def __init__(self, chat_id, message_id):
+        self.chat_id    = chat_id
+        self.message_id = message_id
+        self.chat       = type("_AutoChat", (), {"id": chat_id})()
+
+    async def reply_text(self, *a, **k):          return None
+    async def reply_photo(self, *a, **k):         return None
+    async def reply_markup(self, *a, **k):        return None
+    async def edit_reply_markup(self, *a, **k):   return None
+
+
+class _HeadlessQuery:
+    """Stand-in for update.callback_query during a scheduled refresh."""
+    def __init__(self, bot, chat_id, message_id, data):
+        self._bot       = bot
+        self.data       = data
+        self.chat_id    = chat_id
+        self.message_id = message_id
+        self.message    = _HeadlessMessage(chat_id, message_id)
+        self.from_user  = None
+        self.stop       = False   # set True when the card is gone / bot blocked
+
+    async def answer(self, *a, **k):
+        # Scheduled refresh: never surface a toast/alert to the user.
+        return True
+
+    async def _edit(self, **kwargs):
+        from telegram.error import BadRequest, Forbidden, TelegramError
+        try:
+            return await self._bot.edit_message_text(
+                chat_id=self.chat_id, message_id=self.message_id, **kwargs
+            )
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "not modified" in msg:
+                return None                       # nothing changed — fine
+            if ("not found" in msg or "can't be edited" in msg
+                    or "message to edit" in msg or "chat not found" in msg):
+                self.stop = True                  # card gone — stop the timer
+                return None
+            logger.debug("autorefresh edit BadRequest: %s", e)
+            return None
+        except Forbidden:
+            self.stop = True                      # user blocked the bot
+            return None
+        except TelegramError as e:
+            logger.debug("autorefresh edit error: %s", e)
+            return None
+
+    async def edit_message_text(self, text=None, reply_markup=None, **k):
+        return await self._edit(text=text, reply_markup=reply_markup, **k)
+
+    async def edit_message_caption(self, caption=None, reply_markup=None, **k):
+        from telegram.error import TelegramError
+        try:
+            return await self._bot.edit_message_caption(
+                chat_id=self.chat_id, message_id=self.message_id,
+                caption=caption, reply_markup=reply_markup, **k)
+        except TelegramError:
+            return None
+
+    async def edit_message_reply_markup(self, reply_markup=None, **k):
+        from telegram.error import TelegramError
+        try:
+            return await self._bot.edit_message_reply_markup(
+                chat_id=self.chat_id, message_id=self.message_id,
+                reply_markup=reply_markup, **k)
+        except TelegramError:
+            return None
+
+
+class _HeadlessUpdate:
+    def __init__(self, query):
+        self.callback_query = query
+        self.effective_chat = type("_AutoChat", (), {"id": query.chat_id})()
+        self.effective_user = None
+        self.message        = None
+
+
+async def _auto_refresh_job(context):
+    """JobQueue callback — re-fires the manual refresh handler in place."""
+    job  = context.job
+    d    = job.data or {}
+    name = job.name
+    handler = _autorefresh_handler_for(d.get("callback_data"))
+    if handler is None:
+        job.schedule_removal(); _autorefresh_jobs.discard(name); return
+
+    # Skip (but keep the timer alive) while a sub-view like Details is open.
+    if (d.get("chat_id"), d.get("message_id")) in _autorefresh_paused:
+        return
+
+    query  = _HeadlessQuery(context.bot, d["chat_id"], d["message_id"],
+                            d["callback_data"])
+    update = _HeadlessUpdate(query)
+    try:
+        await handler(update, context)
+    except Exception as e:
+        logger.debug("auto-refresh handler %s failed: %s", name, e)
+
+    d["cycles"] = d.get("cycles", 0) + 1
+    if query.stop or (AUTO_REFRESH_MAX_CYCLES > 0
+                      and d["cycles"] >= AUTO_REFRESH_MAX_CYCLES):
+        job.schedule_removal()
+        _autorefresh_jobs.discard(name)
+
+
+def _schedule_auto_refresh(job_queue, chat_id, message_id, callback_data):
+    """Arm (or skip) a repeating auto-refresh timer for one card."""
+    if job_queue is None or _autorefresh_handler_for(callback_data) is None:
+        return
+    name = f"autoref|{chat_id}|{message_id}"
+    if name in _autorefresh_jobs or job_queue.get_jobs_by_name(name):
+        return                                    # already armed
+    if len(_autorefresh_jobs) >= AUTO_REFRESH_MAX_JOBS:
+        logger.warning("auto-refresh cap (%d) reached — not arming %s",
+                       AUTO_REFRESH_MAX_JOBS, name)
+        return
+    try:
+        job_queue.run_repeating(
+            _auto_refresh_job,
+            interval=AUTO_REFRESH_SECS,
+            first=AUTO_REFRESH_SECS,
+            name=name,
+            data={"chat_id": chat_id, "message_id": message_id,
+                  "callback_data": callback_data, "cycles": 0},
+        )
+        _autorefresh_jobs.add(name)
+    except Exception as e:
+        logger.debug("could not arm auto-refresh %s: %s", name, e)
+
+
+def _find_refresh_callback(reply_markup):
+    """Return the first known refresh callback_data in an InlineKeyboardMarkup."""
+    if not reply_markup or not getattr(reply_markup, "inline_keyboard", None):
+        return None
+    for row in reply_markup.inline_keyboard:
+        for btn in row:
+            cb = getattr(btn, "callback_data", None)
+            if _autorefresh_handler_for(cb) is not None:
+                return cb
+    return None
+
+
+def _install_auto_refresh(app):
+    """Wrap bot.send_message once so every TEXT card with a 🔄 button arms a
+    30s auto-refresh timer. Idempotent and safe with telegram.Bot __slots__
+    (patches at the class level, not the instance)."""
+    global _autorefresh_installed
+    if _autorefresh_installed:
+        return
+    bot_cls   = type(app.bot)
+    orig_send = bot_cls.send_message
+
+    async def send_message_wrapped(self, *args, **kwargs):
+        msg = await orig_send(self, *args, **kwargs)
+        try:
+            cb = _find_refresh_callback(getattr(msg, "reply_markup", None))
+            if cb and getattr(msg, "chat_id", None) and getattr(msg, "message_id", None):
+                _schedule_auto_refresh(app.job_queue, msg.chat_id, msg.message_id, cb)
+        except Exception as e:
+            logger.debug("auto-refresh arm-on-send skipped: %s", e)
+        return msg
+
+    bot_cls.send_message   = send_message_wrapped
+    _autorefresh_installed = True
+    logger.info("Auto-refresh engine installed (interval=%ds, max_cycles=%d, cap=%d)",
+                AUTO_REFRESH_SECS, AUTO_REFRESH_MAX_CYCLES, AUTO_REFRESH_MAX_JOBS)
+
+
 def main():
     global last_scan_results, last_scan_time, price_history, user_tracking
 
@@ -14533,6 +14874,9 @@ def main():
     logger.info("Restored %d safemode users from DB", len(safemode_users))
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # FIX #AUTOREFRESH — every card with a 🔄 button also auto-refreshes (30s)
+    _install_auto_refresh(app)
 
     # ── FIX #WS — WebSocket startup via post_init ─────────────────────────
     # app.run_polling() owns the event loop — the only safe way to launch a
