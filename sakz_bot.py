@@ -2193,7 +2193,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
 #   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
-# ──────────────────��──────────────────────────
+# ─────────────────────────────────────────────
 def generate_chart(signal, df4h):
     """
     Generate a chart PNG (bytes) for the given signal using the 4H OHLCV dataframe
@@ -2362,7 +2362,7 @@ def generate_chart(signal, df4h):
 
 # ─────────────────────────────────────────────
 # ANALYZE FUNCTIONS
-# ──────────────────────────��──────────────────
+# ─────────────────────────────────────────────
 def analyze_bybit(symbol):
     try:
         df4h = bybit_fetch_ohlcv(symbol, '240', 100)
@@ -2918,49 +2918,64 @@ def _fetch_ohlc_since(exchange, symbol, scan_time, limit=60):
 
 
 def _compute_peak_pct(signal, current_price=None):
-    """Highest FAVOURABLE move (%) a signal reached since it was scanned.
+    """
+    Highest favorable % a signal reached since it was scanned, plus WHEN.
 
-    Uses 1H candle WICKS (high for LONG, low for SHORT) from scan_time to now,
-    so it captures the true peak even if price has since reversed past the
-    entry. Returns an UNLEVERAGED percentage (the caller applies leverage), or
-    None if it can't be computed. Folds in the live price so a still-running
-    move is never under-reported. Note: history is limited to roughly the most
-    recent ~500h of 1H candles, so peaks before that window may be clipped.
+    Returns (peak_pct, peak_at):
+      • peak_pct : largest UNLEVERAGED favorable move (%) from entry, using
+                   candle wicks (highs for LONG, lows for SHORT) over 1H candles
+                   since scan_time, folded with the current live price.
+      • peak_at  : datetime the peak occurred (candle timestamp, or now if the
+                   live price is the most favorable point).
+    Returns (None, None) when no data is available.
     """
     try:
         entry = float(signal.get('price') or 0)
+        bias  = str(signal.get('bias', 'LONG')).upper()
         if entry <= 0:
-            return None
-        bias = str(signal.get('bias', 'LONG')).upper()
-        exch = str(signal.get('exchange', '')).upper()
-        sym  = signal.get('symbol', '')
-        scan_time = signal.get('scan_time')
-        if isinstance(scan_time, datetime):
-            scan_iso = scan_time.isoformat()
-        elif scan_time:
-            scan_iso = str(scan_time)
-        else:
-            return None
+            return None, None
 
-        candles = _fetch_ohlc_since(exch, sym, scan_iso, limit=500)
-        favs = []
+        scan_time = signal.get('scan_time')
+        if hasattr(scan_time, 'isoformat'):
+            scan_iso = scan_time.isoformat()
+        else:
+            scan_iso = str(scan_time) if scan_time else None
+        if not scan_iso:
+            return None, None
+
+        candles = _fetch_ohlc_since(
+            signal.get('exchange', ''), signal.get('symbol', ''), scan_iso, limit=500
+        )
+
+        best    = None
+        best_at = None
         for cdl in candles:
             if bias == 'LONG':
-                favs.append((cdl['high'] - entry) / entry * 100)
+                fav = (cdl['high'] - entry) / entry * 100
             else:
-                favs.append((entry - cdl['low']) / entry * 100)
+                fav = (entry - cdl['low']) / entry * 100
+            if best is None or fav > best:
+                best, best_at = fav, cdl['ts']
+
         if current_price and current_price > 0:
             if bias == 'LONG':
-                favs.append((current_price - entry) / entry * 100)
+                cur_fav = (current_price - entry) / entry * 100
             else:
-                favs.append((entry - current_price) / entry * 100)
-        if not favs:
-            return None
-        return max(favs)
+                cur_fav = (entry - current_price) / entry * 100
+            if best is None or cur_fav > best:
+                best, best_at = cur_fav, datetime.now()
+
+        if best is None:
+            return None, None
+        if hasattr(best_at, 'replace'):
+            try:
+                best_at = best_at.replace(tzinfo=None)
+            except Exception:
+                pass
+        return best, best_at
     except Exception as e:
-        logger.warning("_compute_peak_pct error %s %s: %s",
-                       signal.get('exchange', ''), signal.get('symbol', ''), e)
-        return None
+        logger.warning("_compute_peak_pct error: %s", e)
+        return None, None
 
 
 def _resolve_outcome_from_candles(candles, bias, sl, t1, t2, t3):
@@ -5459,208 +5474,314 @@ def _fetch_sparkline_closes(exchange, symbol, limit=60):
         return []
 
 
-def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None, peak_raw_pct=None):
-    """Render the upgraded SAKZ PnL card (PNG bytes).
+def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None, peak_raw_pct=None, peak_at=None):
+    """Render the SAKZ 'AI Trading Intelligence' PnL card (PNG bytes).
 
-    Teal/green colour system. Area-fill sparkline with endpoint dot.
-    Badge mirrors the FGI score box style. Amber logo unchanged.
+    Layout mirrors the v2 card design: header emblem, pair + direction/leverage
+    pill, big PNL (ROI), profit box, framed price chart with ENTRY/EXIT callouts,
+    a 3-stat strip (EXIT target / LEVERAGE / HELD FOR) and a 5-stat footer
+    (ENTRY PRICE / EXIT PRICE / PNL USDT / ROI / TIME).
+
+    Preserves prior data: live ROI, dollar profit, peak high-water-mark (with
+    time-to-peak), direction + leverage, exit target and held-for duration.
     """
-    import math
+    import math, io
+    import numpy as np
     from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
-    from matplotlib.path import Path
-    import matplotlib.patches as mpatches
 
-    BG       = "#0c0d10"; PANEL    = "#0e0f13"; PANEL_ED = "#1c2030"
-    TEAL     = "#5DCAA5"; TEAL_DK  = "#1D9E75"; TEAL_XDK = "#0F6E56"
-    WHITE    = "#FFFFFF"; SOFT     = "#C5CBD3"; GRAY     = "#8A93A0"
-    CHIP_BG  = "#111318"; CHIP_ED  = "#222832"
-    RED      = "#F0556B"
-    GOLD     = "#E7B23C"; GOLD_DK  = "#B8822A"
+    # ---- palette --------------------------------------------------------
+    BG        = "#06080B"
+    CARD      = "#0A0D12"
+    CARD_ED   = "#232C36"
+    PANEL2    = "#0E141A"
+    PANEL2_ED = "#1E2731"
+    CALL_BG   = "#0C1116"
+    GREEN     = "#34E29B"
+    GREEN_DK  = "#1FA87A"
+    RED       = "#F0556B"
+    RED_DK    = "#A33442"
+    WHITE     = "#FFFFFF"
+    SOFT      = "#AEB6BF"
+    GRAY      = "#7E8893"
+    SUBCOL    = "#7FA899"
+    GRID      = "#172029"
 
-    ASPECT = 10.24 / 5.36
+    ASPECT = 10.24 / 6.83
+    up_arrow = "\u25B2"
+    dn_arrow = "\u25BC"
 
     def disc(x, y, r, **kw):
-        ax.add_patch(Ellipse((x, y), width=2*r/ASPECT, height=2*r, **kw))
+        ax.add_patch(Ellipse((x, y), width=2 * r / ASPECT, height=2 * r, **kw))
 
+    # ---- derive values --------------------------------------------------
     name = os.environ.get("BOT_NAME", "SAKZ").upper()
 
-    entry = float(signal.get('price') or 0) or current_price
+    entry = float(signal.get('price') or 0) or float(current_price or 0)
     bias  = str(signal.get('bias', 'LONG')).upper()
-    if entry > 0:
-        raw_pct = ((current_price - entry) / entry * 100) if bias == 'LONG' \
-                  else ((entry - current_price) / entry * 100)
+    is_long = bias == 'LONG'
+    cur   = float(current_price or 0)
+    if entry > 0 and cur > 0:
+        raw_pct = ((cur - entry) / entry * 100) if is_long else ((entry - cur) / entry * 100)
     else:
         raw_pct = 0.0
     lev     = leverage or 1
     lev_pct = raw_pct * lev
     up      = lev_pct >= 0
-    col     = TEAL if up else RED
-    col_dk  = TEAL_DK if up else "#A32D2D"
-    arrow   = "\u25B2" if up else "\u25BC"
+    col     = GREEN if up else RED
+    col_dk  = GREEN_DK if up else RED_DK
+    dir_col = GREEN if is_long else RED
+    dir_arrow = up_arrow if is_long else dn_arrow
 
-    raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
-    disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith('USDT') else raw_sym
+    raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT').replace('/', '')
+    disp_sym = raw_sym
     exch     = str(signal.get('exchange', '')).upper()
-    exit_lbl = str(signal.get('exit_mode') or signal.get('exit') or 'Manual')
-    held_str = _fmt_held_for(signal.get('scan_time'))
+    held_str = _fmt_held_for(signal.get('scan_time')).upper()
 
-    pct_str    = f"{lev_pct:+.2f}%"
-    dollar_str = None
+    roi_str = f"{lev_pct:+.2f}%"
     if capital:
-        d = capital * lev_pct / 100.0
-        dollar_str = f"{'+' if d >= 0 else '-'}${abs(d):,.2f}"
+        dval = capital * lev_pct / 100.0
+        dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.2f}"
+    else:
+        dollar_str = "\u2014"
 
-    # peak (high-water-mark) favourable move, leveraged. Defaults to the
-    # current move when no peak was supplied, and never drops below it.
-    _peak_raw = peak_raw_pct if peak_raw_pct is not None else raw_pct
-    peak_lev_pct = _peak_raw * lev
+    # peak high-water-mark (leveraged), never below current pnl
+    if peak_raw_pct is not None:
+        peak_lev_pct = peak_raw_pct * lev
+    else:
+        peak_lev_pct = lev_pct
     if peak_lev_pct < lev_pct:
         peak_lev_pct = lev_pct
-    peak_up    = peak_lev_pct >= 0
-    peak_col   = TEAL if peak_up else RED
-    peak_arrow = "\u25B2" if peak_up else "\u25BC"
-    peak_str   = f"{peak_lev_pct:+.2f}%"
-    peak_dollar_str = None
-    if capital:
-        _pd = capital * peak_lev_pct / 100.0
-        peak_dollar_str = f"{'+' if _pd >= 0 else '-'}${abs(_pd):,.2f}"
+    peak_str = f"{peak_lev_pct:+.2f}%"
+    peak_when_str = None
+    _scan_t = signal.get('scan_time')
+    if peak_at is not None and _scan_t:
+        try:
+            _st = datetime.fromisoformat(_scan_t) if isinstance(_scan_t, str) else _scan_t
+            if isinstance(_st, datetime):
+                _secs = max(int((peak_at.replace(tzinfo=None) - _st.replace(tzinfo=None)).total_seconds()), 0)
+                _d, _r = divmod(_secs, 86400)
+                _h, _r = divmod(_r, 3600)
+                _m = _r // 60
+                if _d:
+                    peak_when_str = f"{_d}d {_h}h {_m}m"
+                elif _h:
+                    peak_when_str = f"{_h}h {_m}m"
+                else:
+                    peak_when_str = f"{_m}m"
+        except Exception:
+            peak_when_str = None
 
-    fig = plt.figure(figsize=(10.24, 5.36), dpi=100, facecolor=BG)
+    def _fmt_price(p):
+        if not p:
+            return "\u2014"
+        p = float(p)
+        if p >= 1000:
+            return f"${p:,.2f}"
+        if p >= 1:
+            return f"${p:,.4f}"
+        return f"${p:.5f}"
+    entry_price_str = _fmt_price(entry)
+    exit_price_str  = _fmt_price(cur)
+
+    exit_mode = str(signal.get('exit_mode') or signal.get('exit') or '').upper().strip()
+    _tp_map = {'TP1': 'TAKE PROFIT 1', 'TP2': 'TAKE PROFIT 2', 'TP3': 'TAKE PROFIT 3',
+               'SL': 'STOP LOSS', 'STOP': 'STOP LOSS'}
+    if exit_mode in _tp_map:
+        exit_val = exit_mode; exit_sub = _tp_map[exit_mode]; exit_callout = f"EXIT ({exit_mode})"
+    elif exit_mode:
+        exit_val = exit_mode; exit_sub = "TARGET"; exit_callout = "EXIT"
+    else:
+        exit_val = "OPEN"; exit_sub = "STILL ACTIVE"; exit_callout = "CURRENT"
+
+    margin_mode = str(signal.get('margin_mode') or 'CROSS').upper()
+
+    try:
+        _tt = datetime.fromisoformat(_scan_t) if isinstance(_scan_t, str) else _scan_t
+        time_str = _tt.strftime("%d %b %Y %H:%M:%S") if isinstance(_tt, datetime) else "\u2014"
+    except Exception:
+        time_str = "\u2014"
+
+    # ---- figure ---------------------------------------------------------
+    fig = plt.figure(figsize=(10.24, 6.83), dpi=100, facecolor=BG)
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ────────────────────────────────────────────────────────
-    ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
-        boxstyle="round,pad=0,rounding_size=0.035",
-        linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
+    ax.add_patch(FancyBboxPatch((0.012, 0.018), 0.976, 0.964,
+        boxstyle="round,pad=0,rounding_size=0.030",
+        linewidth=1.4, edgecolor=CARD_ED, facecolor=CARD, zorder=1))
 
-    # ── glow accent (top-right) ───────────────────────────────────────────
-    from matplotlib.colors import to_rgba
-    import numpy as np
-    _gx = np.linspace(0, 1, 200); _gy = np.linspace(0, 1, 200)
-    _GX, _GY = np.meshgrid(_gx, _gy)
-    _dist = np.sqrt((_GX - 0.92)**2 + (_GY - 0.92)**2)
-    _alpha = np.clip(0.12 - _dist * 0.55, 0, 0.12)
-    ax.imshow(_alpha, extent=[0, 1, 0, 1], aspect='auto', origin='lower',
-              cmap='Greens', alpha=0.6, zorder=0, interpolation='bilinear')
+    # radial glow behind chart (top-right) — transparent green haze, keeps card dark
+    gx = np.linspace(0, 1, 200); gy = np.linspace(0, 1, 200)
+    GXX, GYY = np.meshgrid(gx, gy)
+    dist = np.sqrt((GXX - 0.72) ** 2 + (GYY - 0.74) ** 2)
+    glow = np.clip(0.10 - dist * 0.46, 0, 0.10)
+    rgba = np.zeros((glow.shape[0], glow.shape[1], 4))
+    rgba[..., 0] = 0.12; rgba[..., 1] = 0.66; rgba[..., 2] = 0.46
+    rgba[..., 3] = glow * 2.6
+    ax.imshow(rgba, extent=[0.10, 0.965, 0.36, 0.945], aspect='auto', origin='lower',
+              zorder=1, interpolation='bilinear')
 
-    # ── wings logo ────────────────────────────────────────────────────────
-    lx, ly = 0.072, 0.872
-    left_wing  = [(lx-0.030,ly+0.000),(lx-0.004,ly+0.026),(lx-0.010,ly+0.008),(lx-0.003,ly+0.016),(lx-0.003,ly-0.010)]
-    right_wing = [(lx+0.030,ly+0.000),(lx+0.004,ly+0.026),(lx+0.010,ly+0.008),(lx+0.003,ly+0.016),(lx+0.003,ly-0.010)]
-    body       = [(lx-0.005,ly-0.004),(lx+0.005,ly-0.004),(lx,ly-0.030)]
-    for poly in (left_wing, right_wing, body):
-        ax.add_patch(Polygon(poly, closed=True, facecolor=GOLD, edgecolor=GOLD_DK, linewidth=0.6, zorder=3))
-    disc(lx, ly+0.014, 0.006, facecolor=GOLD, edgecolor=GOLD_DK, lw=0.5, zorder=4)
-    ax.text(0.122, 0.892, name, color=WHITE, fontsize=21, fontweight='bold', va='center', ha='left', zorder=3)
-    ax.text(0.123, 0.836, "T R A D I N G   M A D E   E A S I E R", color=GRAY, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=3)
+    # ---- header emblem + wordmark --------------------------------------
+    lx, ly = 0.066, 0.905
+    def _wing(side):
+        feathers = [
+            [(0.000, 0.004), (0.052 * side, 0.030), (0.030 * side, 0.006), (0.044 * side, -0.004)],
+            [(0.004 * side, 0.000), (0.040 * side, 0.016), (0.024 * side, -0.002), (0.034 * side, -0.012)],
+            [(0.006 * side, -0.006), (0.028 * side, 0.002), (0.016 * side, -0.012), (0.022 * side, -0.020)],
+        ]
+        for f in feathers:
+            ax.add_patch(Polygon([(lx + px, ly + py) for px, py in f], closed=True,
+                facecolor=GREEN, edgecolor=GREEN_DK, linewidth=0.5, zorder=4))
+    _wing(1); _wing(-1)
+    ax.add_patch(Polygon([(lx - 0.006, ly + 0.018), (lx + 0.006, ly + 0.018), (lx, ly - 0.030)],
+        closed=True, facecolor=GREEN, edgecolor=GREEN_DK, linewidth=0.5, zorder=5))
+    disc(lx, ly + 0.024, 0.008, facecolor=GREEN, edgecolor=GREEN_DK, lw=0.5, zorder=6)
 
-    # ── exchange pill ─────────────────────────────────────────────────────
-    if exch:
-        pw = 0.0135 * len(exch) + 0.052
-        px = 0.96 - pw
-        ax.add_patch(FancyBboxPatch((px, 0.850), pw, 0.058,
-            boxstyle="round,pad=0,rounding_size=0.016",
-            linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
-        ax.text(px+0.022, 0.879, exch, color=SOFT, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
-        ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=TEAL_DK, edgecolor='none', zorder=4))
+    ax.text(0.120, 0.918, name, color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=5)
+    ax.text(0.122, 0.870, "A I   T R A D I N G   I N T E L L I G E N C E", color=SUBCOL,
+            fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=5)
 
-    # ── pair name ─────────────────────────────────────────────────────────
-    ax.text(0.05, 0.665, disp_sym, color=WHITE, fontsize=36, fontweight='bold', va='center', ha='left', zorder=3)
+    # ---- left column: pair, direction pill, ROI, peak, profit ----------
+    _sym_fs = 44 if len(disp_sym) <= 8 else (36 if len(disp_sym) <= 11 else 30)
+    ax.text(0.046, 0.762, disp_sym, color=WHITE, fontsize=_sym_fs, fontweight='bold', va='center', ha='left', zorder=5)
 
-    # ── PnL badge ─────────────────────────────────────────────────────────
-    bx, by, bw, bh = 0.05, 0.345, 0.40, 0.205
-    # direction pill (LONG / SHORT) sitting just above the PnL badge
-    dir_label = "LONG" if bias == "LONG" else "SHORT"
-    dir_col   = TEAL if bias == "LONG" else RED
-    dir_arrow = "\u25B2" if bias == "LONG" else "\u25BC"
-    dpw = 0.030 + 0.020 * len(dir_label)
-    ax.add_patch(FancyBboxPatch((bx, 0.578), dpw, 0.060,
+    pill_txt = f"{dir_arrow} {bias}   {lev}X"
+    pdw = 0.052 + 0.0150 * len(pill_txt)
+    ax.add_patch(FancyBboxPatch((0.046, 0.672), pdw, 0.052,
+        boxstyle="round,pad=0,rounding_size=0.026",
+        linewidth=1.5, edgecolor=dir_col, facecolor='none', zorder=4))
+    ax.text(0.046 + pdw / 2, 0.698, pill_txt, color=dir_col, fontsize=13, fontweight='bold', va='center', ha='center', zorder=5)
+
+    ax.text(0.048, 0.612, "PNL (ROI)", color=GRAY, fontsize=12, fontweight='bold', va='center', ha='left', zorder=5)
+    ax.text(0.044, 0.520, roi_str, color=col, fontsize=50, fontweight='bold', va='center', ha='left', zorder=5)
+
+    if peak_when_str:
+        peak_line = f"{up_arrow} Peak {peak_str}   \u00b7   reached after {peak_when_str.upper()}"
+    else:
+        peak_line = f"{up_arrow} Peak {peak_str}"
+    ax.text(0.048, 0.452, peak_line, color=(GREEN if up else RED), fontsize=10, fontweight='bold', va='center', ha='left', zorder=5)
+
+    pbx, pby, pbw, pbh = 0.046, 0.356, 0.312, 0.064
+    ax.add_patch(FancyBboxPatch((pbx, pby), pbw, pbh,
         boxstyle="round,pad=0,rounding_size=0.016",
-        linewidth=0, facecolor=dir_col, alpha=0.16, zorder=2))
-    ax.add_patch(FancyBboxPatch((bx, 0.578), dpw, 0.060,
-        boxstyle="round,pad=0,rounding_size=0.016",
-        linewidth=1.4, edgecolor=dir_col, facecolor='none', zorder=3))
-    ax.text(bx + dpw/2, 0.608, f"{dir_arrow} {dir_label}", color=dir_col,
-            fontsize=12.5, fontweight='bold', va='center', ha='center', zorder=4)
-    # PnL badge: current move (big) + peak high-water-mark (sub-line)
-    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
-        boxstyle="round,pad=0,rounding_size=0.03",
-        linewidth=0, facecolor=col_dk, alpha=0.18, zorder=2))
-    ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
-        boxstyle="round,pad=0,rounding_size=0.03",
-        linewidth=1.6, edgecolor=col_dk, facecolor='none', zorder=3))
-    ax.text(bx+0.032, by+bh-0.040, "PNL",
-            color=col, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.030, by+0.110, f"{pct_str}  {arrow}",
-            color=col, fontsize=26, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.032, by+0.042, "PEAK",
-            color=GRAY, fontsize=9, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.120, by+0.042, f"{peak_str}  {peak_arrow}",
-            color=peak_col, fontsize=12.5, fontweight='bold', va='center', ha='left', zorder=4)
-    if dollar_str:
-        ax.text(0.96, 0.60, dollar_str, color=col, fontsize=16, fontweight='bold', va='center', ha='right', zorder=4)
-    if peak_dollar_str:
-        ax.text(0.96, 0.515, f"peak {peak_dollar_str}", color=peak_col, fontsize=11,
-                fontweight='bold', va='center', ha='right', zorder=4)
+        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
+    ax.text(pbx + 0.022, pby + pbh / 2, "PROFIT", color=GRAY, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(pbx + pbw - 0.022, pby + pbh / 2, dollar_str, color=col, fontsize=15, fontweight='bold', va='center', ha='right', zorder=4)
 
-    # ── sparkline area chart ──────────────────────────────────────────────
-    cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
+    # ---- price chart ----------------------------------------------------
+    cx0, cx1 = 0.420, 0.945
+    cy0, cy1 = 0.392, 0.812
+    for i in range(1, 6):
+        gxp = cx0 + (cx1 - cx0) * i / 6
+        ax.plot([gxp, gxp], [cy0, cy1], color=GRID, lw=0.8, zorder=2)
+    for j in range(0, 4):
+        gyp = cy0 + (cy1 - cy0) * j / 3
+        ax.plot([cx0, cx1], [gyp, gyp], color=GRID, lw=0.8, zorder=2)
+
     pts = list(closes) if (closes and len(closes) >= 3) else None
     if pts is None:
-        base = entry or current_price or 1.0
-        end  = current_price or base
-        n = 30
-        pts = [base + (end - base) * (i / (n-1)) + (end - base) * 0.15 * math.sin((i / (n-1)) * 5.5) for i in range(n)]
-    n   = len(pts)
+        base = entry or cur or 1.0; end = cur or base; npt = 30
+        pts = [base + (end - base) * (i / (npt - 1)) + (end - base) * 0.12 * math.sin((i / (npt - 1)) * 5.5) for i in range(npt)]
+    n = len(pts)
     lo, hi = min(pts), max(pts); rng = (hi - lo) or 1.0
-    xs  = [cx0 + (cx1 - cx0) * i / (n-1) for i in range(n)]
-    ys  = [cy0 + (cy1 - cy0) * ((p - lo) / rng) for p in pts]
+    xs = [cx0 + (cx1 - cx0) * i / (n - 1) for i in range(n)]
+    ys = [cy0 + 0.045 + (cy1 - cy0 - 0.07) * ((p - lo) / rng) for p in pts]
 
-    # area fill
-    ax.fill_between(xs, ys, cy0 - 0.01, color=TEAL_DK, alpha=0.22, zorder=2, linewidth=0)
-    ax.fill_between(xs, ys, cy0 - 0.01, color=TEAL, alpha=0.06, zorder=2, linewidth=0)
-    # line
-    ax.plot(xs, ys, color=TEAL, lw=2.4, solid_capstyle='round', solid_joinstyle='round', zorder=3)
-    # endpoint dot
-    disc(xs[-1], ys[-1], 0.022, facecolor=PANEL, edgecolor=TEAL, lw=1.8, zorder=4)
-    disc(xs[-1], ys[-1], 0.008, facecolor=TEAL, edgecolor='none', zorder=5)
+    ax.fill_between(xs, ys, cy0, color=GREEN_DK, alpha=0.16, zorder=2, linewidth=0)
+    ax.plot(xs, ys, color=GREEN, lw=7.0, alpha=0.10, solid_capstyle='round', zorder=3)
+    ax.plot(xs, ys, color=GREEN, lw=2.6, solid_capstyle='round', solid_joinstyle='round', zorder=4)
 
-    # ── divider ───────────────────────────────────────────────────────────
-    ax.plot([0.05, 0.95], [0.315, 0.315], color=PANEL_ED, lw=1.0, zorder=2)
+    # entry dot (start)
+    disc(xs[0], ys[0], 0.022, facecolor='none', edgecolor=GREEN, lw=1.4, zorder=5)
+    disc(xs[0], ys[0], 0.011, facecolor=GREEN, edgecolor=BG, lw=1.4, zorder=6)
+    # dashed vertical at exit + baseline dot
+    ax.plot([xs[-1], xs[-1]], [cy0, ys[-1]], color=GREEN_DK, lw=1.2, ls=(0, (4, 3)), zorder=4)
+    disc(xs[-1], cy0, 0.010, facecolor=GREEN_DK, edgecolor='none', zorder=5)
+    # exit dot (end)
+    disc(xs[-1], ys[-1], 0.026, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=6)
+    disc(xs[-1], ys[-1], 0.013, facecolor=GREEN, edgecolor=BG, lw=1.6, zorder=7)
 
-    # ── bottom detail chips ───────────────────────────────────────────────
-    def chip(x, glyph):
-        cw, ch, cy_chip = 0.05, 0.095, 0.135
-        ax.add_patch(FancyBboxPatch((x, cy_chip), cw, ch,
-            boxstyle="round,pad=0,rounding_size=0.018",
-            linewidth=1.1, edgecolor=CHIP_ED, facecolor=CHIP_BG, zorder=3))
-        gx, gy = x + cw/2, cy_chip + ch/2
-        if glyph == 'exit':
-            ax.plot([gx-0.011, gx-0.011], [gy-0.020, gy+0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
-            ax.plot([gx-0.011, gx-0.002], [gy+0.020, gy+0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
-            ax.plot([gx-0.011, gx-0.002], [gy-0.020, gy-0.020], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
-            ax.annotate('', xy=(gx+0.016, gy), xytext=(gx-0.004, gy),
-                        arrowprops=dict(arrowstyle='-|>', color=TEAL_DK, lw=1.8), zorder=4)
-        elif glyph == 'lev':
-            ax.add_patch(Arc((gx, gy-0.006), width=0.046/ASPECT, height=0.046, angle=0,
-                             theta1=25, theta2=155, color=TEAL_DK, lw=1.8, zorder=4))
-            ax.plot([gx, gx-0.010], [gy-0.006, gy+0.014], color=TEAL_DK, lw=1.8, zorder=4, solid_capstyle='round')
-            disc(gx, gy-0.006, 0.004, facecolor=TEAL_DK, edgecolor='none', zorder=4)
-        elif glyph == 'clock':
-            disc(gx, gy, 0.022, facecolor='none', edgecolor=TEAL_DK, lw=1.7, zorder=4)
-            ax.plot([gx, gx], [gy, gy+0.013], color=TEAL_DK, lw=1.7, zorder=4, solid_capstyle='round')
-            ax.plot([gx, gx+0.009/ASPECT], [gy, gy], color=TEAL_DK, lw=1.7, zorder=4, solid_capstyle='round')
+    # peak marker on the curve (high-water-mark)
+    pk_i = max(range(n), key=lambda i: ys[i])
+    if 1 < pk_i < int(n * 0.82):
+        disc(xs[pk_i], ys[pk_i], 0.009, facecolor=WHITE, edgecolor=GREEN, lw=1.2, zorder=7)
+        ax.text(xs[pk_i], ys[pk_i] + 0.050, f"PEAK {peak_str}", color=WHITE, fontsize=7.5,
+                fontweight='bold', va='center', ha='center', zorder=8)
 
-    def detail(x, glyph, label, val_str, val_col=WHITE):
-        chip(x, glyph)
-        tx = x + 0.066
-        ax.text(tx, 0.205, label,   color=GRAY,    fontsize=9.5,  fontweight='bold', va='center', ha='left', zorder=4)
-        ax.text(tx, 0.135, val_str, color=val_col, fontsize=14.5, fontweight='bold', va='center', ha='left', zorder=4)
+    def callout(cx, cy, w, h, title, value, tcol):
+        ax.add_patch(FancyBboxPatch((cx, cy), w, h,
+            boxstyle="round,pad=0,rounding_size=0.014",
+            linewidth=1.2, edgecolor=PANEL2_ED, facecolor=CALL_BG, zorder=8))
+        disc(cx + 0.018, cy + h - 0.024, 0.006, facecolor=tcol, edgecolor='none', zorder=9)
+        ax.text(cx + 0.034, cy + h - 0.024, title, color=tcol, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=9)
+        ax.text(cx + 0.018, cy + 0.021, value, color=WHITE, fontsize=11, fontweight='bold', va='center', ha='left', zorder=9)
 
-    detail(0.05, 'exit',  "EXIT",     exit_lbl)
-    detail(0.40, 'lev',   "LEVERAGE", f"{lev}x")
-    detail(0.70, 'clock', "HELD FOR", held_str)
+    # entry callout (above start dot, with connector)
+    eb_w, eb_h = 0.122, 0.066
+    eb_x = min(max(xs[0] - 0.010, cx0 + 0.004), cx1 - eb_w)
+    eb_y = min(ys[0] + 0.085, cy1 - eb_h)
+    ax.plot([xs[0], xs[0]], [ys[0], eb_y], color=PANEL2_ED, lw=1.0, zorder=7)
+    callout(eb_x, eb_y, eb_w, eb_h, "ENTRY", entry_price_str, GREEN)
+
+    # exit callout (top-right, with short connector to end dot)
+    xb_w, xb_h = 0.150, 0.066
+    xb_x = cx1 - xb_w - 0.018
+    xb_y = 0.642
+    ax.plot([xb_x + xb_w, xs[-1]], [xb_y + xb_h / 2, ys[-1]], color=PANEL2_ED, lw=1.0, zorder=7)
+    callout(xb_x, xb_y, xb_w, xb_h, exit_callout, exit_price_str, GREEN)
+
+    # ---- 3-stat strip ---------------------------------------------------
+    ms_x, ms_y, ms_w, ms_h = 0.046, 0.214, 0.908, 0.116
+    ax.add_patch(FancyBboxPatch((ms_x, ms_y), ms_w, ms_h,
+        boxstyle="round,pad=0,rounding_size=0.020",
+        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
+    for dvx in (ms_x + ms_w / 3, ms_x + 2 * ms_w / 3):
+        ax.plot([dvx, dvx], [ms_y + 0.024, ms_y + ms_h - 0.024], color=PANEL2_ED, lw=1.0, zorder=4)
+
+    def stat(col_x, kind, label, value, sub):
+        icx = col_x + 0.034
+        icy = ms_y + ms_h / 2
+        disc(icx, icy, 0.030, facecolor=CALL_BG, edgecolor=GREEN_DK, lw=1.4, zorder=4)
+        if kind == 'target':
+            disc(icx, icy, 0.016, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=5)
+            disc(icx, icy, 0.0075, facecolor='none', edgecolor=GREEN, lw=1.3, zorder=5)
+            disc(icx, icy, 0.0025, facecolor=GREEN, edgecolor='none', zorder=5)
+        elif kind == 'bolt':
+            bolt = [(0.000, 0.020), (-0.011, 0.001), (-0.001, 0.001),
+                    (-0.005, -0.020), (0.013, 0.005), (0.002, 0.005)]
+            ax.add_patch(Polygon([(icx + bxv / ASPECT, icy + byv) for bxv, byv in bolt],
+                closed=True, facecolor=GREEN, edgecolor=GREEN_DK, lw=0.5, zorder=5))
+        elif kind == 'clock':
+            disc(icx, icy, 0.016, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=5)
+            ax.plot([icx, icx], [icy, icy + 0.010], color=GREEN, lw=1.5, zorder=5, solid_capstyle='round')
+            ax.plot([icx, icx + 0.009 / ASPECT], [icy, icy], color=GREEN, lw=1.5, zorder=5, solid_capstyle='round')
+        tx = col_x + 0.078
+        ax.text(tx, ms_y + ms_h - 0.030, label, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=5)
+        ax.text(tx, ms_y + ms_h / 2 - 0.002, value, color=WHITE, fontsize=15, fontweight='bold', va='center', ha='left', zorder=5)
+        ax.text(tx, ms_y + 0.026, sub, color=GRAY, fontsize=8, fontweight='bold', va='center', ha='left', zorder=5)
+
+    stat(ms_x,                  'target', "EXIT",     exit_val,   exit_sub)
+    stat(ms_x + ms_w / 3,       'bolt',   "LEVERAGE", f"{lev}X",  margin_mode)
+    stat(ms_x + 2 * ms_w / 3,   'clock',  "HELD FOR", held_str,   "DURATION")
+
+    # ---- 5-stat footer --------------------------------------------------
+    bs_x, bs_y, bs_w, bs_h = 0.046, 0.040, 0.908, 0.130
+    ax.add_patch(FancyBboxPatch((bs_x, bs_y), bs_w, bs_h,
+        boxstyle="round,pad=0,rounding_size=0.020",
+        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
+    foot = [
+        ("ENTRY PRICE", entry_price_str, WHITE, 12.5),
+        ("EXIT PRICE",  exit_price_str,  WHITE, 12.5),
+        ("PNL (USDT)",  dollar_str,      col,   12.5),
+        ("ROI",         roi_str,         col,   12.5),
+        ("TIME",        time_str,        WHITE, 9.5),
+    ]
+    col_lefts = [0.072, 0.262, 0.448, 0.620, 0.756]
+    for (lab, val, vcol, vfs), clx in zip(foot, col_lefts):
+        ax.text(clx, bs_y + bs_h - 0.040, lab, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=4)
+        ax.text(clx, bs_y + 0.042, val, color=vcol, fontsize=vfs, fontweight='bold', va='center', ha='left', zorder=4)
+    for dvx in (0.246, 0.432, 0.604, 0.742):
+        ax.plot([dvx, dvx], [bs_y + 0.024, bs_y + bs_h - 0.024], color=PANEL2_ED, lw=0.8, zorder=4)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', facecolor=BG, edgecolor='none')
@@ -5688,8 +5809,9 @@ async def send_pnl_image_card(update, context):
 
     try:
         closes = _fetch_sparkline_closes(signal.get('exchange', ''), signal['symbol'])
-        peak_raw = _compute_peak_pct(signal, current)
-        png = render_pnl_card_image(signal, current, leverage, capital, closes, peak_raw_pct=peak_raw)
+        peak_raw, peak_at = _compute_peak_pct(signal, current)
+        png = render_pnl_card_image(signal, current, leverage, capital, closes,
+                                    peak_raw_pct=peak_raw, peak_at=peak_at)
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
@@ -5744,11 +5866,13 @@ def _resolve_pnl_signal(arg: str, results: list):
 
 
 def _gather_pnl_matches(arg, results):
-    """Every signal matching `arg` from the current scan AND persisted history.
+    """
+    Find every scanned signal for a symbol — from the current scan AND from the
+    persisted scan history — so users can pull a PnL for a past call even if it
+    rolled off the bot or has since reversed direction.
 
-    A signal remains summonable for PnL as long as it was scanned at least
-    once, even after it rolls off the latest scan or reverses direction.
-    De-dupes by (symbol, bias, scan_time); returns newest first.
+    Returns a de-duplicated list, current-scan matches first, then historical
+    matches newest-first.
     """
     def _norm(s):
         return str(s or '').upper().replace('/', '').replace('_', '')
@@ -5756,41 +5880,36 @@ def _gather_pnl_matches(arg, results):
     q = _norm(arg)
     if not q:
         return []
-    q_full = q if q.endswith('USDT') else q + 'USDT'
+    q_base = q[:-4] if q.endswith('USDT') else q
 
-    def _is_match(sym):
-        n = _norm(sym)
-        return n == q or n == q_full or n.startswith(q)
+    matches = []
+    seen    = set()
 
-    pool = []
+    def _key(sig):
+        st = sig.get('scan_time')
+        st = st.isoformat() if hasattr(st, 'isoformat') else str(st)
+        return (str(sig.get('exchange')), _norm(sig.get('symbol')), st)
+
+    # 1) Current scan results (freshest)
     for r in (results or []):
-        if _is_match(r.get('symbol')):
-            pool.append(r)
+        sym = _norm(r.get('symbol'))
+        if sym == q or sym == q_base + 'USDT' or sym.startswith(q_base):
+            k = _key(r)
+            if k not in seen:
+                seen.add(k)
+                matches.append(r)
+
+    # 2) Persisted scan history
     try:
-        for r in db_find_signals_by_symbol(q):
-            if _is_match(r.get('symbol')):
-                pool.append(r)
+        for r in db_find_signals_by_symbol(q_base):
+            k = _key(r)
+            if k not in seen:
+                seen.add(k)
+                matches.append(r)
     except Exception as e:
-        logger.warning("db_find_signals_by_symbol failed for %s: %s", arg, e)
+        logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    def _ts(r):
-        st = r.get('scan_time')
-        return st if isinstance(st, datetime) else datetime.min
-
-    def _key(r):
-        st = r.get('scan_time')
-        st = st.isoformat() if isinstance(st, datetime) else str(st)
-        return (_norm(r.get('symbol')), str(r.get('bias', '')).upper(), st)
-
-    seen = set()
-    uniq = []
-    for r in sorted(pool, key=_ts, reverse=True):
-        k = _key(r)
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(r)
-    return uniq
+    return matches
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5806,23 +5925,19 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = state.last_scan_results or []
 
-    # Direct lookup: /pnl 1 (rank in last scan)  or  /pnl btc (symbol, incl. past scans)
+    # Direct lookup: /pnl 1   or   /pnl btc   (symbol works even with no current scan)
     args = context.args or []
     if args:
-        arg = args[0].strip()
+        arg0 = args[0].strip()
 
-        # A bare number refers to a rank in the CURRENT scan list.
-        if arg.isdigit():
+        # Numeric rank → pick from the current scan only.
+        if arg0.isdigit():
             if not results:
-                await update.message.reply_text(
-                    "⚠️ No current scan to number. Run /scan, or look one up by symbol (e.g. /pnl btc)."
-                )
+                await update.message.reply_text("⚠️ No scan data yet. Run /scan first, or use /pnl <symbol>.")
                 return
-            sig = _resolve_pnl_signal(arg, results)
+            sig = _resolve_pnl_signal(arg0, results)
             if sig is None:
-                await update.message.reply_text(
-                    f"⚠️ Enter a number between 1 and {len(results)}, or use a symbol (e.g. /pnl btc)."
-                )
+                await update.message.reply_text(f"⚠️ Enter a number between 1 and {len(results)}.")
                 return
             context.user_data['pnl_signal']  = sig
             context.user_data['pnl_capital'] = None
@@ -5830,46 +5945,37 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_pnl_image_card(update, context)
             return
 
-        # Symbol lookup — search the current scan AND past scans. A signal stays
-        # summonable as long as it was scanned at least once, even if it rolled
-        # off the bot or has since reversed direction.
-        matches = _gather_pnl_matches(arg, results)
-        if not matches:
+        # Symbol → search current scan AND persisted history (incl. reversed calls).
+        gathered = _gather_pnl_matches(arg0, results)
+        if not gathered:
             await update.message.reply_text(
-                f"⚠️ Couldn't find \"{arg}\" in any scan I've recorded.\n"
-                f"It needs to have been scanned at least once. Try the symbol as shown "
-                f"(e.g. /pnl btc), or run /scan first."
+                f"⚠️ Couldn't find any scanned signal for \"{arg0}\".\n"
+                f"It has to have been scanned on the chart at least once."
             )
             return
-        if len(matches) == 1:
-            context.user_data['pnl_signal']  = matches[0]
+        if len(gathered) == 1:
+            context.user_data['pnl_signal']  = gathered[0]
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None
             await send_pnl_image_card(update, context)
             return
 
-        # Multiple scans for this symbol — let the user pick which one.
-        context.user_data['pnl_matches'] = matches
-        context.user_data['pnl_capital'] = None
+        # Multiple scans for this symbol — let the user pick one.
+        context.user_data['pnl_matches'] = gathered
         context.user_data['pnl_step']    = 'pnl_pick_match'
-        sym_disp = matches[0].get('symbol', arg)
-        lines = [f"🔎 Found {len(matches)} signals for {sym_disp} across past scans:\n"]
-        for i, m in enumerate(matches[:20], 1):
-            emoji = "🟢" if str(m.get('bias', '')).upper() == "LONG" else "🔴"
-            held  = _fmt_held_for(m.get('scan_time'))
-            lev   = m.get('leverage')
+        lines = [f"🔎 Found {len(gathered)} scans for \"{arg0.upper()}\".\nPick one:\n"]
+        for i, r in enumerate(gathered[:20], 1):
+            emoji = "🟢" if str(r.get('bias')) == "LONG" else "🔴"
+            lev   = r.get('leverage')
             lev_s = f" | {lev['suggested']}x" if lev else ""
-            lines.append(
-                f"{i}. {emoji} {m.get('exchange','')} {m.get('symbol','')} — "
-                f"{m.get('bias','')} {m.get('confidence','?')}/10{lev_s}  · {held} ago"
-            )
-        if len(matches) > 20:
-            lines.append(f"... and {len(matches) - 20} more")
-        lines.append(f"\nReply with a number (1–{min(len(matches), 20)}).")
+            st    = r.get('scan_time')
+            when  = (_fmt_held_for(st) + " ago") if st else "time unknown"
+            conf  = r.get('confidence', '?')
+            lines.append(f"{i}. {emoji} {r.get('exchange')} {r.get('symbol')} — {r.get('bias')} {conf}/10{lev_s}  ·  {when}")
+        lines.append("\nReply with a number to see its PnL.")
         await update.message.reply_text("\n".join(lines))
         return
 
-    # The no-argument flow needs a current scan to list.
     if not results:
         await update.message.reply_text("⚠️ No scan data yet. Run /scan first.")
         return
@@ -5914,12 +6020,11 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             n = int(text)
             if n < 1 or n > len(matches):
-                await update.message.reply_text(f"⚠️ Enter 1–{min(len(matches), 20)}.")
+                await update.message.reply_text(f"⚠️ Enter 1–{len(matches)}.")
                 return
             context.user_data['pnl_signal']  = matches[n - 1]
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None
-            context.user_data['pnl_matches'] = None
             await send_pnl_image_card(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Reply with a number only.")
