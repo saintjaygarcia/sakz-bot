@@ -122,6 +122,7 @@ from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_init,
     db_save_scan,
     db_load_last_scan,
+    db_find_signals_by_symbol,
     db_append_price_history,
     db_load_price_history,
     db_save_signal_bias,
@@ -404,7 +405,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ─────────────────────────────────────────────────────────
+# ── /pro Detection engine ────────────────────────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -2192,7 +2193,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
 #   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
-# ─────────────────────────────────────────────
+# ──────────────────��──────────────────────────
 def generate_chart(signal, df4h):
     """
     Generate a chart PNG (bytes) for the given signal using the 4H OHLCV dataframe
@@ -2361,7 +2362,7 @@ def generate_chart(signal, df4h):
 
 # ─────────────────────────────────────────────
 # ANALYZE FUNCTIONS
-# ─────────────────────────────────────────────
+# ──────────────────────────��──────────────────
 def analyze_bybit(symbol):
     try:
         df4h = bybit_fetch_ohlcv(symbol, '240', 100)
@@ -2491,7 +2492,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 # LIQUIDITY FILTER
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
 # Thresholds by timeframe:
 #   SCALP  (15m / 1h)  →  $5M   — need tight spreads and fast fills
@@ -2877,7 +2878,7 @@ async def get_scan_results(force=False):
 # Background job that checks signal outcomes at
 # 4h, 8h, 24h, 48h intervals and updates the DB.
 # ─────────────────────────────────────────────
-def _fetch_ohlc_since(exchange, symbol, scan_time):
+def _fetch_ohlc_since(exchange, symbol, scan_time, limit=60):
     """
     FIX A2 — Fetch 1H OHLC candles covering the period from scan_time to now.
     Returns a list of dicts {ts, open, high, low, close} sorted oldest-first.
@@ -2886,11 +2887,11 @@ def _fetch_ohlc_since(exchange, symbol, scan_time):
     """
     try:
         if exchange == 'BYBIT':
-            df = bybit_fetch_ohlcv(symbol, '60', 60)          # '60' = 1h on Bybit
+            df = bybit_fetch_ohlcv(symbol, '60', limit)       # '60' = 1h on Bybit
         elif exchange == 'BINANCE':
-            df = binance_fetch_ohlcv(symbol, '1h', 60)
+            df = binance_fetch_ohlcv(symbol, '1h', limit)
         else:
-            df = mexc_fetch_ohlcv(symbol, '1h', 60)
+            df = mexc_fetch_ohlcv(symbol, '1h', limit)
 
         if df is None or len(df) == 0:
             return []
@@ -2914,6 +2915,52 @@ def _fetch_ohlc_since(exchange, symbol, scan_time):
     except Exception as e:
         logger.warning("_fetch_ohlc_since error %s %s: %s", exchange, symbol, e)
         return []
+
+
+def _compute_peak_pct(signal, current_price=None):
+    """Highest FAVOURABLE move (%) a signal reached since it was scanned.
+
+    Uses 1H candle WICKS (high for LONG, low for SHORT) from scan_time to now,
+    so it captures the true peak even if price has since reversed past the
+    entry. Returns an UNLEVERAGED percentage (the caller applies leverage), or
+    None if it can't be computed. Folds in the live price so a still-running
+    move is never under-reported. Note: history is limited to roughly the most
+    recent ~500h of 1H candles, so peaks before that window may be clipped.
+    """
+    try:
+        entry = float(signal.get('price') or 0)
+        if entry <= 0:
+            return None
+        bias = str(signal.get('bias', 'LONG')).upper()
+        exch = str(signal.get('exchange', '')).upper()
+        sym  = signal.get('symbol', '')
+        scan_time = signal.get('scan_time')
+        if isinstance(scan_time, datetime):
+            scan_iso = scan_time.isoformat()
+        elif scan_time:
+            scan_iso = str(scan_time)
+        else:
+            return None
+
+        candles = _fetch_ohlc_since(exch, sym, scan_iso, limit=500)
+        favs = []
+        for cdl in candles:
+            if bias == 'LONG':
+                favs.append((cdl['high'] - entry) / entry * 100)
+            else:
+                favs.append((entry - cdl['low']) / entry * 100)
+        if current_price and current_price > 0:
+            if bias == 'LONG':
+                favs.append((current_price - entry) / entry * 100)
+            else:
+                favs.append((entry - current_price) / entry * 100)
+        if not favs:
+            return None
+        return max(favs)
+    except Exception as e:
+        logger.warning("_compute_peak_pct error %s %s: %s",
+                       signal.get('exchange', ''), signal.get('symbol', ''), e)
+        return None
 
 
 def _resolve_outcome_from_candles(candles, bias, sl, t1, t2, t3):
@@ -4454,7 +4501,7 @@ def format_signal_primary(r, rank):
       /scan number tap, /cscan, /scalp, auto-signal detection.
 
     Layout:
-      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      ━━━━━��━━━━━━━━━━━━━━━━━━━━━━
         ⚡️ SWING | SIGNAL
         CONFIDENCE: 🟩🟩🟩🟩🟩 10/10
       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -5412,7 +5459,7 @@ def _fetch_sparkline_closes(exchange, symbol, limit=60):
         return []
 
 
-def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None):
+def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None, peak_raw_pct=None):
     """Render the upgraded SAKZ PnL card (PNG bytes).
 
     Teal/green colour system. Area-fill sparkline with endpoint dot.
@@ -5463,6 +5510,21 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         d = capital * lev_pct / 100.0
         dollar_str = f"{'+' if d >= 0 else '-'}${abs(d):,.2f}"
 
+    # peak (high-water-mark) favourable move, leveraged. Defaults to the
+    # current move when no peak was supplied, and never drops below it.
+    _peak_raw = peak_raw_pct if peak_raw_pct is not None else raw_pct
+    peak_lev_pct = _peak_raw * lev
+    if peak_lev_pct < lev_pct:
+        peak_lev_pct = lev_pct
+    peak_up    = peak_lev_pct >= 0
+    peak_col   = TEAL if peak_up else RED
+    peak_arrow = "\u25B2" if peak_up else "\u25BC"
+    peak_str   = f"{peak_lev_pct:+.2f}%"
+    peak_dollar_str = None
+    if capital:
+        _pd = capital * peak_lev_pct / 100.0
+        peak_dollar_str = f"{'+' if _pd >= 0 else '-'}${abs(_pd):,.2f}"
+
     fig = plt.figure(figsize=(10.24, 5.36), dpi=100, facecolor=BG)
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
@@ -5507,19 +5569,40 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     ax.text(0.05, 0.665, disp_sym, color=WHITE, fontsize=36, fontweight='bold', va='center', ha='left', zorder=3)
 
     # ── PnL badge ─────────────────────────────────────────────────────────
-    bx, by, bw, bh = 0.05, 0.40, 0.40, 0.165
+    bx, by, bw, bh = 0.05, 0.345, 0.40, 0.205
+    # direction pill (LONG / SHORT) sitting just above the PnL badge
+    dir_label = "LONG" if bias == "LONG" else "SHORT"
+    dir_col   = TEAL if bias == "LONG" else RED
+    dir_arrow = "\u25B2" if bias == "LONG" else "\u25BC"
+    dpw = 0.030 + 0.020 * len(dir_label)
+    ax.add_patch(FancyBboxPatch((bx, 0.578), dpw, 0.060,
+        boxstyle="round,pad=0,rounding_size=0.016",
+        linewidth=0, facecolor=dir_col, alpha=0.16, zorder=2))
+    ax.add_patch(FancyBboxPatch((bx, 0.578), dpw, 0.060,
+        boxstyle="round,pad=0,rounding_size=0.016",
+        linewidth=1.4, edgecolor=dir_col, facecolor='none', zorder=3))
+    ax.text(bx + dpw/2, 0.608, f"{dir_arrow} {dir_label}", color=dir_col,
+            fontsize=12.5, fontweight='bold', va='center', ha='center', zorder=4)
+    # PnL badge: current move (big) + peak high-water-mark (sub-line)
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
         boxstyle="round,pad=0,rounding_size=0.03",
         linewidth=0, facecolor=col_dk, alpha=0.18, zorder=2))
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
         boxstyle="round,pad=0,rounding_size=0.03",
         linewidth=1.6, edgecolor=col_dk, facecolor='none', zorder=3))
-    ax.text(bx+0.032, by+bh-0.042, "PNL",
+    ax.text(bx+0.032, by+bh-0.040, "PNL",
             color=col, fontsize=11, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(bx+0.030, by+0.058, f"{pct_str}  {arrow}",
-            color=col, fontsize=29, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.030, by+0.110, f"{pct_str}  {arrow}",
+            color=col, fontsize=26, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.032, by+0.042, "PEAK",
+            color=GRAY, fontsize=9, fontweight='bold', va='center', ha='left', zorder=4)
+    ax.text(bx+0.120, by+0.042, f"{peak_str}  {peak_arrow}",
+            color=peak_col, fontsize=12.5, fontweight='bold', va='center', ha='left', zorder=4)
     if dollar_str:
         ax.text(0.96, 0.60, dollar_str, color=col, fontsize=16, fontweight='bold', va='center', ha='right', zorder=4)
+    if peak_dollar_str:
+        ax.text(0.96, 0.515, f"peak {peak_dollar_str}", color=peak_col, fontsize=11,
+                fontweight='bold', va='center', ha='right', zorder=4)
 
     # ── sparkline area chart ──────────────────────────────────────────────
     cx0, cx1, cy0, cy1 = 0.52, 0.95, 0.43, 0.78
@@ -5605,7 +5688,8 @@ async def send_pnl_image_card(update, context):
 
     try:
         closes = _fetch_sparkline_closes(signal.get('exchange', ''), signal['symbol'])
-        png = render_pnl_card_image(signal, current, leverage, capital, closes)
+        peak_raw = _compute_peak_pct(signal, current)
+        png = render_pnl_card_image(signal, current, leverage, capital, closes, peak_raw_pct=peak_raw)
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
@@ -5659,6 +5743,56 @@ def _resolve_pnl_signal(arg: str, results: list):
     return None
 
 
+def _gather_pnl_matches(arg, results):
+    """Every signal matching `arg` from the current scan AND persisted history.
+
+    A signal remains summonable for PnL as long as it was scanned at least
+    once, even after it rolls off the latest scan or reverses direction.
+    De-dupes by (symbol, bias, scan_time); returns newest first.
+    """
+    def _norm(s):
+        return str(s or '').upper().replace('/', '').replace('_', '')
+
+    q = _norm(arg)
+    if not q:
+        return []
+    q_full = q if q.endswith('USDT') else q + 'USDT'
+
+    def _is_match(sym):
+        n = _norm(sym)
+        return n == q or n == q_full or n.startswith(q)
+
+    pool = []
+    for r in (results or []):
+        if _is_match(r.get('symbol')):
+            pool.append(r)
+    try:
+        for r in db_find_signals_by_symbol(q):
+            if _is_match(r.get('symbol')):
+                pool.append(r)
+    except Exception as e:
+        logger.warning("db_find_signals_by_symbol failed for %s: %s", arg, e)
+
+    def _ts(r):
+        st = r.get('scan_time')
+        return st if isinstance(st, datetime) else datetime.min
+
+    def _key(r):
+        st = r.get('scan_time')
+        st = st.isoformat() if isinstance(st, datetime) else str(st)
+        return (_norm(r.get('symbol')), str(r.get('bias', '')).upper(), st)
+
+    seen = set()
+    uniq = []
+    for r in sorted(pool, key=_ts, reverse=True):
+        k = _key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(r)
+    return uniq
+
+
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point — pick a signal, or look one up directly via /pnl <rank|symbol>."""
     _track(update)
@@ -5670,27 +5804,74 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug("pnl_command: could not clear autoscan TF state: %s", e)
 
-    if not state.last_scan_results:
-        await update.message.reply_text("⚠️ No scan data yet. Run /scan first.")
-        return
+    results = state.last_scan_results or []
 
-    results = state.last_scan_results
-
-    # Direct lookup: /pnl 1   or   /pnl btc
+    # Direct lookup: /pnl 1 (rank in last scan)  or  /pnl btc (symbol, incl. past scans)
     args = context.args or []
     if args:
-        sig = _resolve_pnl_signal(args[0], results)
-        if sig is None:
+        arg = args[0].strip()
+
+        # A bare number refers to a rank in the CURRENT scan list.
+        if arg.isdigit():
+            if not results:
+                await update.message.reply_text(
+                    "⚠️ No current scan to number. Run /scan, or look one up by symbol (e.g. /pnl btc)."
+                )
+                return
+            sig = _resolve_pnl_signal(arg, results)
+            if sig is None:
+                await update.message.reply_text(
+                    f"⚠️ Enter a number between 1 and {len(results)}, or use a symbol (e.g. /pnl btc)."
+                )
+                return
+            context.user_data['pnl_signal']  = sig
+            context.user_data['pnl_capital'] = None
+            context.user_data['pnl_step']    = None
+            await send_pnl_image_card(update, context)
+            return
+
+        # Symbol lookup — search the current scan AND past scans. A signal stays
+        # summonable as long as it was scanned at least once, even if it rolled
+        # off the bot or has since reversed direction.
+        matches = _gather_pnl_matches(arg, results)
+        if not matches:
             await update.message.reply_text(
-                f"⚠️ Couldn't match \"{args[0]}\" to a signal from the last scan.\n"
-                f"Send /pnl on its own to see the numbered list, or use the symbol as shown "
-                f"(e.g. /pnl btc or /pnl 1)."
+                f"⚠️ Couldn't find \"{arg}\" in any scan I've recorded.\n"
+                f"It needs to have been scanned at least once. Try the symbol as shown "
+                f"(e.g. /pnl btc), or run /scan first."
             )
             return
-        context.user_data['pnl_signal']  = sig
+        if len(matches) == 1:
+            context.user_data['pnl_signal']  = matches[0]
+            context.user_data['pnl_capital'] = None
+            context.user_data['pnl_step']    = None
+            await send_pnl_image_card(update, context)
+            return
+
+        # Multiple scans for this symbol — let the user pick which one.
+        context.user_data['pnl_matches'] = matches
         context.user_data['pnl_capital'] = None
-        context.user_data['pnl_step']    = None
-        await send_pnl_image_card(update, context)
+        context.user_data['pnl_step']    = 'pnl_pick_match'
+        sym_disp = matches[0].get('symbol', arg)
+        lines = [f"🔎 Found {len(matches)} signals for {sym_disp} across past scans:\n"]
+        for i, m in enumerate(matches[:20], 1):
+            emoji = "🟢" if str(m.get('bias', '')).upper() == "LONG" else "🔴"
+            held  = _fmt_held_for(m.get('scan_time'))
+            lev   = m.get('leverage')
+            lev_s = f" | {lev['suggested']}x" if lev else ""
+            lines.append(
+                f"{i}. {emoji} {m.get('exchange','')} {m.get('symbol','')} — "
+                f"{m.get('bias','')} {m.get('confidence','?')}/10{lev_s}  · {held} ago"
+            )
+        if len(matches) > 20:
+            lines.append(f"... and {len(matches) - 20} more")
+        lines.append(f"\nReply with a number (1–{min(len(matches), 20)}).")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # The no-argument flow needs a current scan to list.
+    if not results:
+        await update.message.reply_text("⚠️ No scan data yet. Run /scan first.")
         return
 
     total = len(state.last_scan_results)
@@ -5724,6 +5905,21 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['pnl_signal']  = state.last_scan_results[n - 1]
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None   # image PnL-card flow takes over
+            await send_pnl_image_card(update, context)
+        except ValueError:
+            await update.message.reply_text("⚠️ Reply with a number only.")
+
+    elif step == 'pnl_pick_match':
+        matches = context.user_data.get('pnl_matches') or []
+        try:
+            n = int(text)
+            if n < 1 or n > len(matches):
+                await update.message.reply_text(f"⚠️ Enter 1–{min(len(matches), 20)}.")
+                return
+            context.user_data['pnl_signal']  = matches[n - 1]
+            context.user_data['pnl_capital'] = None
+            context.user_data['pnl_step']    = None
+            context.user_data['pnl_matches'] = None
             await send_pnl_image_card(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Reply with a number only.")
@@ -9257,7 +9453,7 @@ async def snail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🐌  S N A I L   M O D E\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━���━━━━━━━━━━━━━━━━━━━\n\n"
         f"Status: {status_str}\n\n"
         f"Goal: 2x per day | Criteria: 10/10 + Snail Score ≥ 80\n"
         f"Use /snailvault to view your signal log.\n",
@@ -13260,7 +13456,7 @@ async def xgtrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # /rftrain — Retrain Random Forest signal classifier
 # Admin only. Mirrors /xgtrain.
-# ─────────────────────────────────────────────
+# ────────────��────────────────────────────────
 async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Retrain the Random Forest win-probability model from historical outcomes."""
     _track(update)

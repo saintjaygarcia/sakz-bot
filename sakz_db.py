@@ -418,6 +418,47 @@ def db_load_last_scan():
     scan_time = datetime.fromisoformat(last_ts) if results else None
     return results, scan_time
 
+
+def db_find_signals_by_symbol(norm_query: str, limit: int = 40):
+    """Persisted signals whose (normalised) symbol matches `norm_query`.
+
+    `norm_query` must be upper-cased with '/' and '_' stripped (e.g. 'BTC',
+    'BTCUSDT'). Matches by prefix so 'TON' finds 'TONCOINUSDT'. Returns signal
+    dicts (data_json parsed, scan_time as datetime) spanning the WHOLE
+    scan_results history, newest first — so a signal can be summoned long after
+    it left the latest scan.
+    """
+    if not norm_query:
+        return []
+    conn = db_connect()
+    c    = conn.cursor()
+    pattern = norm_query + '%'
+    try:
+        c.execute(
+            "SELECT data_json, scan_time FROM scan_results "
+            "WHERE REPLACE(REPLACE(UPPER(symbol), '/', ''), '_', '') LIKE ? "
+            "ORDER BY scan_time DESC LIMIT ?",
+            (pattern, limit)
+        )
+        rows = c.fetchall()
+    except Exception as e:
+        logger.warning("db_find_signals_by_symbol query failed: %s", e)
+        rows = []
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            d = json.loads(r['data_json'])
+            if 'scan_time_str' in d:
+                d['scan_time'] = datetime.fromisoformat(d['scan_time_str'])
+            elif r['scan_time']:
+                d['scan_time'] = datetime.fromisoformat(r['scan_time'])
+            out.append(d)
+        except Exception as e:
+            logger.debug("skipping unparseable scan_result row: %s", e)
+    return out
+
+
 def db_append_price_history(key, exchange, symbol, price):
     conn = db_connect()
     c    = conn.cursor()
