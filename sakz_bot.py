@@ -1130,6 +1130,8 @@ def _pro_full_command_guide() -> str:
         "/scan new 24h        New listings scan (m/h/d/w units)\n"
         "/cscan ZEC           Custom pair scan (auto-detect TF)\n"
         "/cscan ZEC 15m       Custom pair on 15m / 1h / 4h / 1d\n"
+        "/analyse ZEC         Raw analysis — no gates (⚠️ hot ground)\n"
+        "/analyse ZEC 10m     Raw analysis on any timeframe\n"
         "/scalp               Scalp mode — 15M + 1H signals\n"
         "/scalp ETH           Scalp a specific pair\n"
         "/swing               Swing mode — 4H + 1D signals\n"
@@ -10310,6 +10312,459 @@ def _check_trend_dying(r: dict, df4h, df1d) -> tuple[bool, str]:
     return len(warns) >= 2, "\n".join(f"  {w}" for w in warns)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# /analyse — Raw market analysis, no regime gate, no confidence floor
+#
+# Usage:
+#   /analyse ZBT          → auto-selects 4H, MEXC
+#   /analyse ZBT 1h       → pins to 1H
+#   /analyse ZBT 10m      → maps 10m to nearest supported TF (15m)
+#   /analyse BTCUSDT 4h   → explicit USDT pair
+#
+# Emits a raw indicator snapshot and directional read regardless of whether
+# the market is trending, ranging, or regime-divergent. Always preceded by
+# a hot-ground risk warning to the user.
+#
+# TF mapping for non-standard timeframes:
+#   ≤7 min  → 15m   |   8–22 min  → 15m   |   23–90 min → 1h
+#   91–360 min → 4h  |   >360 min → 1d
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Extended TF alias map that includes non-standard intervals (maps to nearest
+# supported TF).  Values are TF_CONFIGS keys: '15m' | '1h' | '4h' | '1d'.
+_ANALYSE_TF_ALIASES = {
+    # Exact standard aliases
+    '15m': '15m', '15': '15m', '15min': '15m',
+    '1h':  '1h',  '60m': '1h', '60': '1h', 'h1': '1h', '1': '1h',
+    '4h':  '4h',  '240m': '4h', '240': '4h', 'h4': '4h', '4': '4h',
+    '1d':  '1d',  'daily': '1d', 'd': '1d', 'day': '1d',
+    # Non-standard — map to nearest supported TF
+    '1m': '15m', '2m': '15m', '3m': '15m', '5m': '15m',
+    '7m': '15m', '10m': '15m', '12m': '15m',
+    '20m': '15m', '25m': '1h', '30m': '1h', '45m': '1h',
+    '2h': '1h', '3h': '4h', '6h': '4h', '8h': '4h',
+    '12h': '4h', '16h': '1d', '2d': '1d', '3d': '1d', 'w': '1d', '1w': '1d',
+}
+
+# What we tell the user when their requested TF was remapped
+_ANALYSE_TF_REMAP_NOTE = {
+    '1m': '1m → 15m (smallest supported)',
+    '2m': '2m → 15m',
+    '3m': '3m → 15m',
+    '5m': '5m → 15m',
+    '7m': '7m → 15m',
+    '10m': '10m → 15m (nearest supported)',
+    '12m': '12m → 15m',
+    '20m': '20m → 15m',
+    '25m': '25m → 1h',
+    '30m': '30m → 1h',
+    '45m': '45m → 1h',
+    '2h':  '2h → 1h',
+    '3h':  '3h → 4h',
+    '6h':  '6h → 4h',
+    '8h':  '8h → 4h',
+    '12h': '12h → 4h',
+    '16h': '16h → 1d',
+    '2d':  '2d → 1d',
+    '3d':  '3d → 1d',
+    'w':   '1W → 1d (weekly not supported)',
+    '1w':  '1W → 1d',
+}
+
+
+def _analyse_raw_indicators(symbol: str, tf_key: str):
+    """
+    Fetch candles + compute indicators for /analyse.
+    Returns a dict of raw values, or a string error message on failure.
+    No gates, no scoring engine — pure snapshot.
+    """
+    # MEXC interval map (same keys as TF_CONFIGS)
+    mexc_interval_map = {
+        '15m': 'Min15',
+        '1h':  'Min60',
+        '4h':  'Hour4',
+        '1d':  'Day1',
+    }
+    mexc_interval = mexc_interval_map.get(tf_key, 'Hour4')
+    limit = 120   # enough for indicators + lookback
+
+    try:
+        sym_clean = symbol.upper().replace('_USDT', 'USDT').replace('/', '')
+        if sym_clean.endswith('USDT'):
+            futures_sym = sym_clean[:-4] + '_USDT'
+        else:
+            futures_sym = sym_clean + '_USDT'
+
+
+        r = requests.get(
+            f"https://contract.mexc.com/api/v1/contract/kline/{futures_sym}",
+            params={'interval': mexc_interval, 'limit': limit},
+            headers={'User-Agent': 'SakzBot/1.0'},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return f"MEXC API error {r.status_code} — pair may not exist as a perpetual"
+
+        data = r.json()
+        if not data.get('success') or not data.get('data'):
+            return f"No data for {symbol} on MEXC perpetuals — check the symbol"
+
+        d = data['data']
+
+        df = pd.DataFrame({
+            'timestamp': d.get('time', []),
+            'open':      d.get('open', []),
+            'high':      d.get('high', []),
+            'low':       d.get('low', []),
+            'close':     d.get('close', []),
+            'volume':    d.get('vol', []),
+        })
+        if len(df) < 20:
+            return f"Not enough candle history for {symbol} on {tf_key} (got {len(df)} candles)"
+
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='s')
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].dropna()
+
+        # Add indicators (use '4h' stoch window for anything ≤4h, else '1d')
+        stoch_tf = '4h' if tf_key in ('15m', '1h', '4h') else '1d'
+        df_ind = add_indicators(df, timeframe=stoch_tf)
+        if df_ind is None or len(df_ind) < 5:
+            return f"Indicator calculation failed — not enough clean candles"
+
+        L   = df_ind.iloc[-1]   # latest closed candle
+        P   = df_ind.iloc[-2]   # previous candle
+        P2  = df_ind.iloc[-3]   # two candles back
+
+        price      = float(L['close'])
+        rsi        = float(L['rsi'])
+        macd_diff  = float(L['macd_diff'])
+        prev_diff  = float(P['macd_diff'])
+        macd_line  = float(L.get('macd_line', L.get('macd', 0)))
+        macd_sig   = float(L.get('macd_signal', 0))
+        bb_upper   = float(L['bb_upper'])
+        bb_lower   = float(L['bb_lower'])
+        bb_mid     = float(L['bb_mid'])
+        bb_bw      = float(L.get('bb_bw', (bb_upper - bb_lower) / max(bb_mid, 0.0001)))
+        bb_bw_min  = float(L.get('bb_bw_min', bb_bw))
+        ema20      = float(L['ema20'])
+        ema50      = float(L['ema50'])
+        stoch_k    = float(L['stoch_k'])
+        stoch_d    = float(L['stoch_d'])
+        atr        = float(L['atr'])
+        volume     = float(L['volume'])
+        vol_ma     = float(L.get('volume_ma', volume))
+        support    = float(L.get('support', price * 0.97))
+        resistance = float(L.get('resistance', price * 1.03))
+        clv_ma     = float(L.get('clv_ma', 0))
+
+        # Derive raw bias signals (no gating)
+        bull_signals, bear_signals = [], []
+
+        # RSI
+        if rsi < 30:    bull_signals.append(f"RSI {rsi:.1f} — extremely oversold 🔴")
+        elif rsi < 40:  bull_signals.append(f"RSI {rsi:.1f} — oversold")
+        elif rsi < 48:  bull_signals.append(f"RSI {rsi:.1f} — leaning oversold")
+        elif rsi > 70:  bear_signals.append(f"RSI {rsi:.1f} — extremely overbought 🔴")
+        elif rsi > 60:  bear_signals.append(f"RSI {rsi:.1f} — overbought")
+        elif rsi > 52:  bear_signals.append(f"RSI {rsi:.1f} — leaning overbought")
+        else:
+            if rsi > float(P['rsi']): bull_signals.append(f"RSI {rsi:.1f} — crossing 50 upward")
+            elif rsi < float(P['rsi']): bear_signals.append(f"RSI {rsi:.1f} — crossing 50 downward")
+
+        # MACD
+        if macd_diff > 0 and prev_diff <= 0:
+            bull_signals.append(f"MACD bullish crossover (hist={macd_diff:+.4f})")
+        elif macd_diff > 0 and prev_diff > 0:
+            bull_signals.append(f"MACD hist positive & growing" if macd_diff > prev_diff else f"MACD hist positive but fading")
+        elif macd_diff < 0 and prev_diff >= 0:
+            bear_signals.append(f"MACD bearish crossover (hist={macd_diff:+.4f})")
+        elif macd_diff < 0 and prev_diff < 0:
+            bear_signals.append(f"MACD hist negative & deepening" if macd_diff < prev_diff else f"MACD hist negative but recovering")
+
+        # EMA stack
+        if price > ema20 > ema50:   bull_signals.append(f"Price > EMA20 > EMA50 — bullish stack")
+        elif price < ema20 < ema50: bear_signals.append(f"Price < EMA20 < EMA50 — bearish stack")
+        elif price > ema20:         bull_signals.append(f"Price above EMA20 (${ema20:.4f})")
+        elif price < ema20:         bear_signals.append(f"Price below EMA20 (${ema20:.4f})")
+
+        # BB position
+        bb_pct = (price - bb_lower) / max(bb_upper - bb_lower, 0.0001) * 100
+        if price >= bb_upper * 0.99:
+            bear_signals.append(f"Price at/above BB upper (${bb_upper:.4f}) — overextended")
+        elif price <= bb_lower * 1.01:
+            bull_signals.append(f"Price at/below BB lower (${bb_lower:.4f}) — potential reversal zone")
+        else:
+            if bb_pct > 65:   bear_signals.append(f"Price in upper BB band ({bb_pct:.0f}%)")
+            elif bb_pct < 35: bull_signals.append(f"Price in lower BB band ({bb_pct:.0f}%)")
+
+        # BB squeeze breakout
+        squeeze_breaking = bb_bw > bb_bw_min * 1.05 if bb_bw_min > 0 else False
+        if squeeze_breaking:
+            if macd_diff > 0: bull_signals.append("BB squeeze expanding — breakout attempt (bullish direction)")
+            else: bear_signals.append("BB squeeze expanding — breakout attempt (bearish direction)")
+
+        # Stochastic
+        if stoch_k < 20:   bull_signals.append(f"Stoch K {stoch_k:.1f} — deeply oversold")
+        elif stoch_k < 30: bull_signals.append(f"Stoch K {stoch_k:.1f} — oversold")
+        elif stoch_k > 80: bear_signals.append(f"Stoch K {stoch_k:.1f} — deeply overbought")
+        elif stoch_k > 70: bear_signals.append(f"Stoch K {stoch_k:.1f} — overbought")
+        # Stoch cross
+        if stoch_k > stoch_d and float(P['stoch_k']) <= float(P['stoch_d']):
+            bull_signals.append(f"Stoch K crossed above D — bullish signal")
+        elif stoch_k < stoch_d and float(P['stoch_k']) >= float(P['stoch_d']):
+            bear_signals.append(f"Stoch K crossed below D — bearish signal")
+
+        # Volume
+        vol_ratio = volume / max(vol_ma, 0.0001)
+        if vol_ratio > 1.5:   vol_note = f"Volume {vol_ratio:.1f}x avg — elevated (confirms move)"
+        elif vol_ratio < 0.5: vol_note = f"Volume {vol_ratio:.1f}x avg — thin (low conviction)"
+        else:                 vol_note = f"Volume {vol_ratio:.1f}x avg — normal"
+
+        # CLV (order absorption)
+        if clv_ma > 0.3:    bull_signals.append(f"CLV {clv_ma:+.2f} — buyers absorbing candles")
+        elif clv_ma < -0.3: bear_signals.append(f"CLV {clv_ma:+.2f} — sellers absorbing candles")
+
+        # Pivot S/R proximity
+        dist_to_res = (resistance - price) / price * 100
+        dist_to_sup = (price - support) / price * 100
+        if dist_to_res < 1.0: bear_signals.append(f"Price within {dist_to_res:.1f}% of resistance (${resistance:.4f})")
+        if dist_to_sup < 1.0: bull_signals.append(f"Price within {dist_to_sup:.1f}% of support (${support:.4f})")
+
+        # Raw lean
+        if len(bull_signals) > len(bear_signals) + 1:
+            lean = 'BULLISH'
+            lean_emoji = '🟢'
+        elif len(bear_signals) > len(bull_signals) + 1:
+            lean = 'BEARISH'
+            lean_emoji = '🔴'
+        elif len(bull_signals) == 0 and len(bear_signals) == 0:
+            lean = 'FLAT'
+            lean_emoji = '⚪'
+        else:
+            lean = 'MIXED'
+            lean_emoji = '🟡'
+
+        btc_regime = get_btc_regime()
+
+        return {
+            'symbol':       symbol,
+            'tf_key':       tf_key,
+            'tf_label':     TF_CONFIGS[tf_key]['label'],
+            'price':        price,
+            'rsi':          rsi,
+            'macd_diff':    macd_diff,
+            'macd_line':    macd_line,
+            'macd_sig':     macd_sig,
+            'bb_upper':     bb_upper,
+            'bb_lower':     bb_lower,
+            'bb_mid':       bb_mid,
+            'bb_pct':       bb_pct,
+            'ema20':        ema20,
+            'ema50':        ema50,
+            'stoch_k':      stoch_k,
+            'stoch_d':      stoch_d,
+            'atr':          atr,
+            'vol_ratio':    vol_ratio,
+            'vol_note':     vol_note,
+            'support':      support,
+            'resistance':   resistance,
+            'clv_ma':       clv_ma,
+            'bull_signals': bull_signals,
+            'bear_signals': bear_signals,
+            'lean':         lean,
+            'lean_emoji':   lean_emoji,
+            'btc_regime':   btc_regime,
+            'candles':      len(df_ind),
+        }
+
+    except Exception as e:
+        logger.warning("_analyse_raw_indicators %s %s: %s", symbol, tf_key, e)
+        return f"Analysis failed: {e}"
+
+
+def _format_analyse_card(data: dict, requested_tf_raw: str | None) -> str:
+    """
+    Format the raw analysis dict into the /analyse message card.
+    """
+    sym        = data['symbol']
+    tf_label   = data['tf_label']
+    price      = data['price']
+    lean       = data['lean']
+    lean_emoji = data['lean_emoji']
+    regime     = data['btc_regime']
+    bull       = data['bull_signals']
+    bear       = data['bear_signals']
+
+    remap_note = ''
+    if requested_tf_raw and requested_tf_raw in _ANALYSE_TF_REMAP_NOTE:
+        remap_note = f"\n⚠️ TF remapped: {_ANALYSE_TF_REMAP_NOTE[requested_tf_raw]}"
+
+    regime_emoji = {
+        'STRONG_BULL': '🟢🟢', 'BULL': '🟢',
+        'NEUTRAL': '⚪',
+        'BEAR': '🔴', 'STRONG_BEAR': '🔴🔴',
+    }.get(regime, '⚪')
+
+    lines = [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"  🔬 RAW ANALYSIS | {sym}",
+        f"  Timeframe: {tf_label}{remap_note}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"",
+        f"💰 Price:       ${price:.6g}",
+        f"",
+        f"📊 INDICATORS",
+        f"   RSI:         {data['rsi']:.1f}",
+        f"   MACD hist:   {data['macd_diff']:+.5f}",
+        f"   EMA20:       ${data['ema20']:.6g}",
+        f"   EMA50:       ${data['ema50']:.6g}",
+        f"   BB %:        {data['bb_pct']:.0f}% (lower=${data['bb_lower']:.6g} / upper=${data['bb_upper']:.6g})",
+        f"   Stoch K/D:   {data['stoch_k']:.1f} / {data['stoch_d']:.1f}",
+        f"   ATR:         ${data['atr']:.6g}",
+        f"   CLV MA:      {data['clv_ma']:+.2f}",
+        f"   {data['vol_note']}",
+        f"",
+        f"📐 S/R",
+        f"   Support:     ${data['support']:.6g}",
+        f"   Resistance:  ${data['resistance']:.6g}",
+        f"",
+    ]
+
+    if bull:
+        lines.append("🟢 BULLISH SIGNALS:")
+        for s in bull:
+            lines.append(f"   • {s}")
+        lines.append("")
+
+    if bear:
+        lines.append("🔴 BEARISH SIGNALS:")
+        for s in bear:
+            lines.append(f"   • {s}")
+        lines.append("")
+
+    lines += [
+        f"{lean_emoji} LEAN: {lean}  ({len(bull)} bull / {len(bear)} bear signals)",
+        f"",
+        f"{regime_emoji} BTC Regime: {regime}",
+        f"",
+        f"─────────────────────────────",
+        f"ℹ️ This is raw indicator data — no confidence gate, no regime filter.",
+        f"Interpret with your own judgement.",
+    ]
+
+    return "\n".join(lines)
+
+
+async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /analyse [PAIR] [TIMEFRAME]
+
+    Raw market analysis with no regime gate or confidence floor.
+    Always produces an indicator snapshot regardless of market condition.
+
+    Examples:
+        /analyse ZBT          → ZBTUSDT on 4H (default)
+        /analyse ZBT 1h       → ZBTUSDT on 1H
+        /analyse ZBT 10m      → ZBTUSDT, 10m remapped to 15m
+        /analyse BTCUSDT 4h   → explicit pair
+    """
+    _track(update)
+    chat_id = update.effective_chat.id
+    args    = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "🔬 RAW CHART ANALYSIS — No Gates, No Filters\n\n"
+            "Usage:\n"
+            "  /analyse ZBT          — ZBTUSDT on default 4H\n"
+            "  /analyse ZBT 1h       — pin to 1H chart\n"
+            "  /analyse ZBT 15m      — pin to 15M chart\n"
+            "  /analyse ZBT 10m      — non-standard TF (remaps to 15m)\n"
+            "  /analyse BTCUSDT 4h   — full USDT pair name also works\n\n"
+            "Supported TFs: 15m, 1h, 4h, 1d\n"
+            "Non-standard TFs (5m, 10m, 30m, etc.) are remapped to nearest.\n\n"
+            "⚠️ Unlike /cscan, /analyse shows raw readings with zero filtering.\n"
+            "Use your own judgment on the output."
+        )
+        return
+
+    # Parse pair
+    raw    = args[0].upper().replace('/', '').strip()
+    symbol = raw if raw.endswith('USDT') else raw + 'USDT'
+
+    # Parse optional TF
+    requested_tf_raw = None
+    tf_key = '4h'   # default
+    if len(args) > 1:
+        requested_tf_raw = args[1].lower().strip()
+        tf_key = _ANALYSE_TF_ALIASES.get(requested_tf_raw)
+        if tf_key is None:
+            await update.message.reply_text(
+                f"⚠️ Unknown timeframe: {args[1]}\n\n"
+                f"Supported: 15m, 1h, 4h, 1d\n"
+                f"Non-standard: 5m, 10m, 30m, 2h, 6h, 12h (remapped to nearest)\n"
+                f"Example: /analyse ZBT 10m"
+            )
+            return
+
+    tf_label = TF_CONFIGS[tf_key]['label']
+
+    # ── HOT-GROUND WARNING — sent before the analysis ────────────────────────
+    warning_msg = (
+        "⚠️⚠️ HOT GROUND — READ BEFORE PROCEEDING ⚠️⚠️\n\n"
+        "You are using /analyse — the unfiltered analysis mode.\n\n"
+        "Unlike /cscan or /scan, this command has:\n"
+        "  ✗  No BTC regime gate\n"
+        "  ✗  No confidence floor\n"
+        "  ✗  No counter-trend veto\n"
+        "  ✗  No cooldown checks\n"
+        "  ✗  No signal validation\n\n"
+        "You will receive a raw indicator snapshot.\n"
+        "There is NO recommendation to trade. The output tells you\n"
+        "what the indicators say — not whether you should act on it.\n\n"
+        "🔥 Trading on /analyse output without your own analysis\n"
+        "   carries significantly higher risk. Proceed with caution.\n\n"
+        "──────────────────────────────────────\n"
+        f"⏳ Fetching {symbol} on {tf_label}..."
+    )
+    await update.message.reply_text(warning_msg)
+
+    # Run in executor (blocking I/O)
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        SCAN_EXECUTOR,
+        lambda: _analyse_raw_indicators(symbol, tf_key)
+    )
+
+    if isinstance(result, str):
+        # Error message
+        await update.message.reply_text(
+            f"❌ Could not analyse {symbol} on {tf_label}\n\n"
+            f"{result}\n\n"
+            f"💡 Tips:\n"
+            f"• Verify the pair exists as a MEXC perpetual\n"
+            f"• Try: /analyse {raw.replace('USDT','')} 4h\n"
+            f"• Some tokens use 1000{raw.replace('USDT','')} format"
+        )
+        return
+
+    card = _format_analyse_card(result, requested_tf_raw)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📡 Full Signal Scan",
+            callback_data=f"menu_run|cscan"
+        ),
+        InlineKeyboardButton(
+            "📈 Chart",
+            callback_data=f"chart_tf_refresh|{symbol}|{tf_key}|{chat_id}"
+        ),
+    ]])
+
+    await update.message.reply_text(card, reply_markup=keyboard)
+
+
 async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Background job — runs every 30 minutes.
@@ -13563,6 +14018,7 @@ def main():
     app.add_handler(CommandHandler("filter",     filter_command))
     app.add_handler(CommandHandler("pnl",        pnl_command))
     app.add_handler(CommandHandler("cscan",      cscan_tf_command))  # TF-aware e.g. /cscan btc t15m
+    app.add_handler(CommandHandler("analyse",    analyse_command))   # raw analysis, no gates
     app.add_handler(CommandHandler("watch",      watch_command))
     app.add_handler(CommandHandler("unwatch",    unwatch_command))
     app.add_handler(CommandHandler("safemode",   safemode_command))
