@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -776,7 +776,7 @@ def _pro_format_uptrend_card(uptrend: dict, rank: int = 1) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {exch} | {sym}\n"
         f"\n"
-        f"🟢 BIAS: LONG (trend confirmed)\n"
+        f"��� BIAS: LONG (trend confirmed)\n"
         f"⭐ AVG DAILY GAIN: {bar} +{avg:.1f}%/day\n"
         f"\n"
         f"⏱ STREAK DURATION: {lbl}\n"
@@ -1683,7 +1683,7 @@ _MIN_SIGNAL_RR = max(0.1, float(os.getenv("MIN_SIGNAL_RR", "1.5")))
 #   bybit_con    — Bybit API interval string for confirmation
 #   mexc_pri     — MEXC interval string for primary
 #   mexc_con     — MEXC interval string for confirmation
-#   binance_pri  — Binance interval string for primary
+#   binance_pri  ��� Binance interval string for primary
 #   binance_con  — Binance interval string for confirmation
 #   min_candles  — minimum closed candles required on the primary TF
 #   label        ��� human-readable label shown in signals
@@ -2493,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ══════════════════════����══��══����══����══����══════════════����═══════════════════════
+# ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -5439,7 +5439,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ─────────────────────────────────────��─��───��─
+# ───────────────────────────────��─────��─��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -10065,7 +10065,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 6. Admin user-count tracking (/admin)
 # ══════════════════════════════════════════════════════════���════
 
-# ─── TIMEFRAME HELPERS ────────────────────────────────────────
+# ─── TIMEFRAME HELPERS ──────────────────────────────────���─────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -14865,6 +14865,24 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _admin_pw_gate))
     # unknown_command MUST be last — it catches everything else including /scan1234JP$$
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    # -- Exchange reachability probe (startup trial) -------------------------
+    # Probe Bybit FIRST; MEXC is always the fallback. This makes it obvious in
+    # the logs whether the current host region can reach Bybit's public API.
+    try:
+        _bybit_ok = bybit_check_available()
+        binance_check_available()
+        if sakz_exchanges.MEXC_ONLY:
+            logger.info("SCAN SOURCE: MEXC only (MEXC_ONLY=true) -- Bybit disabled")
+            print("SCAN SOURCE: MEXC only (MEXC_ONLY=true)")
+        elif _bybit_ok:
+            logger.info("SCAN SOURCE: Bybit PRIMARY + MEXC fallback (region unblocked)")
+            print("SCAN SOURCE: Bybit PRIMARY + MEXC fallback -- migration effective")
+        else:
+            logger.info("SCAN SOURCE: Bybit blocked -> MEXC fallback active")
+            print("SCAN SOURCE: Bybit blocked -> MEXC fallback (region still blocked)")
+    except Exception as _probe_e:
+        logger.warning("Exchange reachability probe failed: %s", _probe_e)
 
     print("\n✅ Bot running. Open Telegram and type /menu\n")
 
