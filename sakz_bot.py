@@ -40,6 +40,18 @@ from matplotlib.lines import Line2D
 import sakz_memory
 
 # ─────────────────────────────────────────────
+# EXECUTION LAYER (Phase 1) — encrypted Bybit key vault
+# ─────────────────────────────────────────────
+try:
+    import sakz_execution
+    _EXEC_AVAILABLE = True
+    print(f"[sakz_bot] Execution layer loaded (testnet={sakz_execution.BYBIT_TESTNET}, vault_ready={sakz_execution.vault_ready()})")
+except Exception as _exec_err:
+    print(f"[sakz_bot] WARNING: sakz_execution unavailable — execution layer disabled ({_exec_err})")
+    sakz_execution = None
+    _EXEC_AVAILABLE = False
+
+# ─────────────────────────────────────────────
 # CONVICTION LAYER — CVD / OI / VWAP
 # sakz_conviction.py must live in the same directory as sakz_bot.py
 # ─────────────────────────────────────────────
@@ -195,6 +207,10 @@ from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_admin_set_auth,
     db_admin_revoke,
     db_admin_get_stats,
+    db_save_user_keys,
+    db_get_user_keys,
+    db_delete_user_keys,
+    db_user_has_keys,
     DB_PATH, ACTIVE_WINDOW_MIN, TURSO_URL, TURSO_TOKEN, _USE_TURSO,
 )
 # === Extracted exchange layer (sakz_exchanges.py) ===
@@ -275,6 +291,9 @@ REASON_LOW_VOLUME     = "LOW_VOLUME"       # 24h volume below minimum threshold
 PICK_TRADE   = 1
 ASK_REMINDER = 2
 ASK_INTERVAL = 3
+# Phase 1 execution layer — /connect key-vault conversation states
+CONNECT_KEY    = 10
+CONNECT_SECRET = 11
 
 # FIX H3 — bound the per-chat caches so they can't grow without limit (OOM guard).
 class _BoundedDict(dict):
@@ -408,7 +427,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────������������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�������������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -1117,7 +1136,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ────────────────────────────────────────────������─���────────────
+# ── /pro Command handler ──────────────────────────────────────────���─������─���────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1430,7 +1449,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ────────────────────────────────────���──������──���─
+# ────────────────────────────────���───���──������──���─
 try:
     from sakz_ws import (
         start_ws,
@@ -2492,7 +2511,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 3-thread executor allows concurrent scans
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
-# ────────────────────────────────────���────���───
+# ───────────────────────────────────������────���───
 # ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
@@ -5181,6 +5200,142 @@ async def receive_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please reply with a number (minutes).")
         return ASK_INTERVAL
 
+# ─────────────────────────────────────────────
+# EXECUTION LAYER (Phase 1) — /connect encrypted Bybit key vault
+# ─────────────────────────────────────────────
+def _exec_enabled():
+    """Guard: execution layer importable AND vault key configured."""
+    return bool(_EXEC_AVAILABLE and sakz_execution and sakz_execution.vault_ready())
+
+
+async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _track(update)
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "🔒 For your security, run /connect in a private DM with me — not in a group."
+        )
+        return ConversationHandler.END
+    if not _exec_enabled():
+        await update.message.reply_text(
+            "⚠️ Trading is not enabled on this deployment yet (vault key not configured). "
+            "Ask the admin to set the SAKZ_VAULT_KEY secret."
+        )
+        return ConversationHandler.END
+    net = "TESTNET" if sakz_execution.BYBIT_TESTNET else "LIVE"
+    await update.message.reply_text(
+        f"🔐 CONNECT BYBIT API ({net})\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Create a Bybit API key with *Trade* permission ONLY — never enable *Withdraw*.\n\n"
+        "Step 1/2 — send me your *API KEY* now.\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return CONNECT_KEY
+
+
+async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_key = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    if not api_key or len(api_key) < 8 or " " in api_key:
+        await context.bot.send_message(chat_id, "⚠️ That doesn't look like a valid API key. Send it again, or /cancel.")
+        return CONNECT_KEY
+    context.user_data['pending_api_key'] = api_key
+    await context.bot.send_message(
+        chat_id,
+        "✅ Got your API key (message deleted for safety).\n\nStep 2/2 — now send your *API SECRET*.",
+        parse_mode="Markdown",
+    )
+    return CONNECT_SECRET
+
+
+async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_secret = (update.message.text or "").strip()
+    chat_id    = update.effective_chat.id
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    api_key = context.user_data.get('pending_api_key')
+    if not api_key:
+        await context.bot.send_message(chat_id, "⚠️ Session expired. Run /connect again.")
+        return ConversationHandler.END
+    if not api_secret or len(api_secret) < 8 or " " in api_secret:
+        await context.bot.send_message(chat_id, "⚠️ That doesn't look like a valid API secret. Send it again, or /cancel.")
+        return CONNECT_SECRET
+    testnet = sakz_execution.BYBIT_TESTNET
+    await context.bot.send_message(chat_id, "🔄 Testing your keys against Bybit…")
+    try:
+        ok, detail = await asyncio.to_thread(sakz_execution.test_connection, api_key, api_secret, testnet)
+    except Exception as e:
+        ok, detail = False, str(e)
+    if not ok:
+        context.user_data.pop('pending_api_key', None)
+        await context.bot.send_message(
+            chat_id,
+            f"❌ Connection failed: {detail}\n\nCheck the key/secret and that *Trade* permission is enabled, then run /connect again.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+    try:
+        key_enc = sakz_execution.encrypt_secret(api_key)
+        sec_enc = sakz_execution.encrypt_secret(api_secret)
+        db_save_user_keys(chat_id, key_enc, sec_enc, testnet)
+    except Exception as e:
+        logger.error("db_save_user_keys failed: %s", e)
+        context.user_data.pop('pending_api_key', None)
+        await context.bot.send_message(chat_id, "❌ Could not securely store your keys. Please try again later.")
+        return ConversationHandler.END
+    context.user_data.pop('pending_api_key', None)
+    net = "TESTNET" if testnet else "LIVE"
+    await context.bot.send_message(
+        chat_id,
+        f"✅ CONNECTED ({net})\n{detail}\n\nYour keys are encrypted at rest. "
+        "Use /connstatus to re-check, or /disconnect to remove them.",
+    )
+    return ConversationHandler.END
+
+
+async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _track(update)
+    chat_id = update.effective_chat.id
+    try:
+        existed = db_delete_user_keys(chat_id)
+    except Exception as e:
+        logger.error("db_delete_user_keys failed: %s", e)
+        existed = False
+    if existed:
+        await update.message.reply_text("🗑 Disconnected. Your stored Bybit keys have been deleted.")
+    else:
+        await update.message.reply_text("ℹ️ You have no stored keys to disconnect.")
+
+
+async def connstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _track(update)
+    chat_id = update.effective_chat.id
+    if not _exec_enabled():
+        await update.message.reply_text("⚠️ Trading vault is not configured on this deployment.")
+        return
+    rec = db_get_user_keys(chat_id)
+    if not rec:
+        await update.message.reply_text("🔌 Not connected. Run /connect to link your Bybit API keys.")
+        return
+    key_enc, sec_enc, testnet = rec
+    net = "TESTNET" if testnet else "LIVE"
+    await context.bot.send_message(chat_id, "🔄 Checking your connection…")
+    try:
+        api_key    = sakz_execution.decrypt_secret(key_enc)
+        api_secret = sakz_execution.decrypt_secret(sec_enc)
+        ok, detail = await asyncio.to_thread(sakz_execution.test_connection, api_key, api_secret, testnet)
+    except Exception as e:
+        ok, detail = False, str(e)
+    status = "✅ Connected" if ok else "❌ Error"
+    await context.bot.send_message(chat_id, f"{status} ({net})\n{detail}")
+
+
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
@@ -7489,7 +7644,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # /compare
 # ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
+# ���────────────────────────────────────────────
 # /cscan — Custom pair scanner
 # Usage: /cscan BTC   or   /cscan BTCUSDT
 # Analyses that specific perp on all available
@@ -9704,7 +9859,7 @@ def format_snail_signal(r, sa, day_num, days_left):
     bar_w  = int(sa['snail_score'] / 10)
     bar    = "█" * bar_w + "░" * (10 - bar_w)
 
-    # ── Leverage-aware 2x target ──────────────────────────────
+    # ── Leverage-aware 2x target ───────────────────────��──────
     t2_lev, t2_desc = _snail_2x_target(r)
     lev_val = lev['suggested'] if lev else 5
 
@@ -14870,6 +15025,19 @@ def main():
     )
 
     app.add_handler(conv_handler)
+
+    # ── Execution layer (Phase 1): /connect encrypted key vault ────────────
+    connect_conv = ConversationHandler(
+        entry_points=[CommandHandler("connect", connect_command)],
+        states={
+            CONNECT_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key)],
+            CONNECT_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    app.add_handler(connect_conv)
+    app.add_handler(CommandHandler("disconnect", disconnect_command))
+    app.add_handler(CommandHandler("connstatus", connstatus_command))
     app.add_handler(CommandHandler("start",      start_command))
     app.add_handler(CommandHandler("menu",       menu_command))
     app.add_handler(CommandHandler("status",     status_command))

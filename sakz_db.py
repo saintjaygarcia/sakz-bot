@@ -323,6 +323,17 @@ def db_init():
             recorded_at TEXT NOT NULL
         );
 
+        -- PHASE 1 EXECUTION LAYER - per-user encrypted Bybit API keys.
+        -- Secrets are stored ENCRYPTED (Fernet); plaintext never touches the DB.
+        CREATE TABLE IF NOT EXISTS user_api_keys (
+            chat_id        INTEGER PRIMARY KEY,
+            api_key_enc    TEXT NOT NULL,
+            api_secret_enc TEXT NOT NULL,
+            testnet        INTEGER NOT NULL DEFAULT 1,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+
         -- FIX #PERSIST-CACHE — signal card cache survives restarts
         -- Only cards written within the last 24h are restored (older ones are stale)
         CREATE TABLE IF NOT EXISTS signal_card_cache (
@@ -1299,3 +1310,67 @@ def db_admin_get_stats():
         'all_users':  rows,
     }
 
+
+
+# ============================================================================
+# PHASE 1 EXECUTION LAYER - per-user encrypted Bybit API key vault.
+# Secrets arrive already ENCRYPTED from sakz_execution.encrypt_secret(); this
+# layer only persists/retrieves opaque ciphertext - it never sees plaintext.
+# rowcount is avoided (the Turso cursor wrapper does not expose it); existence
+# is checked with an explicit SELECT to stay backend-agnostic.
+# ============================================================================
+def db_save_user_keys(chat_id, api_key_enc, api_secret_enc, testnet=True):
+    """Upsert a user's encrypted Bybit API key pair (preserves created_at)."""
+    conn = db_connect()
+    c    = conn.cursor()
+    now  = datetime.now().isoformat()
+    c.execute("SELECT created_at FROM user_api_keys WHERE chat_id=?", (chat_id,))
+    existing = c.fetchone()
+    if existing:
+        c.execute(
+            "UPDATE user_api_keys SET api_key_enc=?, api_secret_enc=?, testnet=?, updated_at=? "
+            "WHERE chat_id=?",
+            (api_key_enc, api_secret_enc, 1 if testnet else 0, now, chat_id)
+        )
+    else:
+        c.execute(
+            "INSERT INTO user_api_keys (chat_id, api_key_enc, api_secret_enc, testnet, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (chat_id, api_key_enc, api_secret_enc, 1 if testnet else 0, now, now)
+        )
+    conn.commit()
+    conn.close()
+
+
+def db_get_user_keys(chat_id):
+    """Return (api_key_enc, api_secret_enc, testnet_bool) or None if not set."""
+    conn = db_connect()
+    c    = conn.cursor()
+    c.execute("SELECT api_key_enc, api_secret_enc, testnet FROM user_api_keys WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return (row['api_key_enc'], row['api_secret_enc'], bool(row['testnet']))
+
+
+def db_delete_user_keys(chat_id):
+    """Remove a user's stored API keys. Returns True if a row existed."""
+    conn = db_connect()
+    c    = conn.cursor()
+    c.execute("SELECT 1 FROM user_api_keys WHERE chat_id=?", (chat_id,))
+    existed = c.fetchone() is not None
+    c.execute("DELETE FROM user_api_keys WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+    return existed
+
+
+def db_user_has_keys(chat_id):
+    """True if the user has stored API keys."""
+    conn = db_connect()
+    c    = conn.cursor()
+    c.execute("SELECT 1 FROM user_api_keys WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
