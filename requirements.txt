@@ -8,5 +8,6 @@ scikit-learn
 xgboost
 matplotlib
 Pillow
+libsql-experimental
 websockets>=12.0
 ccxt>=4.3.0

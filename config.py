@@ -9,8 +9,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Database / Turso ---
-TURSO_URL   = os.environ.get("TURSO_URL", "")
-TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
+# Accept both our names and the standard Turso names that Railway/Turso set
+# by default (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN), so existing setups work.
+TURSO_URL   = os.environ.get("TURSO_URL", "")   or os.environ.get("TURSO_DATABASE_URL", "")
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "") or os.environ.get("TURSO_AUTH_TOKEN", "")
 _USE_TURSO  = bool(TURSO_URL and TURSO_TOKEN)
 DB_PATH = os.environ.get("SAKZ_DB_PATH", "sakz_data.db")
 ACTIVE_WINDOW_MIN = 30

@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────��������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -2493,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ═════════════════════════════════����══����══════════════����═══════════════════════
+# ══════════════════════════════��══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -5551,6 +5551,28 @@ def _fetch_sparkline_closes(exchange, symbol, limit=60):
         return [float(c) for c in df['close'].tolist()]
     except Exception as e:
         logger.warning("sparkline fetch failed %s %s: %s", exchange, symbol, e)
+        return []
+
+
+def _fetch_pnl_chart_closes(signal, current=None):
+    """Closes for the PnL-card sparkline, ending at the live price.
+
+    Wraps _fetch_sparkline_closes using the signal's symbol/exchange. The
+    live `current` price (when provided and positive) is appended so the
+    chart ends at the latest tick. Always returns a list of floats.
+    """
+    try:
+        symbol   = signal.get('symbol', '')   if isinstance(signal, dict) else ''
+        exchange = signal.get('exchange', '') if isinstance(signal, dict) else ''
+        closes = _fetch_sparkline_closes(exchange, symbol) or []
+        try:
+            if current is not None and float(current) > 0:
+                closes = list(closes) + [float(current)]
+        except (TypeError, ValueError):
+            pass
+        return closes
+    except Exception as e:
+        logger.warning("_fetch_pnl_chart_closes failed: %s", e)
         return []
 
 
@@ -8694,7 +8716,7 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Bot checks your watchlist every 30 minutes."
             )
         else:
-            lines = ["👁 YOUR WATCHLIST\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+            lines = ["👁 YOUR WATCHLIST\n━━━━━━━━━━━━━━━���━━━━━━━━━━━━━━\n"]
             for sym, mc in wl:
                 lines.append(f"  • {sym}  (min confidence: {mc}/10)")
             lines.append("\n/unwatch SYMBOL to remove")
