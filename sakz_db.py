@@ -61,7 +61,23 @@ class _CursorWrapper:
     def __init__(self, cur):
         self._cur = cur
     def _cols(self):
-        return [d[0] for d in self._cur.description] if self._cur.description else []
+        desc = getattr(self._cur, "description", None)
+        if not desc:
+            return []
+        cols = []
+        for d in desc:
+            # sqlite3 returns 7-tuples (name, None, ...) so the name is d[0].
+            # libsql_experimental (Turso) returns the column name as a plain
+            # STRING, in which case d[0] would wrongly be just the first letter.
+            # Support both shapes so row['col'] works on either backend.
+            if isinstance(d, str):
+                cols.append(d)
+            else:
+                try:
+                    cols.append(d[0])
+                except (TypeError, IndexError):
+                    cols.append(str(d))
+        return cols
     def execute(self, *a, **k):
         self._cur.execute(*a, **k)
         return self

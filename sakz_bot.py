@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────��������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�����������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ────────────────────────────���─���──────────────
+# ─────────────────────────������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2493,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ══════════════════════════════��══����══����══════════════����═══════════════════════
+# ═══════════════════════��══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -5439,7 +5439,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -5808,7 +5808,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ──────────────────────────────────────────────
+# ────────────────────────────���────���───���────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -5979,13 +5979,23 @@ def compose_3d_card(flat_png, up=True):
     back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.07, rot=-11.0, scale=0.93), 0.62))
 
     fw, fh = front.size
-    CW = int(fw * 1.75); CH = int(fh * 1.62)
+    bw, bh = back.size
+    # Tighter canvas → the deck fills more of the frame (cards appear bigger).
+    CW = int(fw * 1.42); CH = int(fh * 1.52)
     canvas = Image.new('RGBA', (CW, CH), BG + (255,))
-    canvas = _radial_glow(canvas, center=(int(CW * 0.66), int(CH * 0.40)),
-                          radius=int(CW * 0.44), color=ACCENT, strength=0.5)
 
-    fx = int(CW * 0.07); fy = int(CH * 0.19)
-    bx = fx + int(fw * 0.17); by = fy - int(fh * 0.14)
+    # Center the front+back deck within the canvas, biased slightly upward so
+    # the floor reflection still has room below.
+    bdx = int(fw * 0.17)            # back card x-offset (to the right) from front
+    bdy = int(fh * 0.14)            # back card y-offset (upward) from front
+    span_w = max(fw, bdx + bw)      # union width of the stacked deck
+    span_h = bdy + fh               # union height (back top → front bottom)
+    fx = int((CW - span_w) / 2)
+    fy = int((CH - span_h) / 2) + bdy - int(fh * 0.04)
+    bx = fx + bdx; by = fy - bdy
+
+    canvas = _radial_glow(canvas, center=(int(CW * 0.60), int(CH * 0.42)),
+                          radius=int(CW * 0.50), color=ACCENT, strength=0.5)
 
     # floor reflection of the front card
     refl = front.transpose(Image.FLIP_TOP_BOTTOM)
@@ -6559,7 +6569,7 @@ async def tl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-# ─────────────────────────────────────────────
+# ────────────────���──────���─────���───────────────
 # /menu
 # ─────────────────────────────────────────────
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6721,7 +6731,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "• Scans 150+ pairs simultaneously\n"
             "• Uses RSI, MACD, EMA, Bollinger Bands, Stochastic & ATR\n"
             "• Funding rate analysis included\n"
-            "• Auto-calculates suggested leverage per signal\n"
+            "�� Auto-calculates suggested leverage per signal\n"
             "• Tracks signal outcomes at 4h, 8h, 24h & 48h\n\n"
             "Free to use — no API key required.",
             parse_mode="Markdown",
@@ -8697,7 +8707,7 @@ def filter_live_signals(results):
 # /watch                     — show watchlist
 # /unwatch BTCUSDT           — remove
 # Bot pings every 30 min when signal appears
-# ─────────────────────────────────────────────
+# ─────��───────��───────────────────────────────
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -11212,77 +11222,119 @@ def _analyse_raw_indicators(symbol: str, tf_key: str):
         return f"Analysis failed: {e}"
 
 
+# In-memory cache so the /analyse section buttons can rebuild each view in-place.
+# Key: "<chat_id>:<symbol>:<tf_key>" -> result dict from _analyse_raw_indicators.
+_analyse_cache: dict = {}
+
+
+def _an_pre(lines: list) -> str:
+    """Join lines, HTML-escape, and wrap in a <pre> block (monospace in Telegram)."""
+    body = "\n".join(lines)
+    body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<pre>{body}</pre>"
+
+
+def _an_regime_emoji(regime: str) -> str:
+    return {
+        'STRONG_BULL': '🟢🟢', 'BULL': '🟢',
+        'NEUTRAL': '⚪',
+        'BEAR': '🔴', 'STRONG_BEAR': '🔴🔴',
+    }.get(regime, '⚪')
+
+
+def _analyse_kb(symbol: str, tf_key: str, chat_id, n_bull: int, n_bear: int,
+                active: str = 'sum') -> InlineKeyboardMarkup:
+    """Inline keyboard for the /analyse card. `active` marks the open section."""
+    def b(label, sec):
+        mark = "• " if sec == active else ""
+        return InlineKeyboardButton(f"{mark}{label}",
+                                    callback_data=f"an_sec|{sec}|{symbol}|{tf_key}")
+    rows = []
+    if active != 'sum':
+        rows.append([InlineKeyboardButton(
+            "⬅️ Summary", callback_data=f"an_sec|sum|{symbol}|{tf_key}")])
+    rows.append([b("📊 Indicators", "ind")])
+    rows.append([b(f"🟢 Bullish ({n_bull})", "bull"),
+                 b(f"🔴 Bearish ({n_bear})", "bear")])
+    rows.append([
+        InlineKeyboardButton("📈 Chart",
+                             callback_data=f"chart_tf_refresh|{symbol}|{tf_key}|{chat_id}"),
+        InlineKeyboardButton("📡 Full Scan", callback_data="menu_run|cscan"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def _format_analyse_card(data: dict, requested_tf_raw: str | None) -> str:
-    """
-    Format the raw analysis dict into the /analyse message card.
-    """
+    """Brief /analyse summary: price, S/R, lean, regime. Detail lives behind buttons."""
     sym        = data['symbol']
     tf_label   = data['tf_label']
     price      = data['price']
     lean       = data['lean']
     lean_emoji = data['lean_emoji']
     regime     = data['btc_regime']
-    bull       = data['bull_signals']
-    bear       = data['bear_signals']
+    nb         = len(data['bull_signals'])
+    nbear      = len(data['bear_signals'])
 
     remap_note = ''
     if requested_tf_raw and requested_tf_raw in _ANALYSE_TF_REMAP_NOTE:
-        remap_note = f"\n⚠️ TF remapped: {_ANALYSE_TF_REMAP_NOTE[requested_tf_raw]}"
+        remap_note = f"  ⚠️ remapped: {_ANALYSE_TF_REMAP_NOTE[requested_tf_raw]}"
 
-    regime_emoji = {
-        'STRONG_BULL': '🟢🟢', 'BULL': '🟢',
-        'NEUTRAL': '⚪',
-        'BEAR': '🔴', 'STRONG_BEAR': '🔴🔴',
-    }.get(regime, '⚪')
+    def _row(label, value):
+        return f"  {label:<12}{value}"
 
     lines = [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"  🔬 RAW ANALYSIS | {sym}",
-        f"  Timeframe: {tf_label}{remap_note}",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"",
-        f"💰 Price:       ${price:.6g}",
-        f"",
-        f"📊 INDICATORS",
-        f"   RSI:         {data['rsi']:.1f}",
-        f"   MACD hist:   {data['macd_diff']:+.5f}",
-        f"   EMA20:       ${data['ema20']:.6g}",
-        f"   EMA50:       ${data['ema50']:.6g}",
-        f"   BB %:        {data['bb_pct']:.0f}% (lower=${data['bb_lower']:.6g} / upper=${data['bb_upper']:.6g})",
-        f"   Stoch K/D:   {data['stoch_k']:.1f} / {data['stoch_d']:.1f}",
-        f"   ATR:         ${data['atr']:.6g}",
-        f"   CLV MA:      {data['clv_ma']:+.2f}",
-        f"   {data['vol_note']}",
-        f"",
-        f"📐 S/R",
-        f"   Support:     ${data['support']:.6g}",
-        f"   Resistance:  ${data['resistance']:.6g}",
-        f"",
+        f"🔬 {sym}  ·  {tf_label}{remap_note}",
+        "═══════════════════════════",
+        _row("Price", f"${price:.6g}"),
+        _row("Support", f"${data['support']:.6g}"),
+        _row("Resistance", f"${data['resistance']:.6g}"),
+        "",
+        f"{lean_emoji} Lean: {lean}  ({nb} bull / {nbear} bear)",
+        f"{_an_regime_emoji(regime)} BTC Regime: {regime}",
+        f"  {data['vol_note']}",
+        "",
+        "ℹ️ Raw data — no gates. Tap below for detail.",
     ]
+    return _an_pre(lines)
 
-    if bull:
-        lines.append("🟢 BULLISH SIGNALS:")
-        for s in bull:
-            lines.append(f"   • {s}")
-        lines.append("")
 
-    if bear:
-        lines.append("🔴 BEARISH SIGNALS:")
-        for s in bear:
-            lines.append(f"   • {s}")
-        lines.append("")
-
-    lines += [
-        f"{lean_emoji} LEAN: {lean}  ({len(bull)} bull / {len(bear)} bear signals)",
-        f"",
-        f"{regime_emoji} BTC Regime: {regime}",
-        f"",
-        f"─────────────────────────────",
-        f"ℹ️ This is raw indicator data — no confidence gate, no regime filter.",
-        f"Interpret with your own judgement.",
+def _format_analyse_indicators(data: dict) -> str:
+    """Full indicator readout for the /analyse Indicators button."""
+    def _row(label, value):
+        return f"  {label:<12}{value}"
+    lines = [
+        f"📊 INDICATORS — {data['symbol']} · {data['tf_label']}",
+        "═══════════════════════════",
+        _row("Price", f"${data['price']:.6g}"),
+        _row("RSI", f"{data['rsi']:.1f}"),
+        _row("MACD hist", f"{data['macd_diff']:+.5f}"),
+        _row("EMA 20", f"${data['ema20']:.6g}"),
+        _row("EMA 50", f"${data['ema50']:.6g}"),
+        _row("BB %", f"{data['bb_pct']:.0f}%"),
+        _row("BB range", f"${data['bb_lower']:.6g} – ${data['bb_upper']:.6g}"),
+        _row("Stoch K/D", f"{data['stoch_k']:.1f} / {data['stoch_d']:.1f}"),
+        _row("ATR", f"${data['atr']:.6g}"),
+        _row("CLV MA", f"{data['clv_ma']:+.2f}"),
+        f"  {data['vol_note']}",
     ]
+    return _an_pre(lines)
 
-    return "\n".join(lines)
+
+def _format_analyse_signals(data: dict, side: str) -> str:
+    """Bullish or bearish signal list for the /analyse section buttons."""
+    if side == 'bull':
+        title = f"🟢 BULLISH SIGNALS — {data['symbol']} · {data['tf_label']}"
+        sigs  = data['bull_signals']
+    else:
+        title = f"🔴 BEARISH SIGNALS — {data['symbol']} · {data['tf_label']}"
+        sigs  = data['bear_signals']
+    lines = [title, "═══════════════════════════"]
+    if sigs:
+        for s in sigs:
+            lines.append(f"• {s}")
+    else:
+        lines.append("(none)")
+    return _an_pre(lines)
 
 
 async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11378,19 +11430,48 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    card = _format_analyse_card(result, requested_tf_raw)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "📡 Full Signal Scan",
-            callback_data=f"menu_run|cscan"
-        ),
-        InlineKeyboardButton(
-            "📈 Chart",
-            callback_data=f"chart_tf_refresh|{symbol}|{tf_key}|{chat_id}"
-        ),
-    ]])
+    # Cache the full result so the section buttons can rebuild each view in-place.
+    _analyse_cache[f"{chat_id}:{symbol}:{tf_key}"] = result
 
-    await update.message.reply_text(card, reply_markup=keyboard)
+    card     = _format_analyse_card(result, requested_tf_raw)
+    keyboard = _analyse_kb(symbol, tf_key, chat_id,
+                           len(result['bull_signals']), len(result['bear_signals']),
+                           active='sum')
+
+    await update.message.reply_text(card, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def analyse_section_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Swap the /analyse card between summary / indicators / bullish / bearish."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, section, symbol, tf_key = query.data.split('|', 3)
+    except ValueError:
+        return
+    chat_id = query.message.chat_id if query.message else None
+    data = _analyse_cache.get(f"{chat_id}:{symbol}:{tf_key}")
+    if not data:
+        await query.answer("Analysis expired — run /analyse again.", show_alert=True)
+        return
+
+    if section == 'ind':
+        text = _format_analyse_indicators(data)
+    elif section == 'bull':
+        text = _format_analyse_signals(data, 'bull')
+    elif section == 'bear':
+        text = _format_analyse_signals(data, 'bear')
+    else:
+        section = 'sum'
+        text = _format_analyse_card(data, None)
+
+    kb = _analyse_kb(symbol, tf_key, chat_id,
+                     len(data['bull_signals']), len(data['bear_signals']),
+                     active=section)
+    try:
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        logger.warning("analyse_section edit failed: %s", e)
 
 
 async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
@@ -13125,7 +13206,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Running parameter sweep… (~3 ATR variants × 3 conf gates)"
     )
 
-    # ── Section 1 — ATR T1 multiplier sweep (at conf≥5, baseline) ─────────────
+    # ── Section 1 — ATR T1 multiplier sweep (at conf≥5, baseline) ────────���────
     # Three variants: TIGHT (×0.75), CURRENT (×1.0), WIDE (×1.25)
     atr_variants = [
         ('TIGHT',   0.75),
@@ -13276,7 +13357,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"🔬 PARAM CALIBRATION — {exchange} | {symbol}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━���━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Historical window: {days_covered:.0f} days | {candles_4h} bars\n"
         f"Sim: signals fired at each bar, outcome resolved within 18×4H candles\n\n"
 
@@ -14670,6 +14751,7 @@ def main():
     app.add_handler(CommandHandler("pnl",        pnl_command))
     app.add_handler(CommandHandler("cscan",      cscan_tf_command))  # TF-aware e.g. /cscan btc t15m
     app.add_handler(CommandHandler("analyse",    analyse_command))   # raw analysis, no gates
+    app.add_handler(CallbackQueryHandler(analyse_section_callback,  pattern=r'^an_sec\|'))
     app.add_handler(CommandHandler("watch",      watch_command))
     app.add_handler(CommandHandler("unwatch",    unwatch_command))
     app.add_handler(CommandHandler("safemode",   safemode_command))
