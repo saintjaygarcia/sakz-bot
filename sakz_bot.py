@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�����������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -2194,7 +2194,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • EMA20 / EMA50 overlaid on candles
 #   • Bollinger Bands (shaded)
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
-#   • Volume bars    (panel 2, coloured by candle direction)
+#   ��� Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
 # ──���─���────────────────────────────────────────
 def generate_chart(signal, df4h):
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ─────────────────────────������─���─���──────────────
+# ───────────────────────���─������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2493,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ═══════════════════════��══��══����══����══����══════════════����═══════════════════════
+# ══════════════════════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -5439,7 +5439,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ───────────────────────────────────────��───��─
+# ─────────────────────────────────────��─��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -5788,15 +5788,50 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Entry / Exit price ------------------------------------
+    # ---- footer: Entry / Exit / Current price + Time to Peak -----------
+    # Time it took to run from the signal (entry) to the peak (exit) price.
+    def _fmt_dur(a, b):
+        try:
+            if a is None or b is None:
+                return "\u2014"
+            if isinstance(a, str):
+                a = datetime.fromisoformat(a)
+            if isinstance(b, str):
+                b = datetime.fromisoformat(b)
+            if not isinstance(a, datetime) or not isinstance(b, datetime):
+                return "\u2014"
+            a = a.replace(tzinfo=None)
+            b = b.replace(tzinfo=None)
+            secs = max(int((b - a).total_seconds()), 0)
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                return f"{days}d {hours}h {mins}m"
+            if hours > 0:
+                return f"{hours}h {mins}m"
+            return f"{mins}m"
+        except Exception:
+            return "\u2014"
+
+    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
+
     fy = 0.180
-    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
+    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=10.5, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
+    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=14, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
+    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=10.5, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
+    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=14, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.520, fy + 0.030, "Current Price", color=GRAY, fontsize=10.5, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.520, fy - 0.014, _fmt_price(cur), color=WHITE, fontsize=14, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.740, fy + 0.030, "Time to Peak", color=GRAY, fontsize=10.5, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.740, fy - 0.014, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
             va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
@@ -5808,7 +5843,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ────────────────────────────���────���───���────────
+# ─────────────────────────���──���────���───���────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -12510,7 +12545,7 @@ def render_fgi_card(data):
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ────────────────────────────────────────────────────────
+    # ── card panel ───────────────────────────────────────────��────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
