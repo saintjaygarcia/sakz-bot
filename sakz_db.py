@@ -35,20 +35,61 @@ if _USE_TURSO:
 # BOTH row['col'] and row[0], with zero changes to call sites. Only the Turso
 # path is wrapped; the local-sqlite path keeps native sqlite3.Row.
 class _DictRow:
-    __slots__ = ("_map", "_vals")
+    __slots__ = ("_map", "_vals", "_norm")
+    @staticmethod
+    def _norm_name(c):
+        # libsql/Turso can report column names table-qualified
+        # ("price_history.key"), quoted/bracketed ('"key"', '`key`', '[key]')
+        # or padded — especially for reserved words like `key`. Normalise so
+        # row['key'] still resolves no matter how the backend names the column.
+        if not isinstance(c, str):
+            return None
+        n = c.strip()
+        if "." in n:
+            n = n.split(".")[-1]
+        n = n.strip().strip('"').strip("`")
+        if n.startswith("[") and n.endswith("]"):
+            n = n[1:-1]
+        return n.strip()
     def __init__(self, cols, vals):
         self._vals = tuple(vals)
-        self._map = {c: self._vals[i] for i, c in enumerate(cols)}
+        m = {}
+        norm = {}
+        for i, c in enumerate(cols):
+            v = self._vals[i] if i < len(self._vals) else None
+            m[c] = v
+            n = self._norm_name(c)
+            if n and n not in norm:
+                norm[n] = v
+        self._map = m
+        self._norm = norm
     def __getitem__(self, key):
         if isinstance(key, (int, slice)):
             return self._vals[key]
-        return self._map[key]
+        if key in self._map:
+            return self._map[key]
+        if key in self._norm:
+            return self._norm[key]
+        n = self._norm_name(key)
+        if n is not None and n in self._norm:
+            return self._norm[n]
+        raise KeyError(key)
     def get(self, key, default=None):
-        return self._map.get(key, default)
+        if key in self._map:
+            return self._map[key]
+        if key in self._norm:
+            return self._norm[key]
+        n = self._norm_name(key)
+        if n is not None and n in self._norm:
+            return self._norm[n]
+        return default
     def keys(self):
         return list(self._map.keys())
     def __contains__(self, key):
-        return key in self._map
+        if key in self._map or key in self._norm:
+            return True
+        n = self._norm_name(key)
+        return n is not None and n in self._norm
     def __iter__(self):
         return iter(self._vals)
     def __len__(self):
@@ -496,14 +537,22 @@ def db_load_price_history():
     rows = c.fetchall()
     conn.close()
     history = {}
+    # Positional access (SELECT key, exchange, symbol, ts, price = 0..4). The
+    # boot-critical restore must never depend on how the backend reports the
+    # reserved-word column name `key` in cursor.description.
     for r in rows:
-        if r['key'] not in history:
-            history[r['key']] = []
-        history[r['key']].append({
-            'time':     datetime.fromisoformat(r['ts']),
-            'price':    r['price'],
-            'exchange': r['exchange'],
-            'symbol':   r['symbol']
+        k        = r[0]
+        exchange = r[1]
+        symbol   = r[2]
+        ts       = r[3]
+        price    = r[4]
+        if k not in history:
+            history[k] = []
+        history[k].append({
+            'time':     datetime.fromisoformat(ts),
+            'price':    price,
+            'exchange': exchange,
+            'symbol':   symbol
         })
     return history
 
