@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────���������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -1117,7 +1117,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ────────────────────────────────────────────────────────────
+# ── /pro Command handler ───────────────────────────────────────────────���────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1430,7 +1430,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ─────────────────────────────────────────────
+# ────────────────────────────────────────���──���─
 try:
     from sakz_ws import (
         start_ws,
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ───────────────────────���─������─���─���──────────────
+# ──────────���───────���────���─������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -3302,7 +3302,7 @@ async def check_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Outcome check error for %s: %s", row['symbol'], e)
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────���──
 # /stats — Dynamic win rate stats
 # Supports minute-level windows for short-term live evaluation.
 #
@@ -6564,7 +6564,7 @@ async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not top:
         await update.message.reply_text("📊 No positive gainers yet. Run /scan more times.")
         return
-    lines = [f"📈 TOP GAINS — Last 24 Hours\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    lines = [f"📈 TOP GAINS — Last 24 Hours\n━���━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
     for i, g in enumerate(top, 1):
         lines.append(f"🟢 #{i} {g['exchange']} | {g['symbol']}\n"
                      f"   Change: +{g['change_pct']:.2f}%\n"
@@ -7280,6 +7280,19 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         bybit_count  = sum(1 for r in shown if r.get('exchange') == 'BYBIT')
         bin_count    = sum(1 for r in shown if r.get('exchange') == 'BINANCE')
+        mexc_count   = sum(1 for r in shown if r.get('exchange') == 'MEXC')
+        # ── SCAN SOURCE notif: shows which exchange(s) these scans came from ──
+        if sakz_exchanges.MEXC_ONLY:
+            scan_source_note = f"📡 Source: MEXC only ({mexc_count} pairs)"
+        elif sakz_exchanges.BYBIT_AVAILABLE:
+            _src_parts = [f"Bybit {bybit_count}", f"MEXC {mexc_count}"]
+            if sakz_exchanges.BINANCE_AVAILABLE:
+                _src_parts.append(f"Binance {bin_count}")
+            scan_source_note = "📡 Source: Bybit ✅ primary + MEXC fallback — " + " | ".join(_src_parts)
+        elif sakz_exchanges.BYBIT_AVAILABLE is False:
+            scan_source_note = f"📡 Source: Bybit ❌ blocked → MEXC fallback ({mexc_count} pairs)"
+        else:
+            scan_source_note = f"📡 Source: MEXC ({mexc_count} pairs)"
         bybit_note   = f"BYBIT: {bybit_count}" if sakz_exchanges.BYBIT_AVAILABLE else "BYBIT: skipped (blocked)"
         binance_note = f"BINANCE: {bin_count}"  if sakz_exchanges.BINANCE_AVAILABLE else "BINANCE: skipped (blocked)"
         cache_note   = "⚡ cached" if from_cache else "🔄 fresh"
@@ -7288,7 +7301,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_alerts(results, context.bot)
             await post_broadcast(results, context.bot)
 
-        title = f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}"
+        title = f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}\n{scan_source_note}"
         if hidden:
             title += f"\n({hidden} lower-confidence setup(s) hidden — use /scan all to view)"
 
@@ -10065,7 +10078,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 6. Admin user-count tracking (/admin)
 # ══════════════════════════════════════════════════════════���════
 
-# ─── TIMEFRAME HELPERS ──────────────────────────────────���─────
+# ─── TIMEFRAME HELPERS ───────────────────────────��──────���─────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -11138,7 +11151,7 @@ def _analyse_raw_indicators(symbol: str, tf_key: str):
         # RSI
         if rsi < 30:    bull_signals.append(f"RSI {rsi:.1f} — extremely oversold 🔴")
         elif rsi < 40:  bull_signals.append(f"RSI {rsi:.1f} — oversold")
-        elif rsi < 48:  bull_signals.append(f"RSI {rsi:.1f} — leaning oversold")
+        elif rsi < 48:  bull_signals.append(f"RSI {rsi:.1f} ��� leaning oversold")
         elif rsi > 70:  bear_signals.append(f"RSI {rsi:.1f} — extremely overbought 🔴")
         elif rsi > 60:  bear_signals.append(f"RSI {rsi:.1f} — overbought")
         elif rsi > 52:  bear_signals.append(f"RSI {rsi:.1f} — leaning overbought")
@@ -12173,7 +12186,7 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(f"❌ Chart refresh failed: {e}")
 
 
-# ─── USER TRACKING ────────────────────────────────────────────
+# ─── USER TRACKING ───────────────────────────────────���────────
 def track_user_interaction(chat_id: int):
     """Record a unique user interaction in the DB."""
     try:
@@ -14270,7 +14283,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────��──────────
+# ──────────────────────────────────��─��────────
 # MAIN
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
@@ -14524,6 +14537,30 @@ def _install_auto_refresh(app):
                 AUTO_REFRESH_SECS, AUTO_REFRESH_MAX_CYCLES, AUTO_REFRESH_MAX_JOBS)
 
 
+async def on_error(update, context):
+    """Global error handler.
+
+    Without this, any uncaught exception in a handler dies silently (PTB only
+    logs it and the user sees nothing). This logs the full traceback AND sends
+    the actual error back to the chat so a command can never fail silently.
+    """
+    err = context.error
+    logger.error("Unhandled exception while processing update", exc_info=err)
+    try:
+        chat_id = None
+        if isinstance(update, Update) and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if chat_id is not None:
+            # Plain text on purpose: error strings often contain Markdown
+            # metacharacters that would make a formatted send fail too.
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Something errored while handling that command:\n{type(err).__name__}: {err}",
+            )
+    except Exception as _notify_e:
+        logger.warning("Failed to notify user of error: %s", _notify_e)
+
+
 def main():
 
 
@@ -14591,6 +14628,7 @@ def main():
     logger.info("Restored %d autoscan subscribers from DB", len(auto_scan_subscribers))
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_error_handler(on_error)   # never die silently — log + notify the chat
 
     # FIX #AUTOREFRESH — every card with a 🔄 button also auto-refreshes (30s)
     _install_auto_refresh(app)
