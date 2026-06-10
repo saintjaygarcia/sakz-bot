@@ -175,6 +175,9 @@ from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_safemode_load,
     db_safemode_enable,
     db_safemode_disable,
+    db_autoscan_load,
+    db_autoscan_set,
+    db_autoscan_remove,
     db_snail_unlock,
     db_snail_is_unlocked,
     db_snail_start_session,
@@ -405,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ────────────────────────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -1124,7 +1127,7 @@ def _pro_full_command_guide() -> str:
         "📖  SAKZ BOT — FULL COMMAND GUIDE\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Everything the bot can do, in one place.\n\n"
-        "🔭  SCANNING\n"
+        "���  SCANNING\n"
         "/scan                Full market scan (4H, top pairs)\n"
         "/scan BTC            Scan a specific pair\n"
         "/scan BTC 1h         Specific pair on a custom timeframe\n"
@@ -1812,7 +1815,7 @@ def _fetch_tf_candles(exchange, symbol, tf_key, role='pri'):
                            detail=f"{exchange} {symbol} fetch exception: {e}")
 
 
-# ── NEW-LISTING DYNAMIC SCAN ──────────────────────────────────────────────────
+# ── NEW-LISTING DYNAMIC SCAN ─────────────────────�����────────────────────────────
 # Handles tokens listed minutes or hours ago that don't yet have enough
 # candle history for the standard 4H + 1D analysis.
 #
@@ -2193,7 +2196,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
 #   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
-# ─────────────────────────────────────────────
+# ──���─���────────────────────────────────────────
 def generate_chart(signal, df4h):
     """
     Generate a chart PNG (bytes) for the given signal using the 4H OHLCV dataframe
@@ -2360,9 +2363,9 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────���─���──────────────
 # ANALYZE FUNCTIONS
-# ─────────────────────────────────────────────
+# ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
     try:
         df4h = bybit_fetch_ohlcv(symbol, '240', 100)
@@ -2464,7 +2467,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
-        key=lambda x: (x["confidence"], x["score"],
+        key=lambda x: (x["confidence"], (x.get("consensus_score") or 0.5), x["score"],
                        _vol_rank.get(x.get("vol_regime", "MEDIUM"), 2)),
         reverse=True
     )
@@ -2490,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -2698,7 +2701,7 @@ def run_full_scan():
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
-        key=lambda x: (x["confidence"], x["score"], _vol_rank.get(x.get("vol_regime", "MEDIUM"), 2)),
+        key=lambda x: (x["confidence"], (x.get("consensus_score") or 0.5), x["score"], _vol_rank.get(x.get("vol_regime", "MEDIUM"), 2)),
         reverse=True
     )
 
@@ -2976,6 +2979,72 @@ def _compute_peak_pct(signal, current_price=None):
     except Exception as e:
         logger.warning("_compute_peak_pct error: %s", e)
         return None, None
+
+
+def _compute_peak_excursions(signal, current_price=None):
+    """Best favorable AND worst adverse % moves since scan (UNLEVERAGED, raw).
+
+    Returns (fav_raw, fav_at, adv_raw, adv_at):
+      • fav_raw / fav_at : largest favorable move (%) + when (peak-profit path).
+      • adv_raw / adv_at : worst adverse move (%, <= 0) + when (peak drawdown).
+    Direction-aware: LONG favors highs / fears lows, SHORT the inverse. Uses
+    candle wicks since scan_time, folded with the current live price. The
+    renderer multiplies adv_raw by leverage and caps the loss at -100%.
+    Returns (None, None, None, None) when no data is available.
+    """
+    try:
+        entry = float(signal.get('price') or 0)
+        bias  = str(signal.get('bias', 'LONG')).upper()
+        if entry <= 0:
+            return None, None, None, None
+
+        scan_time = signal.get('scan_time')
+        if hasattr(scan_time, 'isoformat'):
+            scan_iso = scan_time.isoformat()
+        else:
+            scan_iso = str(scan_time) if scan_time else None
+        if not scan_iso:
+            return None, None, None, None
+
+        candles = _fetch_ohlc_since(
+            signal.get('exchange', ''), signal.get('symbol', ''), scan_iso, limit=500
+        )
+
+        fav = fav_at = None
+        adv = adv_at = None
+        for cdl in candles:
+            if bias == 'LONG':
+                f = (cdl['high'] - entry) / entry * 100
+                a = (cdl['low']  - entry) / entry * 100
+            else:
+                f = (entry - cdl['low'])  / entry * 100
+                a = (entry - cdl['high']) / entry * 100
+            if fav is None or f > fav:
+                fav, fav_at = f, cdl['ts']
+            if adv is None or a < adv:
+                adv, adv_at = a, cdl['ts']
+
+        if current_price and current_price > 0:
+            if bias == 'LONG':
+                cf = (current_price - entry) / entry * 100
+            else:
+                cf = (entry - current_price) / entry * 100
+            if fav is None or cf > fav:
+                fav, fav_at = cf, datetime.now()
+            if adv is None or cf < adv:
+                adv, adv_at = cf, datetime.now()
+
+        def _strip(dt):
+            if hasattr(dt, 'replace'):
+                try:
+                    return dt.replace(tzinfo=None)
+                except Exception:
+                    return dt
+            return dt
+        return fav, _strip(fav_at), adv, _strip(adv_at)
+    except Exception as e:
+        logger.warning("_compute_peak_excursions error: %s", e)
+        return None, None, None, None
 
 
 def _resolve_outcome_from_candles(candles, bias, sl, t1, t2, t3):
@@ -3623,7 +3692,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    await update.message.reply_text("🔬 Running backtest analysis…")
+    await update.message.reply_text("🔬 Running backtest analysis���")
 
     conn = db_connect()
     c    = conn.cursor()
@@ -3772,7 +3841,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   SL hit      : {sl_c}/{tot} ({sl_c/tot*100:.0f}%)\n\n"
         f"🛠 CALIBRATION RECOMMENDATIONS\n"
         f"{rec_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━��━━━━━━━━\n"
         f"💡 Tip: run /backtest 168 weekly to track drift"
     )
 
@@ -4294,6 +4363,7 @@ async def autoscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if choice == 'off':
         auto_scan_subscribers.pop(chat_id, None)
+        db_autoscan_remove(chat_id)
         _autoscan_awaiting_tf.discard(chat_id)
         await query.edit_message_text("🔕 Auto-scan *OFF*. Use /autoscan to turn back on.", parse_mode='Markdown')
         return
@@ -4323,6 +4393,7 @@ async def autoscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     tf_pref  = None if choice == 'always' else choice
     tf_label = _tf_display(tf_pref) if tf_pref else "All timeframes"
     auto_scan_subscribers[chat_id] = tf_pref
+    db_autoscan_set(chat_id, tf_pref)
     _autoscan_awaiting_tf.discard(chat_id)
 
     await query.edit_message_text(
@@ -4361,6 +4432,7 @@ async def autoscan_custom_tf_handler(update: Update, context: ContextTypes.DEFAU
         return True  # consumed — don't pass to other handlers
 
     auto_scan_subscribers[chat_id] = tf
+    db_autoscan_set(chat_id, tf)
     _autoscan_awaiting_tf.discard(chat_id)
 
     await update.message.reply_text(
@@ -4595,7 +4667,15 @@ def format_signal_primary(r, rank):
     rf_score          = r.get('rf_score')
     if consensus_score is not None:
         pct = int(round(consensus_score * 100))
-        lines.append(f"🤖 ML: {pct}% win prob — {consensus_verdict}")
+        _adj = r.get('ml_conf_adjust', 0)
+        _adj_txt = (f"  ({'+' if _adj > 0 else ''}{_adj} conf)" if _adj else "")
+        _cal = ""
+        try:
+            if (rf_model_meta() or {}).get('calibrated'):
+                _cal = " ✓cal"
+        except Exception:
+            pass
+        lines.append(f"🤖 ML: {pct}% win prob{_cal} — {consensus_verdict}{_adj_txt}")
     elif ml_score is not None and rf_score is not None:
         lines.append(f"🤖 ML: XGB {int(round(ml_score*100))}%  |  RF {int(round(rf_score*100))}%")
     elif ml_score is not None:
@@ -5420,7 +5500,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
         f"🎯 Target 3    ${t3:.6f}",
         f"   Move: {t3_pct:+.2f}%  →  🟢 +${t3_pnl:,.2f}",
         f"",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━���━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
     if bot_lev and not custom:
@@ -5474,320 +5554,474 @@ def _fetch_sparkline_closes(exchange, symbol, limit=60):
         return []
 
 
-def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None, peak_raw_pct=None, peak_at=None):
-    """Render the SAKZ 'AI Trading Intelligence' PnL card (PNG bytes).
+def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=None,
+                          peak_raw_pct=None, peak_at=None, peak_loss_pct=None, peak_loss_at=None,
+                          username=None, out_scale=1.0):
+    """Render the SAKZBOTT vault-style PnL card (PNG bytes).
 
-    Layout mirrors the v2 card design: header emblem, pair + direction/leverage
-    pill, big PNL (ROI), profit box, framed price chart with ENTRY/EXIT callouts,
-    a 3-stat strip (EXIT target / LEVERAGE / HELD FOR) and a 5-stat footer
-    (ENTRY PRICE / EXIT PRICE / PNL USDT / ROI / TIME).
+    Front-face layout (flat, dark, green/red accent):
+      • header: bias triangle + SAKZBOTT wordmark
+      • avatar + Telegram username + gold 'Trader' badge
+      • chips row: bias / pair / leverage / exchange (MEXC)
+      • 'My Vault PnL': peak ROI %% (and profit $ beside it when capital is set)
+      • footer: Entry Price (from the signal) + Exit Price (peak/current)
 
-    Preserves prior data: live ROI, dollar profit, peak high-water-mark (with
-    time-to-peak), direction + leverage, exit target and held-for duration.
+    The headline %% is the PEAK leveraged ROI — the best the pair reached from
+    signal to its max profit before retracement. With no capital the card shows
+    the percentage only; with capital it shows '$amount  +%%' side by side.
+    No QR code, no manager fee.
     """
-    import math, io
+    import io
     import numpy as np
-    from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
+    from matplotlib.patches import FancyBboxPatch, Polygon, Ellipse
 
     # ---- palette --------------------------------------------------------
-    BG        = "#06080B"
-    CARD      = "#0A0D12"
-    CARD_ED   = "#232C36"
-    PANEL2    = "#0E141A"
-    PANEL2_ED = "#1E2731"
-    CALL_BG   = "#0C1116"
-    GREEN     = "#34E29B"
-    GREEN_DK  = "#1FA87A"
-    RED       = "#F0556B"
-    RED_DK    = "#A33442"
-    WHITE     = "#FFFFFF"
-    SOFT      = "#AEB6BF"
-    GRAY      = "#7E8893"
-    SUBCOL    = "#7FA899"
-    GRID      = "#172029"
+    BG       = "#06080B"
+    CARD     = "#0B0F14"
+    CARD_ED  = "#1C2630"
+    CHIP_BG  = "#10161D"
+    CHIP_ED  = "#222C37"
+    GREEN    = "#2FD675"
+    GREEN_DK = "#1B9B57"
+    RED      = "#F0556B"
+    RED_DK   = "#A33442"
+    WHITE    = "#FFFFFF"
+    SOFT     = "#AEB6BF"
+    GRAY     = "#7E8893"
+    GOLD     = "#F2C744"
+    INK      = "#0A0D11"
+    BTC_ORANGE = "#F7931A"
+    MEXC_BLUE  = "#1D6CFF"
 
     ASPECT = 10.24 / 6.83
-    up_arrow = "\u25B2"
-    dn_arrow = "\u25BC"
+
+    fig = plt.figure(figsize=(10.24, 6.83), dpi=100, facecolor=BG)
+    ax  = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
     def disc(x, y, r, **kw):
         ax.add_patch(Ellipse((x, y), width=2 * r / ASPECT, height=2 * r, **kw))
 
     # ---- derive values --------------------------------------------------
-    name = os.environ.get("BOT_NAME", "SAKZ").upper()
+    brand = os.environ.get("BOT_NAME", "Sakz")
 
     entry = float(signal.get('price') or 0) or float(current_price or 0)
     bias  = str(signal.get('bias', 'LONG')).upper()
     is_long = bias == 'LONG'
     cur   = float(current_price or 0)
+    lev   = int(leverage or 1)
+
+    # current raw (unleveraged) move, direction-aware
     if entry > 0 and cur > 0:
-        raw_pct = ((cur - entry) / entry * 100) if is_long else ((entry - cur) / entry * 100)
+        cur_raw = ((cur - entry) / entry * 100) if is_long else ((entry - cur) / entry * 100)
     else:
-        raw_pct = 0.0
-    lev     = leverage or 1
-    lev_pct = raw_pct * lev
-    up      = lev_pct >= 0
-    col     = GREEN if up else RED
-    col_dk  = GREEN_DK if up else RED_DK
-    dir_col = GREEN if is_long else RED
-    dir_arrow = up_arrow if is_long else dn_arrow
+        cur_raw = 0.0
 
-    raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT').replace('/', '')
-    disp_sym = raw_sym
-    exch     = str(signal.get('exchange', '')).upper()
-    held_str = _fmt_held_for(signal.get('scan_time')).upper()
+    # PEAK favourable move (raw) → leveraged headline ROI (best before retrace)
+    fav_raw = peak_raw_pct if peak_raw_pct is not None else cur_raw
+    if fav_raw < cur_raw:
+        fav_raw = cur_raw
+    peak_lev = fav_raw * lev
+    if peak_lev < -100.0:
+        peak_lev = -100.0
 
-    roi_str = f"{lev_pct:+.2f}%"
-    if capital:
-        dval = capital * lev_pct / 100.0
-        dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.2f}"
+    up = peak_lev >= 0
+    if not up:                       # loss → flip every accent-green to red
+        GREEN, GREEN_DK = RED, RED_DK
+    accent = GREEN
+    # bias colour is PERMANENT identity: LONG=green, SHORT=red (independent of PnL flip)
+    bias_color = "#2FD675" if is_long else "#F0556B"
+    tri = "\u25B2" if is_long else "\u25BC"
+
+    raw_sym  = str(signal.get('symbol', '')).upper().replace('/', '').replace('_', '')
+    base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
+    exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
+
+    # exit price: peak price if it ran into profit past entry, else current price
+    if fav_raw and fav_raw > 0 and entry > 0:
+        exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
     else:
-        dollar_str = "\u2014"
-
-    # peak high-water-mark (leveraged), never below current pnl
-    if peak_raw_pct is not None:
-        peak_lev_pct = peak_raw_pct * lev
-    else:
-        peak_lev_pct = lev_pct
-    if peak_lev_pct < lev_pct:
-        peak_lev_pct = lev_pct
-    peak_str = f"{peak_lev_pct:+.2f}%"
-    peak_when_str = None
-    _scan_t = signal.get('scan_time')
-    if peak_at is not None and _scan_t:
-        try:
-            _st = datetime.fromisoformat(_scan_t) if isinstance(_scan_t, str) else _scan_t
-            if isinstance(_st, datetime):
-                _secs = max(int((peak_at.replace(tzinfo=None) - _st.replace(tzinfo=None)).total_seconds()), 0)
-                _d, _r = divmod(_secs, 86400)
-                _h, _r = divmod(_r, 3600)
-                _m = _r // 60
-                if _d:
-                    peak_when_str = f"{_d}d {_h}h {_m}m"
-                elif _h:
-                    peak_when_str = f"{_h}h {_m}m"
-                else:
-                    peak_when_str = f"{_m}m"
-        except Exception:
-            peak_when_str = None
+        exit_price = cur or entry
 
     def _fmt_price(p):
         if not p:
             return "\u2014"
         p = float(p)
         if p >= 1000:
-            return f"${p:,.2f}"
+            return f"{p:,.2f}"
         if p >= 1:
-            return f"${p:,.4f}"
-        return f"${p:.5f}"
-    entry_price_str = _fmt_price(entry)
-    exit_price_str  = _fmt_price(cur)
+            return f"{p:,.4f}"
+        return f"{p:.6f}"
 
-    exit_mode = str(signal.get('exit_mode') or signal.get('exit') or '').upper().strip()
-    _tp_map = {'TP1': 'TAKE PROFIT 1', 'TP2': 'TAKE PROFIT 2', 'TP3': 'TAKE PROFIT 3',
-               'SL': 'STOP LOSS', 'STOP': 'STOP LOSS'}
-    if exit_mode in _tp_map:
-        exit_val = exit_mode; exit_sub = _tp_map[exit_mode]; exit_callout = f"EXIT ({exit_mode})"
-    elif exit_mode:
-        exit_val = exit_mode; exit_sub = "TARGET"; exit_callout = "EXIT"
-    else:
-        exit_val = "OPEN"; exit_sub = "STILL ACTIVE"; exit_callout = "CURRENT"
+    pct_str = f"{peak_lev:+.2f}%"
+    show_amount = (capital is not None) and (capital > 0)
+    dollar_str = None
+    if show_amount:
+        dval = capital * peak_lev / 100.0
+        if abs(dval) >= 100:
+            dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.0f}"
+        else:
+            dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.2f}"
 
-    margin_mode = str(signal.get('margin_mode') or 'CROSS').upper()
+    uname = str(username or signal.get('username') or "Trader").lstrip('@')
+    if len(uname) > 16:
+        uname = uname[:15] + "\u2026"
 
-    try:
-        _tt = datetime.fromisoformat(_scan_t) if isinstance(_scan_t, str) else _scan_t
-        time_str = _tt.strftime("%d %b %Y %H:%M:%S") if isinstance(_tt, datetime) else "\u2014"
-    except Exception:
-        time_str = "\u2014"
-
-    # ---- figure ---------------------------------------------------------
-    fig = plt.figure(figsize=(10.24, 6.83), dpi=100, facecolor=BG)
-    ax  = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
-
-    ax.add_patch(FancyBboxPatch((0.012, 0.018), 0.976, 0.964,
-        boxstyle="round,pad=0,rounding_size=0.030",
+    # ---- card body ------------------------------------------------------
+    ax.add_patch(FancyBboxPatch((0.035, 0.06), 0.93, 0.88,
+        boxstyle="round,pad=0,rounding_size=0.045",
         linewidth=1.4, edgecolor=CARD_ED, facecolor=CARD, zorder=1))
 
-    # radial glow behind chart (top-right) — transparent green haze, keeps card dark
-    gx = np.linspace(0, 1, 200); gy = np.linspace(0, 1, 200)
+    # right-side green/red glow (echoes the reference art)
+    gx = np.linspace(0, 1, 220); gy = np.linspace(0, 1, 220)
     GXX, GYY = np.meshgrid(gx, gy)
-    dist = np.sqrt((GXX - 0.72) ** 2 + (GYY - 0.74) ** 2)
-    glow = np.clip(0.10 - dist * 0.46, 0, 0.10)
+    dist = np.sqrt((GXX - 0.80) ** 2 + (GYY - 0.60) ** 2)
+    glow = np.clip(0.13 - dist * 0.40, 0, 0.13)
     rgba = np.zeros((glow.shape[0], glow.shape[1], 4))
-    rgba[..., 0] = 0.12; rgba[..., 1] = 0.66; rgba[..., 2] = 0.46
-    rgba[..., 3] = glow * 2.6
-    ax.imshow(rgba, extent=[0.10, 0.965, 0.36, 0.945], aspect='auto', origin='lower',
+    if up:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.18, 0.84, 0.47
+    else:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.94, 0.33, 0.42
+    rgba[..., 3] = glow * 2.4
+    ax.imshow(rgba, extent=[0.50, 0.965, 0.16, 0.92], aspect='auto', origin='lower',
               zorder=1, interpolation='bilinear')
 
-    # ---- header emblem + wordmark --------------------------------------
-    lx, ly = 0.066, 0.905
-    def _wing(side):
-        feathers = [
-            [(0.000, 0.004), (0.052 * side, 0.030), (0.030 * side, 0.006), (0.044 * side, -0.004)],
-            [(0.004 * side, 0.000), (0.040 * side, 0.016), (0.024 * side, -0.002), (0.034 * side, -0.012)],
-            [(0.006 * side, -0.006), (0.028 * side, 0.002), (0.016 * side, -0.012), (0.022 * side, -0.020)],
-        ]
-        for f in feathers:
-            ax.add_patch(Polygon([(lx + px, ly + py) for px, py in f], closed=True,
-                facecolor=GREEN, edgecolor=GREEN_DK, linewidth=0.5, zorder=4))
-    _wing(1); _wing(-1)
-    ax.add_patch(Polygon([(lx - 0.006, ly + 0.018), (lx + 0.006, ly + 0.018), (lx, ly - 0.030)],
-        closed=True, facecolor=GREEN, edgecolor=GREEN_DK, linewidth=0.5, zorder=5))
-    disc(lx, ly + 0.024, 0.008, facecolor=GREEN, edgecolor=GREEN_DK, lw=0.5, zorder=6)
+    # stacked chevrons pointing up (LONG) / down (SHORT)
+    chev_dir = 1 if is_long else -1
+    for k in range(5):
+        bx = 0.60 + k * 0.068
+        amp = 0.12
+        ya = 0.46
+        alpha = max(0.30 - k * 0.055, 0.05)
+        ax.plot([bx - 0.046, bx, bx + 0.046],
+                [ya, ya + amp * chev_dir, ya],
+                color=accent, lw=9, solid_capstyle='round',
+                solid_joinstyle='round', alpha=alpha, zorder=1)
 
-    ax.text(0.120, 0.918, name, color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=5)
-    ax.text(0.122, 0.870, "A I   T R A D I N G   I N T E L L I G E N C E", color=SUBCOL,
-            fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=5)
+    # ---- header: bias triangle + wordmark -------------------------------
+    hx, hy = 0.082, 0.876
+    ax.add_patch(Polygon([(hx - 0.013, hy - 0.015), (hx + 0.013, hy - 0.015), (hx, hy + 0.017)],
+        closed=(is_long), facecolor=bias_color, edgecolor='none', zorder=5))
+    if not is_long:
+        ax.add_patch(Polygon([(hx - 0.013, hy + 0.015), (hx + 0.013, hy + 0.015), (hx, hy - 0.017)],
+            closed=True, facecolor=bias_color, edgecolor='none', zorder=5))
+    ax.text(hx + 0.028, hy, brand, color=WHITE, fontsize=23, fontweight='bold',
+            va='center', ha='left', zorder=5, fontstyle='italic')
 
-    # ---- left column: pair, direction pill, ROI, peak, profit ----------
-    _sym_fs = 44 if len(disp_sym) <= 8 else (36 if len(disp_sym) <= 11 else 30)
-    ax.text(0.046, 0.762, disp_sym, color=WHITE, fontsize=_sym_fs, fontweight='bold', va='center', ha='left', zorder=5)
+    # ---- avatar + username + Trader badge -------------------------------
+    av_x, av_y = 0.098, 0.758
+    disc(av_x, av_y, 0.030, facecolor="#263241", edgecolor=CARD_ED, lw=1.0, zorder=4)
+    ax.text(av_x, av_y, (uname[:1].upper() or 'T'), color=WHITE, fontsize=15,
+            fontweight='bold', va='center', ha='center', zorder=5)
+    name_x = av_x + 0.052
+    ax.text(name_x, av_y, uname, color=WHITE, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    badge_x = name_x + 0.0150 * len(uname) + 0.020
+    badge_w = 0.018 * 2 + 0.0118 * len("Trader")
+    ax.add_patch(FancyBboxPatch((badge_x, av_y - 0.026), badge_w, 0.052,
+        boxstyle="round,pad=0,rounding_size=0.020",
+        linewidth=0, facecolor=GOLD, zorder=4))
+    ax.text(badge_x + badge_w / 2, av_y, "Trader", color=INK, fontsize=11,
+            fontweight='bold', va='center', ha='center', zorder=5)
 
-    pill_txt = f"{dir_arrow} {bias}   {lev}X"
-    pdw = 0.052 + 0.0150 * len(pill_txt)
-    ax.add_patch(FancyBboxPatch((0.046, 0.672), pdw, 0.052,
-        boxstyle="round,pad=0,rounding_size=0.026",
-        linewidth=1.5, edgecolor=dir_col, facecolor='none', zorder=4))
-    ax.text(0.046 + pdw / 2, 0.698, pill_txt, color=dir_col, fontsize=13, fontweight='bold', va='center', ha='center', zorder=5)
+    # ---- chips row ------------------------------------------------------
+    def chip(x, y, label, *, fg=WHITE, border=CHIP_ED, fill=CHIP_BG, icon=None, icon_col=None):
+        pad = 0.018
+        icon_w = 0.032 if icon else 0.0
+        tw = 0.0140 * len(label)
+        w = pad * 2 + icon_w + tw
+        h = 0.052
+        ax.add_patch(FancyBboxPatch((x, y), w, h,
+            boxstyle="round,pad=0,rounding_size=0.020",
+            linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
+        tx = x + pad
+        if icon in ('coin', 'mexc'):
+            disc(x + pad + 0.013, y + h / 2, 0.014, facecolor=icon_col, edgecolor='none', zorder=5)
+            glyph = base_sym[:1] if icon == 'coin' else 'M'
+            ax.text(x + pad + 0.013, y + h / 2, glyph, color=WHITE if icon == 'mexc' else INK,
+                    fontsize=8.5, fontweight='bold', va='center', ha='center', zorder=6)
+            tx = x + pad + 0.032
+        ax.text(tx, y + h / 2, label, color=fg, fontsize=12, fontweight='bold',
+                va='center', ha='left', zorder=6)
+        return x + w + 0.016
 
-    ax.text(0.048, 0.612, "PNL (ROI)", color=GRAY, fontsize=12, fontweight='bold', va='center', ha='left', zorder=5)
-    ax.text(0.044, 0.520, roi_str, color=col, fontsize=50, fontweight='bold', va='center', ha='left', zorder=5)
+    cy = 0.628
+    nx = 0.078
+    nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=bias_color)
+    nx = chip(nx, cy, base_sym, icon='coin', icon_col=BTC_ORANGE)
+    nx = chip(nx, cy, f"{lev}x")
+    nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
 
-    if peak_when_str:
-        peak_line = f"{up_arrow} Peak {peak_str}   \u00b7   reached after {peak_when_str.upper()}"
+    # ---- My Vault PnL ---------------------------------------------------
+    ax.text(0.080, 0.508, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    if show_amount:
+        _td = ax.text(0.076, 0.410, dollar_str, color=accent, fontsize=44, fontweight='bold',
+                      va='center', ha='left', zorder=5)
+        fig.canvas.draw()  # realise text geometry so we can place % right after it
+        _bb = _td.get_window_extent(renderer=fig.canvas.get_renderer())
+        _x_right = ax.transData.inverted().transform((_bb.x1, _bb.y0))[0]
+        ax.text(min(_x_right + 0.024, 0.60), 0.398, pct_str, color=accent, fontsize=19,
+                fontweight='bold', va='center', ha='left', zorder=5)
     else:
-        peak_line = f"{up_arrow} Peak {peak_str}"
-    ax.text(0.048, 0.452, peak_line, color=(GREEN if up else RED), fontsize=10, fontweight='bold', va='center', ha='left', zorder=5)
+        ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
+                va='center', ha='left', zorder=5)
 
-    pbx, pby, pbw, pbh = 0.046, 0.356, 0.312, 0.064
-    ax.add_patch(FancyBboxPatch((pbx, pby), pbw, pbh,
-        boxstyle="round,pad=0,rounding_size=0.016",
-        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
-    ax.text(pbx + 0.022, pby + pbh / 2, "PROFIT", color=GRAY, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
-    ax.text(pbx + pbw - 0.022, pby + pbh / 2, dollar_str, color=col, fontsize=15, fontweight='bold', va='center', ha='right', zorder=4)
-
-    # ---- price chart ----------------------------------------------------
-    cx0, cx1 = 0.420, 0.945
-    cy0, cy1 = 0.392, 0.812
-    for i in range(1, 6):
-        gxp = cx0 + (cx1 - cx0) * i / 6
-        ax.plot([gxp, gxp], [cy0, cy1], color=GRID, lw=0.8, zorder=2)
-    for j in range(0, 4):
-        gyp = cy0 + (cy1 - cy0) * j / 3
-        ax.plot([cx0, cx1], [gyp, gyp], color=GRID, lw=0.8, zorder=2)
-
-    pts = list(closes) if (closes and len(closes) >= 3) else None
-    if pts is None:
-        base = entry or cur or 1.0; end = cur or base; npt = 30
-        pts = [base + (end - base) * (i / (npt - 1)) + (end - base) * 0.12 * math.sin((i / (npt - 1)) * 5.5) for i in range(npt)]
-    n = len(pts)
-    lo, hi = min(pts), max(pts); rng = (hi - lo) or 1.0
-    xs = [cx0 + (cx1 - cx0) * i / (n - 1) for i in range(n)]
-    ys = [cy0 + 0.045 + (cy1 - cy0 - 0.07) * ((p - lo) / rng) for p in pts]
-
-    ax.fill_between(xs, ys, cy0, color=GREEN_DK, alpha=0.16, zorder=2, linewidth=0)
-    ax.plot(xs, ys, color=GREEN, lw=7.0, alpha=0.10, solid_capstyle='round', zorder=3)
-    ax.plot(xs, ys, color=GREEN, lw=2.6, solid_capstyle='round', solid_joinstyle='round', zorder=4)
-
-    # entry dot (start)
-    disc(xs[0], ys[0], 0.022, facecolor='none', edgecolor=GREEN, lw=1.4, zorder=5)
-    disc(xs[0], ys[0], 0.011, facecolor=GREEN, edgecolor=BG, lw=1.4, zorder=6)
-    # dashed vertical at exit + baseline dot
-    ax.plot([xs[-1], xs[-1]], [cy0, ys[-1]], color=GREEN_DK, lw=1.2, ls=(0, (4, 3)), zorder=4)
-    disc(xs[-1], cy0, 0.010, facecolor=GREEN_DK, edgecolor='none', zorder=5)
-    # exit dot (end)
-    disc(xs[-1], ys[-1], 0.026, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=6)
-    disc(xs[-1], ys[-1], 0.013, facecolor=GREEN, edgecolor=BG, lw=1.6, zorder=7)
-
-    # peak marker on the curve (high-water-mark)
-    pk_i = max(range(n), key=lambda i: ys[i])
-    if 1 < pk_i < int(n * 0.82):
-        disc(xs[pk_i], ys[pk_i], 0.009, facecolor=WHITE, edgecolor=GREEN, lw=1.2, zorder=7)
-        ax.text(xs[pk_i], ys[pk_i] + 0.050, f"PEAK {peak_str}", color=WHITE, fontsize=7.5,
-                fontweight='bold', va='center', ha='center', zorder=8)
-
-    def callout(cx, cy, w, h, title, value, tcol):
-        ax.add_patch(FancyBboxPatch((cx, cy), w, h,
-            boxstyle="round,pad=0,rounding_size=0.014",
-            linewidth=1.2, edgecolor=PANEL2_ED, facecolor=CALL_BG, zorder=8))
-        disc(cx + 0.018, cy + h - 0.024, 0.006, facecolor=tcol, edgecolor='none', zorder=9)
-        ax.text(cx + 0.034, cy + h - 0.024, title, color=tcol, fontsize=8.5, fontweight='bold', va='center', ha='left', zorder=9)
-        ax.text(cx + 0.018, cy + 0.021, value, color=WHITE, fontsize=11, fontweight='bold', va='center', ha='left', zorder=9)
-
-    # entry callout (above start dot, with connector)
-    eb_w, eb_h = 0.122, 0.066
-    eb_x = min(max(xs[0] - 0.010, cx0 + 0.004), cx1 - eb_w)
-    eb_y = min(ys[0] + 0.085, cy1 - eb_h)
-    ax.plot([xs[0], xs[0]], [ys[0], eb_y], color=PANEL2_ED, lw=1.0, zorder=7)
-    callout(eb_x, eb_y, eb_w, eb_h, "ENTRY", entry_price_str, GREEN)
-
-    # exit callout (top-right, with short connector to end dot)
-    xb_w, xb_h = 0.150, 0.066
-    xb_x = cx1 - xb_w - 0.018
-    xb_y = 0.642
-    ax.plot([xb_x + xb_w, xs[-1]], [xb_y + xb_h / 2, ys[-1]], color=PANEL2_ED, lw=1.0, zorder=7)
-    callout(xb_x, xb_y, xb_w, xb_h, exit_callout, exit_price_str, GREEN)
-
-    # ---- 3-stat strip ---------------------------------------------------
-    ms_x, ms_y, ms_w, ms_h = 0.046, 0.214, 0.908, 0.116
-    ax.add_patch(FancyBboxPatch((ms_x, ms_y), ms_w, ms_h,
-        boxstyle="round,pad=0,rounding_size=0.020",
-        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
-    for dvx in (ms_x + ms_w / 3, ms_x + 2 * ms_w / 3):
-        ax.plot([dvx, dvx], [ms_y + 0.024, ms_y + ms_h - 0.024], color=PANEL2_ED, lw=1.0, zorder=4)
-
-    def stat(col_x, kind, label, value, sub):
-        icx = col_x + 0.034
-        icy = ms_y + ms_h / 2
-        disc(icx, icy, 0.030, facecolor=CALL_BG, edgecolor=GREEN_DK, lw=1.4, zorder=4)
-        if kind == 'target':
-            disc(icx, icy, 0.016, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=5)
-            disc(icx, icy, 0.0075, facecolor='none', edgecolor=GREEN, lw=1.3, zorder=5)
-            disc(icx, icy, 0.0025, facecolor=GREEN, edgecolor='none', zorder=5)
-        elif kind == 'bolt':
-            bolt = [(0.000, 0.020), (-0.011, 0.001), (-0.001, 0.001),
-                    (-0.005, -0.020), (0.013, 0.005), (0.002, 0.005)]
-            ax.add_patch(Polygon([(icx + bxv / ASPECT, icy + byv) for bxv, byv in bolt],
-                closed=True, facecolor=GREEN, edgecolor=GREEN_DK, lw=0.5, zorder=5))
-        elif kind == 'clock':
-            disc(icx, icy, 0.016, facecolor='none', edgecolor=GREEN, lw=1.5, zorder=5)
-            ax.plot([icx, icx], [icy, icy + 0.010], color=GREEN, lw=1.5, zorder=5, solid_capstyle='round')
-            ax.plot([icx, icx + 0.009 / ASPECT], [icy, icy], color=GREEN, lw=1.5, zorder=5, solid_capstyle='round')
-        tx = col_x + 0.078
-        ax.text(tx, ms_y + ms_h - 0.030, label, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=5)
-        ax.text(tx, ms_y + ms_h / 2 - 0.002, value, color=WHITE, fontsize=15, fontweight='bold', va='center', ha='left', zorder=5)
-        ax.text(tx, ms_y + 0.026, sub, color=GRAY, fontsize=8, fontweight='bold', va='center', ha='left', zorder=5)
-
-    stat(ms_x,                  'target', "EXIT",     exit_val,   exit_sub)
-    stat(ms_x + ms_w / 3,       'bolt',   "LEVERAGE", f"{lev}X",  margin_mode)
-    stat(ms_x + 2 * ms_w / 3,   'clock',  "HELD FOR", held_str,   "DURATION")
-
-    # ---- 5-stat footer --------------------------------------------------
-    bs_x, bs_y, bs_w, bs_h = 0.046, 0.040, 0.908, 0.130
-    ax.add_patch(FancyBboxPatch((bs_x, bs_y), bs_w, bs_h,
-        boxstyle="round,pad=0,rounding_size=0.020",
-        linewidth=1.2, edgecolor=PANEL2_ED, facecolor=PANEL2, zorder=3))
-    foot = [
-        ("ENTRY PRICE", entry_price_str, WHITE, 12.5),
-        ("EXIT PRICE",  exit_price_str,  WHITE, 12.5),
-        ("PNL (USDT)",  dollar_str,      col,   12.5),
-        ("ROI",         roi_str,         col,   12.5),
-        ("TIME",        time_str,        WHITE, 9.5),
-    ]
-    col_lefts = [0.072, 0.262, 0.448, 0.620, 0.756]
-    for (lab, val, vcol, vfs), clx in zip(foot, col_lefts):
-        ax.text(clx, bs_y + bs_h - 0.040, lab, color=GRAY, fontsize=9.5, fontweight='bold', va='center', ha='left', zorder=4)
-        ax.text(clx, bs_y + 0.042, val, color=vcol, fontsize=vfs, fontweight='bold', va='center', ha='left', zorder=4)
-    for dvx in (0.246, 0.432, 0.604, 0.742):
-        ax.plot([dvx, dvx], [bs_y + 0.024, bs_y + bs_h - 0.024], color=PANEL2_ED, lw=0.8, zorder=4)
+    # ---- footer: Entry / Exit price ------------------------------------
+    fy = 0.180
+    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none')
+    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+# ──────────────────────────────────────────────
+# 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
+# ──────────────────────────────────────────────
+def _persp_coeffs(dst, src):
+    """Solve the 8 perspective coefficients mapping output->input for PIL."""
+    import numpy as np
+    A = []
+    for (dx, dy), (sx, sy) in zip(dst, src):
+        A.append([sx, sy, 1, 0, 0, 0, -dx * sx, -dx * sy])
+        A.append([0, 0, 0, sx, sy, 1, -dy * sx, -dy * sy])
+    A = np.array(A, dtype=float)
+    B = np.array(dst, dtype=float).reshape(8)
+    res = np.linalg.solve(A, B)
+    return res.tolist()
+
+
+def _dim_rgba(img, factor):
+    """Multiply RGB channels by factor, keep alpha (for the dimmed back card)."""
+    import numpy as np
+    from PIL import Image
+    arr = np.array(img).astype(float)
+    arr[..., :3] *= factor
+    return Image.fromarray(arr.clip(0, 255).astype('uint8'), 'RGBA')
+
+
+def _radial_glow(canvas, center, radius, color, strength=0.5):
+    """Alpha-composite a soft radial glow blob onto the canvas."""
+    import numpy as np
+    from PIL import Image
+    CW, CH = canvas.size
+    yy, xx = np.ogrid[:CH, :CW]
+    d = np.sqrt((xx - center[0]) ** 2 + (yy - center[1]) ** 2)
+    a = np.clip(1.0 - d / float(radius), 0, 1) ** 2
+    a = (a * strength * 255).astype('uint8')
+    glow = Image.new('RGBA', (CW, CH), color + (0,))
+    glow.putalpha(Image.fromarray(a))
+    return Image.alpha_composite(canvas, glow)
+
+
+def _paste_card(canvas, card, x, y, accent, shadow=0.5, glow=0.35):
+    """Paste a (warped) card sprite with an accent glow + drop shadow beneath it."""
+    from PIL import Image, ImageFilter
+    CW, CH = canvas.size
+    cw, ch = card.size
+    alpha = card.split()[3]
+    if glow > 0:
+        g = Image.new('RGBA', (CW, CH), (0, 0, 0, 0))
+        tint = Image.new('RGBA', (cw, ch), accent + (255,))
+        g.paste(tint, (x, y), alpha)
+        g = g.filter(ImageFilter.GaussianBlur(max(1, int(cw * 0.06))))
+        ga = g.split()[3].point(lambda a: int(a * glow))
+        g.putalpha(ga)
+        canvas.alpha_composite(g)
+    if shadow > 0:
+        s = Image.new('RGBA', (CW, CH), (0, 0, 0, 0))
+        blk = Image.new('RGBA', (cw, ch), (0, 0, 0, 255))
+        s.paste(blk, (x + int(cw * 0.02), y + int(ch * 0.05)), alpha)
+        s = s.filter(ImageFilter.GaussianBlur(max(1, int(cw * 0.045))))
+        sa = s.split()[3].point(lambda a: int(a * shadow))
+        s.putalpha(sa)
+        canvas.alpha_composite(s)
+    layer = Image.new('RGBA', (CW, CH), (0, 0, 0, 0))
+    layer.paste(card, (x, y), card)
+    canvas.alpha_composite(layer)
+
+
+def _warp_card(img, tilt=0.05, rot=-7.0, scale=1.0):
+    """Light perspective tilt (right edge recedes) + slight rotation."""
+    from PIL import Image
+    if scale != 1.0:
+        img = img.resize((max(1, int(img.size[0] * scale)),
+                          max(1, int(img.size[1] * scale))), Image.LANCZOS)
+    w, h = img.size
+    dy = tilt * h
+    dx = tilt * 0.6 * w
+    src = [(0, 0), (w, 0), (w, h), (0, h)]
+    dst = [(0, 0), (w - dx, dy), (w - dx, h - dy), (0, h)]
+    coeffs = _persp_coeffs(dst, src)
+    out = img.transform((w, h), Image.PERSPECTIVE, coeffs, Image.BICUBIC)
+    if rot:
+        out = out.rotate(rot, expand=True, resample=Image.BICUBIC)
+    return out
+
+
+def _lerp_rgb(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _add_card_patterns(sprite, accent):
+    """Bake subtle surface patterns onto the card face (clipped to its shape)."""
+    from PIL import Image, ImageDraw, ImageChops
+    fw, fh = sprite.size
+    base_a = sprite.split()[3]
+    ov = Image.new('RGBA', (fw, fh), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    # faint diagonal hatch (two directions) -> circuit/topographic feel
+    step = max(8, int(fw * 0.038))
+    for x in range(-fh, fw, step):
+        d.line([(x, 0), (x + fh, fh)], fill=accent + (9,), width=1)
+    for x in range(0, fw + fh, step * 2):
+        d.line([(x, 0), (x - fh, fh)], fill=(255, 255, 255, 5), width=1)
+    # dotted node mesh
+    dstep = max(10, int(fw * 0.042))
+    for yy in range(dstep // 2, fh, dstep):
+        for xx in range(dstep // 2, fw, dstep):
+            d.ellipse([xx - 1, yy - 1, xx + 1, yy + 1], fill=accent + (16,))
+    # soft top sheen band
+    sheen = Image.new('L', (fw, fh), 0)
+    sd = ImageDraw.Draw(sheen)
+    band = max(1, int(fh * 0.42))
+    for yy in range(band):
+        a = int(26 * (1 - yy / band))
+        sd.line([(0, yy), (fw, yy)], fill=a)
+    ov2 = Image.new('RGBA', (fw, fh), (255, 255, 255, 0))
+    ov2.putalpha(sheen)
+    ov = Image.alpha_composite(ov, ov2)
+    ov.putalpha(ImageChops.multiply(ov.split()[3], base_a))
+    return Image.alpha_composite(sprite, ov)
+
+
+def _build_card_slab(face, depth_frac=0.05, ux=0.5, uy=1.0):
+    """Extrude a warped face into a 3D slab with a shaded side wall (gives real depth)."""
+    from PIL import Image
+    fw, fh = face.size
+    D = max(6, int(depth_frac * fh))
+    ex = int(D * abs(ux)) + 4
+    ey = int(D * uy) + 4
+    slab = Image.new('RGBA', (fw + ex, fh + ey), (0, 0, 0, 0))
+    alpha = face.split()[3]
+    top_col = (34, 44, 55)
+    bot_col = (5, 8, 12)
+    for i in range(D, 0, -1):
+        t = i / D
+        col = _lerp_rgb(top_col, bot_col, t)
+        layer = Image.new('RGBA', (fw, fh), col + (0,))
+        layer.putalpha(alpha)
+        slab.alpha_composite(layer, (int(i * ux), int(i * uy)))
+    slab.alpha_composite(face, (0, 0))
+    return slab
+
+
+def compose_3d_card(flat_png, up=True):
+    """Turn a flat PnL card PNG into a realistic 3D render: extruded card
+    thickness (depth), baked surface patterns, a stacked deck card behind,
+    floor reflection, accent glow and drop shadow on a dark backdrop.
+    Returns PNG bytes.
+    """
+    import io as _io
+    from PIL import Image, ImageDraw, ImageFilter, ImageChops
+
+    ACCENT = (47, 214, 117) if up else (240, 85, 107)
+    BG = (5, 7, 10)
+
+    card = Image.open(_io.BytesIO(flat_png)).convert('RGBA')
+    W, H = card.size
+
+    # crop to the card face (FancyBboxPatch at 0.035,0.06 w0.93 h0.88)
+    left   = int(round(0.035 * W)); right  = int(round(0.965 * W))
+    top    = int(round(0.060 * H)); bottom = int(round(0.940 * H))
+    sprite = card.crop((left, top, right, bottom))
+    sw, sh = sprite.size
+
+    # rounded-corner alpha so the warp has clean transparent corners
+    rad = max(1, int(0.055 * sw))
+    mask = Image.new('L', (sw, sh), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, sw - 1, sh - 1], radius=rad, fill=255)
+    sprite.putalpha(mask)
+    sprite = _add_card_patterns(sprite, ACCENT)
+
+    front = _build_card_slab(_warp_card(sprite, tilt=0.07, rot=-7.0, scale=1.0))
+    back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.07, rot=-11.0, scale=0.93), 0.62))
+
+    fw, fh = front.size
+    CW = int(fw * 1.75); CH = int(fh * 1.62)
+    canvas = Image.new('RGBA', (CW, CH), BG + (255,))
+    canvas = _radial_glow(canvas, center=(int(CW * 0.66), int(CH * 0.40)),
+                          radius=int(CW * 0.44), color=ACCENT, strength=0.5)
+
+    fx = int(CW * 0.07); fy = int(CH * 0.19)
+    bx = fx + int(fw * 0.17); by = fy - int(fh * 0.14)
+
+    # floor reflection of the front card
+    refl = front.transpose(Image.FLIP_TOP_BOTTOM)
+    rfade = Image.new('L', refl.size, 0)
+    rd = ImageDraw.Draw(rfade)
+    rh = refl.size[1]
+    for yy in range(rh):
+        rd.line([(0, yy), (refl.size[0], yy)], fill=int(60 * (1 - yy / rh)))
+    refl.putalpha(ImageChops.multiply(refl.split()[3], rfade))
+    refl = refl.filter(ImageFilter.GaussianBlur(6))
+    rl = Image.new('RGBA', (CW, CH), (0, 0, 0, 0))
+    rl.paste(refl, (fx, fy + fh - int(fh * 0.06)), refl)
+    canvas.alpha_composite(rl)
+
+    _paste_card(canvas, back,  bx, by, ACCENT, shadow=0.30, glow=0.22)
+    _paste_card(canvas, front, fx, fy, ACCENT, shadow=0.55, glow=0.42)
+
+    out = _io.BytesIO()
+    canvas.convert('RGB').save(out, format='PNG')
+    return out.getvalue()
+
+
+async def prompt_pnl_display_mode(update, context):
+    """Pop up leverage + display-mode buttons after a signal is picked.
+
+    Lets the user adjust leverage and choose whether to show a profit $ amount
+    (which then asks for capital) or just the percentage. Picking either path
+    renders the vault card via send_pnl_image_card.
+    """
+    signal = context.user_data.get('pnl_signal')
+    tgt = update.effective_message
+    if not signal:
+        await tgt.reply_text("\u26a0\ufe0f Signal data lost. Run /pnl again.")
+        return
+    lev_data = signal.get('leverage')
+    sugg = lev_data['suggested'] if lev_data else 10
+    context.user_data.setdefault('pnl_leverage', sugg)
+    context.user_data['pnl_capital'] = None
+    cur_lev = int(context.user_data.get('pnl_leverage', sugg))
+
+    def _lvb(n):
+        mark = "✅ " if int(n) == cur_lev else ""
+        return InlineKeyboardButton(f"{mark}{n}x", callback_data=f"pnlimg_lev|{n}")
+
+    raw_sym = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
+    bias = signal.get('bias', '')
+    keyboard = InlineKeyboardMarkup([
+        [_lvb(5), _lvb(10), _lvb(20), _lvb(50),
+         InlineKeyboardButton("✏️", callback_data="pnlimg_lev|custom")],
+        [InlineKeyboardButton("💵 Show profit $", callback_data="pnlimg_mode|usdt"),
+         InlineKeyboardButton("📊 % only", callback_data="pnlimg_mode|pct")],
+    ])
+    await tgt.reply_text(
+        f"📈 PnL for {signal.get('exchange', '')} {raw_sym} — {bias}\n"
+        f"Suggested leverage: {sugg}x  (tap to change)\n\n"
+        f"Choose how to show your PnL:",
+        reply_markup=keyboard,
+    )
 
 
 async def send_pnl_image_card(update, context):
@@ -5800,7 +6034,14 @@ async def send_pnl_image_card(update, context):
 
     capital  = context.user_data.get('pnl_capital')
     lev_data = signal.get('leverage')
-    leverage = lev_data['suggested'] if lev_data else 10
+    sugg_lev = lev_data['suggested'] if lev_data else 10
+    leverage = context.user_data.get('pnl_leverage') or sugg_lev
+
+    try:
+        _u = update.effective_user
+        username = (_u.username or _u.first_name or "Trader") if _u else "Trader"
+    except Exception:
+        username = "Trader"
 
     current = _get_live_price(signal['symbol'], signal.get('exchange', ''))
     if not current or current <= 0:
@@ -5808,10 +6049,19 @@ async def send_pnl_image_card(update, context):
         return
 
     try:
-        closes = _fetch_sparkline_closes(signal.get('exchange', ''), signal['symbol'])
-        peak_raw, peak_at = _compute_peak_pct(signal, current)
-        png = render_pnl_card_image(signal, current, leverage, capital, closes,
-                                    peak_raw_pct=peak_raw, peak_at=peak_at)
+        closes = _fetch_pnl_chart_closes(signal, current)
+        fav_raw, fav_at, adv_raw, adv_at = _compute_peak_excursions(signal, current)
+        flat = render_pnl_card_image(signal, current, leverage, capital, closes,
+                                     peak_raw_pct=fav_raw, peak_at=fav_at,
+                                     peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                     username=username, out_scale=2.0)
+        _fav = fav_raw if fav_raw is not None else 0.0
+        up_flag = (_fav * (leverage or 1)) >= 0
+        try:
+            png = compose_3d_card(flat, up=up_flag)
+        except Exception as _e3d:
+            logger.warning("3D compose failed, using flat card: %s", _e3d)
+            png = flat
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
@@ -5821,10 +6071,19 @@ async def send_pnl_image_card(update, context):
     cap_note = f" • capital ${capital:,.0f}" if capital else ""
     caption  = f"📈 Live PnL • {signal.get('exchange', '')} {raw_sym} • {leverage}x{cap_note}"
 
+    _cur_lev = int(leverage)
+    def _lvb(n):
+        mark = "✅ " if int(n) == _cur_lev else ""
+        return InlineKeyboardButton(f"{mark}{n}x", callback_data=f"pnlimg_lev|{n}")
+    if capital:
+        amt_btn = InlineKeyboardButton("📊 % only", callback_data="pnlimg_mode|pct")
+    else:
+        amt_btn = InlineKeyboardButton("💵 Show profit $", callback_data="pnlimg_mode|usdt")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💵 Add capital", callback_data="pnlimg_cap"),
-         InlineKeyboardButton("🔄 Refresh",     callback_data="pnlimg_refresh")],
-        [InlineKeyboardButton("✅ Done",         callback_data="pnlimg_done")],
+        [_lvb(5), _lvb(10), _lvb(20), _lvb(50),
+         InlineKeyboardButton("✏️", callback_data="pnlimg_lev|custom")],
+        [amt_btn, InlineKeyboardButton("🔄 Refresh", callback_data="pnlimg_refresh")],
+        [InlineKeyboardButton("✅ Done", callback_data="pnlimg_done")],
     ])
     await msg.reply_photo(photo=io.BytesIO(png), caption=caption, reply_markup=keyboard)
 
@@ -5942,7 +6201,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['pnl_signal']  = sig
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None
-            await send_pnl_image_card(update, context)
+            await prompt_pnl_display_mode(update, context)
             return
 
         # Symbol → search current scan AND persisted history (incl. reversed calls).
@@ -5957,7 +6216,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['pnl_signal']  = gathered[0]
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None
-            await send_pnl_image_card(update, context)
+            await prompt_pnl_display_mode(update, context)
             return
 
         # Multiple scans for this symbol — let the user pick one.
@@ -6010,8 +6269,8 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             context.user_data['pnl_signal']  = state.last_scan_results[n - 1]
             context.user_data['pnl_capital'] = None
-            context.user_data['pnl_step']    = None   # image PnL-card flow takes over
-            await send_pnl_image_card(update, context)
+            context.user_data['pnl_step']    = None   # display-mode prompt takes over
+            await prompt_pnl_display_mode(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Reply with a number only.")
 
@@ -6025,7 +6284,7 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['pnl_signal']  = matches[n - 1]
             context.user_data['pnl_capital'] = None
             context.user_data['pnl_step']    = None
-            await send_pnl_image_card(update, context)
+            await prompt_pnl_display_mode(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Reply with a number only.")
 
@@ -6040,6 +6299,18 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_pnl_image_card(update, context)
         except ValueError:
             await update.message.reply_text("⚠️ Enter a valid number (e.g. 100 or 500).")
+
+    elif step == 'pnlimg_lev_custom':
+        try:
+            lv = int(text.replace('x', '').strip())
+            if lv < 1 or lv > 125:
+                await update.message.reply_text("⚠️ Leverage must be 1–125.")
+                return
+            context.user_data['pnl_leverage'] = lv
+            context.user_data['pnl_step']     = None
+            await send_pnl_image_card(update, context)
+        except ValueError:
+            await update.message.reply_text("⚠️ Enter a number like 10 or 25.")
 
     elif step == 'capital':
         try:
@@ -6120,12 +6391,46 @@ async def pnl_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─────────────────────────────────────────────
 # /best
-# ─────────────────────────────────────────────
+# ──────────────────────────────��──────────────
 async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Buttons under the image PnL card: add capital / refresh / done."""
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data.startswith('pnlimg_lev|'):
+        if not context.user_data.get('pnl_signal'):
+            await query.message.reply_text("\u26a0\ufe0f Signal data lost. Run /pnl again.")
+            return
+        val = data.split('|', 1)[1]
+        if val == 'custom':
+            context.user_data['pnl_step'] = 'pnlimg_lev_custom'
+            await query.message.reply_text("\u270f\ufe0f Enter leverage (1\u2013125): e.g. 10, 25, 75")
+            return
+        try:
+            context.user_data['pnl_leverage'] = max(1, min(125, int(val)))
+        except ValueError:
+            context.user_data['pnl_leverage'] = 10
+        await send_pnl_image_card(update, context)
+        return
+
+    if data.startswith('pnlimg_mode|'):
+        mode = data.split('|', 1)[1]
+        if not context.user_data.get('pnl_signal'):
+            await query.message.reply_text("\u26a0\ufe0f Signal data lost. Run /pnl again.")
+            return
+        if mode == 'usdt':
+            context.user_data['pnl_mode'] = 'usdt'
+            context.user_data['pnl_step'] = 'pnlimg_capital'
+            await query.message.reply_text(
+                "\U0001F4B5 Enter your capital in USDT (e.g. 100, 500, 1000):"
+            )
+        else:
+            context.user_data['pnl_mode']    = 'pct'
+            context.user_data['pnl_capital'] = None
+            context.user_data['pnl_step']    = None
+            await send_pnl_image_card(update, context)
+        return
 
     if data == 'pnlimg_cap':
         if not context.user_data.get('pnl_signal'):
@@ -6349,7 +6654,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "• *Coin Alert* — get notified when a specific coin hits a signal\n"
             "• *Watchlist* — monitor your favourite pairs automatically\n"
             "• *Auto-Scan* — bot runs a fresh scan every 4 hours for you\n"
-            "• *Broadcast* — auto-post signals to your group or channel\n"
+            "• *Broadcast* ��� auto-post signals to your group or channel\n"
             "• *Pick & Track* — set up live PnL reminders for a trade\n"
             "• *PnL Calculator* — calculate profit/loss with leverage",
             parse_mode="Markdown",
@@ -8889,7 +9194,7 @@ async def leaderboard_time_callback(update: Update, context: ContextTypes.DEFAUL
 
 # ═══════════════════════════════════════════════════════════════
 # 🐌  S N A I L   M O D E  — HIDDEN PREMIUM FEATURE
-# ═══════════════���═══════════════════════════════════════════════
+# ═══════════════���═════════════════════════════���═══���═════════════
 # Access gate: user must first type the secret passphrase
 #   /scan1234JP$$
 # That unlocks the /snail command for that chat permanently.
@@ -9481,7 +9786,7 @@ async def _send_snail_final_report(bot, chat_id):
         f"🎯 WIN RATE",
         f"   {bar} {win_rt:.0f}%",
         f"",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━���━━━━━",
     ]
     if wins >= 5:
         lines.append("🏆 LEGENDARY SNAIL WEEK. Maximum execution.")
@@ -9586,7 +9891,7 @@ async def snailvault_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    lines = ["🐌 SNAIL VAULT — Signal Log\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    lines = ["🐌 SNAIL VAULT — Signal Log\n━━━━━━━━━━━━━━━━━━━━━━━━━��━━━━\n"]
     outcome_map = {'win_2x': '🎯 WIN 2x', 'stopped': '🛑 Stopped', 'pending': '⏳ Open'}
     for r in rows:
         e       = "🟢" if r['bias'] == 'LONG' else "🔴"
@@ -9691,7 +9996,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 4. /chart — generate TA chart image
 # 5. /lb alias for /leaderboard
 # 6. Admin user-count tracking (/admin)
-# ═══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════���════
 
 # ─── TIMEFRAME HELPERS ────────────────────────────────────────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
@@ -9886,7 +10191,7 @@ def _cscan_pair_tf(symbol: str, tf: str):
     return results, failures
 
 
-# ─── PATCHED scan_command (timeframe support) ─────────────────
+# ��── PATCHED scan_command (timeframe support) ─────────────────
 async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Unified /scan dispatcher.  Handles all variants:
@@ -10310,7 +10615,7 @@ async def scan_new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /scan new [window]
     Examples:
-      /scan new 24h   — pairs listed in last 24 hours
+      /scan new 24h   ��� pairs listed in last 24 hours
       /scan new 30m   — last 30 minutes
       /scan new 7d    — last 7 days
       /scan new 2w    — last 2 weeks
@@ -10629,7 +10934,7 @@ def _check_trend_dying(r: dict, df4h, df1d) -> tuple[bool, str]:
 # TF mapping for non-standard timeframes:
 #   ≤7 min  → 15m   |   8–22 min  → 15m   |   23–90 min → 1h
 #   91–360 min → 4h  |   >360 min → 1d
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────���
 
 # Extended TF alias map that includes non-standard intervals (maps to nearest
 # supported TF).  Values are TF_CONFIGS keys: '15m' | '1h' | '4h' | '1d'.
@@ -11012,7 +11317,7 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tf_label = TF_CONFIGS[tf_key]['label']
 
-    # ── HOT-GROUND WARNING — sent before the analysis ────────────────────────
+    # ── HOT-GROUND WARNING — sent before the analysis ─────��──────────────────
     warning_msg = (
         "⚠️⚠️ HOT GROUND — READ BEFORE PROCEEDING ⚠️⚠️\n\n"
         "You are using /analyse — the unfiltered analysis mode.\n\n"
@@ -11778,7 +12083,7 @@ def _track(update: Update):
         logger.error("_track failed: %s", e)
 
 
-# ── Top-level activity middleware (registered in main with group=-1) ──
+# ���─ Top-level activity middleware (registered in main with group=-1) ──
 async def _activity_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Fires on EVERY Telegram update before any handler.
@@ -11992,7 +12297,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"🟢 CURRENTLY ACTIVE ({len(active_now)})\n"
             f"{active_block}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🆕 NEW TODAY ({len(new_today)})\n"
+            f"�� NEW TODAY ({len(new_today)})\n"
             f"{new_block}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏆 TOP USERS BY ACTIVITY\n"
@@ -12964,7 +13269,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         f"🛠 CALIBRATION RECOMMENDATIONS\n"
         f"{rec_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━��━━━━━━━\n"
         f"💡 /calibrate ETH — test on ETHUSDT\n"
         f"💡 /calibrate SOL BINANCE — test specific exchange\n"
         f"💡 /backtest — check live signal outcomes from DB"
@@ -13021,7 +13326,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     analytics = (
         "\n📊  A N A L Y T I C S\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��\n"
         "/compare               All signals vs current prices\n"
         "/compare BTC           One pair — signal vs current price\n"
         "/stats 168             Win rate stats  (24 / 168 / 720 hrs)\n"
@@ -13224,7 +13529,7 @@ async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──���──────────────────────────────────────────
 # /check PAIR DIR ENTRY SL — Validate open trade
 # Example: /check BTCUSDT LONG 98000 95000
-# ─────────────────────────────────────────────
+# ──────────────────────────���──────────────────
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /check PAIR DIR ENTRY SL
@@ -13467,7 +13772,7 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────���─────────
 # /optimize — Hyperopt parameter search (admin)
 # ─────────────────────────────────────────────
 async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13830,7 +14135,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────���─────────
 # AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
 # ─────────────────────────────────────────────��────────────────────────────────────
 # Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
@@ -14095,6 +14400,23 @@ def main():
     # IMPROVEMENT #2 — init DB and restore state from last run
     db_init()
     db_init_user_tracking()
+
+    # PERSIST DIAGNOSTIC — make ephemeral-DB misconfig impossible to miss in logs.
+    # If neither Turso nor a custom SAKZ_DB_PATH (volume) is set, the DB is a local
+    # file that Railway WIPES on every redeploy — every per-user setting resets.
+    if _USE_TURSO:
+        logger.info("✅ PERSISTENCE: Turso cloud DB in use — all per-user data survives redeploys.")
+    elif os.environ.get("SAKZ_DB_PATH"):
+        logger.info("✅ PERSISTENCE: custom DB path %s — ensure this is on a Railway Volume.", os.path.abspath(DB_PATH))
+    else:
+        logger.warning(
+            "⚠️ PERSISTENCE WARNING: using local file %s with NO Turso and NO volume path. "
+            "Railway WIPES this on every redeploy — autoscan, watch, pro, snail, safemode, alerts "
+            "AND the admin user list will all reset. FIX: set TURSO_URL + TURSO_TOKEN, or attach a "
+            "Railway Volume and set SAKZ_DB_PATH to a file on it (e.g. /data/sakz_data.db).",
+            os.path.abspath(DB_PATH),
+        )
+
     _load_best_params()   # load calibrated params from best_params.json if present
 
     # AUTO PAPER TRADING — initialise paper DB tables if module is available
@@ -14123,6 +14445,12 @@ def main():
 
     state.safemode_users = db_safemode_load()
     logger.info("Restored %d safemode users from DB", len(state.safemode_users))
+
+    # PERSIST — restore /autoscan subscriptions so users keep their subs across
+    # GitHub redeploys / Railway restarts (mutate in place to preserve the ref).
+    auto_scan_subscribers.clear()
+    auto_scan_subscribers.update(db_autoscan_load())
+    logger.info("Restored %d autoscan subscribers from DB", len(auto_scan_subscribers))
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 

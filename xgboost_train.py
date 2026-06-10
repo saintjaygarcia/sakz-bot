@@ -241,11 +241,33 @@ def train(db_path: str = "sakz_data.db") -> dict:
     cv = StratifiedKFold(n_splits=min(5, n_wins, n_losses), shuffle=True, random_state=42)
     cv_scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
 
+    # Fit the base model (used for feature importances + as the calibration base)
     model.fit(X, y)
 
-    # Feature importance
+    # Feature importance (from the uncalibrated base model)
     importances = dict(zip(FEATURE_NAMES, model.feature_importances_))
     top_features = dict(sorted(importances.items(), key=lambda x: -x[1])[:8])
+
+    # ── PROBABILITY CALIBRATION ────────────────────────────────────
+    # Raw tree predict_proba is usually miscalibrated, so a shown "78% win" was
+    # not really 78%. Wrap the model in CalibratedClassifierCV so the win-% users
+    # see is statistically honest. Isotonic needs more data; fall back to Platt
+    # (sigmoid) on smaller samples.
+    final_model = model
+    cal_method  = None
+    try:
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.base import clone
+        cal_cv = min(3, n_wins, n_losses)
+        if cal_cv >= 2:
+            cal_method = "isotonic" if len(X) >= 200 else "sigmoid"
+            calibrated = CalibratedClassifierCV(clone(model), method=cal_method, cv=cal_cv)
+            calibrated.fit(X, y)
+            final_model = calibrated
+            logger.info("XGBoost probabilities calibrated via %s (cv=%d)", cal_method, cal_cv)
+    except Exception as _cal_e:
+        logger.warning("XGBoost calibration skipped (%s) — using raw probabilities", _cal_e)
+        cal_method = None
 
     meta = {
         "n_samples":        len(X),
@@ -255,14 +277,16 @@ def train(db_path: str = "sakz_data.db") -> dict:
         "cv_roc_auc_mean":  float(cv_scores.mean()),
         "cv_roc_auc_std":   float(cv_scores.std()),
         "top_features":     top_features,
+        "calibrated":       cal_method is not None,
+        "calibration":      cal_method or "none",
     }
 
     with open(MODEL_PATH, "wb") as f:
-        pickle.dump({"model": model, "meta": meta}, f)
+        pickle.dump({"model": final_model, "meta": meta}, f)
 
     # Reload into cache
     global _model, _meta
-    _model = model
+    _model = final_model
     _meta  = meta
 
     logger.info(

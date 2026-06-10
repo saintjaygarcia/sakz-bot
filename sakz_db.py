@@ -303,6 +303,14 @@ def db_init():
             enabled_at TEXT NOT NULL
         );
 
+        -- PERSIST: /autoscan subscriptions survive redeploys / Railway restarts.
+        -- tf_pref '' means "always / all timeframes" (maps to None in memory).
+        CREATE TABLE IF NOT EXISTS autoscan_subs (
+            chat_id    INTEGER PRIMARY KEY,
+            tf_pref    TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+
         -- /pro feature: users subscribed to the PRO alert suite
         CREATE TABLE IF NOT EXISTS pro_subscribers (
             chat_id     INTEGER PRIMARY KEY,
@@ -1009,6 +1017,28 @@ def db_safemode_enable(chat_id: int):
 def db_safemode_disable(chat_id: int):
     conn = db_connect()
     conn.execute("DELETE FROM safemode_users WHERE chat_id=?", (chat_id,))
+    conn.commit(); conn.close()
+
+def db_autoscan_load() -> dict:
+    """Load all /autoscan subscriptions {chat_id: tf_pref} on startup.
+    Empty-string tf_pref (meaning 'always / all timeframes') is mapped back to None."""
+    conn = db_connect()
+    rows = conn.execute("SELECT chat_id, tf_pref FROM autoscan_subs").fetchall()
+    conn.close()
+    return {r['chat_id']: (r['tf_pref'] or None) for r in rows}
+
+def db_autoscan_set(chat_id: int, tf_pref):
+    """Persist (or update) a user's autoscan subscription. tf_pref None == all timeframes."""
+    conn = db_connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO autoscan_subs (chat_id, tf_pref, updated_at) VALUES (?,?,?)",
+        (chat_id, tf_pref or '', datetime.now().isoformat())
+    )
+    conn.commit(); conn.close()
+
+def db_autoscan_remove(chat_id: int):
+    conn = db_connect()
+    conn.execute("DELETE FROM autoscan_subs WHERE chat_id=?", (chat_id,))
     conn.commit(); conn.close()
 
 def db_snail_unlock(chat_id):

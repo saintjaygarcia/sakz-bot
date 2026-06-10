@@ -55,6 +55,15 @@ except ImportError:
 # ---- engine constants ----
 _MIN_SIGNAL_RR = max(0.1, float(os.getenv("MIN_SIGNAL_RR", "1.5")))
 
+# ---- ML influence thresholds (win-probability → signal shaping) ----
+# Tunable via env. Untrained models return 0.5, so these defaults keep ML inert
+# until it has learned from real outcomes. STRONG/WEAK drive the ±1 confidence
+# nudge; HIDE_BELOW removes only the very-weakest signals from curated /scan &
+# /autoscan (NEVER from user-requested /analyse, /cscan, /chart).
+_ML_STRONG_EDGE = float(os.getenv("ML_STRONG_EDGE", "0.68"))
+_ML_WEAK_EDGE   = float(os.getenv("ML_WEAK_EDGE",   "0.40"))
+_ML_HIDE_BELOW  = float(os.getenv("ML_HIDE_BELOW",  "0.35"))
+
 # ---- signal SURFACING thresholds (display only — NOT the paper execution floor) ----
 SCAN_DISPLAY_CONF_MIN = max(0.0, float(os.getenv("SCAN_DISPLAY_CONF_MIN", "7")))
 # Autoscan pushes are unsolicited; allow a stricter floor (defaults to same).
@@ -1705,11 +1714,39 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             except Exception as _ml_e:
                 logger.debug("RF predict failed for %s: %s", symbol, _ml_e)
 
+        # ── ML INFLUENCE — let win-probability actually shape the signal ──────
+        # (1) NUDGE the headline confidence ±1 (applies to everyone, so /analyse
+        #     confidence reflects the full analysis incl. ML).
+        # (2) HIDE only the very-weakest signals from /scan & /autoscan (curated
+        #     "best pairs"). User-requested pairs (/analyse, /cscan, /chart) are
+        #     NEVER hidden. Untrained models return 0.5, so nothing changes until
+        #     the models have learned from real outcomes.
+        _edge = result.get('consensus_score')
+        if _edge is None:
+            _edge = result.get('ml_score')
+        if _edge is None:
+            _edge = result.get('rf_score')
+        if _edge is not None:
+            if   _edge >= _ML_STRONG_EDGE: _ml_nudge = +1
+            elif _edge <= _ML_WEAK_EDGE:   _ml_nudge = -1
+            else:                          _ml_nudge = 0
+            if _ml_nudge:
+                _old_c     = confidence
+                confidence = max(1, min(10, confidence + _ml_nudge))
+                result['ml_conf_adjust'] = confidence - _old_c
+                if confidence != _old_c:
+                    logger.debug("ML NUDGE: %s conf %d→%d (edge=%.2f)",
+                                 symbol, _old_c, confidence, _edge)
+            if (not user_requested) and _edge < _ML_HIDE_BELOW:
+                logger.debug("ML HIDE: %s dropped from scan (edge=%.2f < %.2f)",
+                             symbol, _edge, _ML_HIDE_BELOW)
+                return None
+
         # Attach warning tags so display layer can rate the risk
         result['regime_warning']   = regime_warning    # set above if regime floor missed
         result['low_conf_warning'] = low_conf_warning  # set above if conf < 4
         result['btc_regime']       = btc_regime
-        result['confidence']       = confidence        # may have been downgraded above
+        result['confidence']       = confidence        # may have been ML-nudged / downgraded
 
         return result
     except Exception as e:

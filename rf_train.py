@@ -165,6 +165,25 @@ def train(db_path: str = "sakz_data.db") -> dict:
     importances  = dict(zip(FEATURE_NAMES, model.feature_importances_))
     top_features = dict(sorted(importances.items(), key=lambda x: -x[1])[:8])
 
+    # ── PROBABILITY CALIBRATION ────────────────────────────────────
+    # Honest win-% — wrap RF in CalibratedClassifierCV (isotonic with enough
+    # data, else Platt/sigmoid). Falls back to raw probabilities on failure.
+    final_model = model
+    cal_method  = None
+    try:
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.base import clone
+        cal_cv = min(3, n_wins, n_losses)
+        if cal_cv >= 2:
+            cal_method = "isotonic" if len(X) >= 200 else "sigmoid"
+            calibrated = CalibratedClassifierCV(clone(model), method=cal_method, cv=cal_cv)
+            calibrated.fit(X, y)
+            final_model = calibrated
+            logger.info("RF probabilities calibrated via %s (cv=%d)", cal_method, cal_cv)
+    except Exception as _cal_e:
+        logger.warning("RF calibration skipped (%s) — using raw probabilities", _cal_e)
+        cal_method = None
+
     meta = {
         "n_samples":       len(X),
         "n_wins":          n_wins,
@@ -173,13 +192,15 @@ def train(db_path: str = "sakz_data.db") -> dict:
         "cv_roc_auc_mean": float(cv_scores.mean()),
         "cv_roc_auc_std":  float(cv_scores.std()),
         "top_features":    top_features,
+        "calibrated":      cal_method is not None,
+        "calibration":     cal_method or "none",
     }
 
     with open(MODEL_PATH, "wb") as f:
-        pickle.dump({"model": model, "meta": meta}, f)
+        pickle.dump({"model": final_model, "meta": meta}, f)
 
     global _model, _meta
-    _model = model
+    _model = final_model
     _meta  = meta
 
     logger.info(
