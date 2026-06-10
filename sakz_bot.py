@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�����������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────������������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -2492,7 +2492,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 3-thread executor allows concurrent scans
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
-# ─────────────────────────────────────────���───
+# ────────────────────────────────────���────���───
 # ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
@@ -3996,7 +3996,7 @@ async def stats_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Users register interest in a specific symbol.
 # When that symbol appears in a scan above their
 # min confidence threshold, they're notified.
-# ─────────────────────────────────────────────
+# ──────────────��──────────────────────────────
 async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -4223,6 +4223,24 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         _autoscan_mark_sent(dedup_key)
+
+        # Persist any pair autoscan surfaces so a PnL can be pulled for it later
+        # — but only the INITIAL call. Re-detections (reminders) are NOT re-saved,
+        # so they can't pile up or override the original entry used for PnL.
+        try:
+            _base = sym[:-4] if sym.endswith('USDT') else sym
+            _seen_setup = any(
+                (s.get('symbol') == sym and str(s.get('bias')) == str(bias)
+                 and str(s.get('exchange')) == str(exch))
+                for s in db_find_signals_by_symbol(_base)
+            )
+            if not _seen_setup:
+                db_save_scan([r])
+                db_register_outcome(r)
+                logger.info("Autoscan: recorded initial call %s %s %s for PnL history",
+                            exch, sym, bias)
+        except Exception as _pe:
+            logger.warning("Autoscan persist failed for %s %s: %s", exch, sym, _pe)
 
         # FIX #RESTART-FLOOD — within the post-restart grace window, the
         # mark-sent above seeds the (wiped) dedup table, but we skip the actual
@@ -5052,7 +5070,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # CONVERSATION: PICK → REMINDER → INTERVAL
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────���─────
 async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     if not state.last_scan_results:
@@ -5636,6 +5654,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     INK      = "#0A0D11"
     BTC_ORANGE = "#F7931A"
     MEXC_BLUE  = "#1D6CFF"
+    BYBIT_GOLD = "#F7A600"
 
     ASPECT = 10.24 / 6.83
 
@@ -5678,7 +5697,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
     raw_sym  = str(signal.get('symbol', '')).upper().replace('/', '').replace('_', '')
     base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
-    exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
+    exch     = (str(signal.get('exchange', '')).upper() or 'BYBIT')
 
     # exit price: peak price if it ran into profit past entry, else current price
     if fav_raw and fav_raw > 0 and entry > 0:
@@ -5778,9 +5797,14 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
             boxstyle="round,pad=0,rounding_size=0.020",
             linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
         tx = x + pad
-        if icon in ('coin', 'mexc'):
+        if icon in ('coin', 'mexc', 'bybit'):
             disc(x + pad + 0.013, y + h / 2, 0.014, facecolor=icon_col, edgecolor='none', zorder=5)
-            glyph = base_sym[:1] if icon == 'coin' else 'M'
+            if icon == 'coin':
+                glyph = base_sym[:1]
+            elif icon == 'bybit':
+                glyph = 'B'
+            else:
+                glyph = 'M'
             ax.text(x + pad + 0.013, y + h / 2, glyph, color=WHITE if icon == 'mexc' else INK,
                     fontsize=8.5, fontweight='bold', va='center', ha='center', zorder=6)
             tx = x + pad + 0.032
@@ -5793,7 +5817,12 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=bias_color)
     nx = chip(nx, cy, base_sym, icon='coin', icon_col=BTC_ORANGE)
     nx = chip(nx, cy, f"{lev}x")
-    nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
+    if exch == 'BYBIT':
+        nx = chip(nx, cy, exch, icon='bybit', icon_col=BYBIT_GOLD)
+    elif exch == 'MEXC':
+        nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
+    else:
+        nx = chip(nx, cy, exch)
 
     # ---- My Vault PnL ---------------------------------------------------
     ax.text(0.080, 0.508, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
@@ -5810,7 +5839,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Entry / Exit / Current price + Time to Peak -----------
+    # ---- footer: Entry / Exit / Current price + Duration ---------------
     # Time it took to run from the signal (entry) to the peak (exit) price.
     def _fmt_dur(a, b):
         try:
@@ -5851,7 +5880,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
             va='center', ha='left', zorder=5)
     ax.text(0.520, fy - 0.014, _fmt_price(cur), color=WHITE, fontsize=14, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.740, fy + 0.030, "Time to Peak", color=GRAY, fontsize=10.5, fontweight='bold',
+    ax.text(0.740, fy + 0.030, "Duration", color=GRAY, fontsize=10.5, fontweight='bold',
             va='center', ha='left', zorder=5)
     ax.text(0.740, fy - 0.014, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
             va='center', ha='left', zorder=5)
@@ -6032,8 +6061,8 @@ def compose_3d_card(flat_png, up=True):
     sprite.putalpha(mask)
     sprite = _add_card_patterns(sprite, ACCENT)
 
-    front = _build_card_slab(_warp_card(sprite, tilt=0.07, rot=-7.0, scale=1.0))
-    back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.07, rot=-11.0, scale=0.93), 0.62))
+    front = _build_card_slab(_warp_card(sprite, tilt=0.04, rot=-2.5, scale=1.0))
+    back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.04, rot=-5.0, scale=0.93), 0.62))
 
     fw, fh = front.size
     bw, bh = back.size
@@ -6257,7 +6286,29 @@ def _gather_pnl_matches(arg, results):
     except Exception as e:
         logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    return matches
+    # Collapse re-detections to the INITIAL call per (exchange, symbol, direction).
+    # A live pair gets re-scanned repeatedly (manual scans + autoscan reminders),
+    # and each detection is persisted — but a PnL is only meaningful from the
+    # FIRST (initial) call's entry. For each exchange+symbol+bias we keep the
+    # earliest scan, so subsequent reminders never appear as separate picks.
+    def _st(sig):
+        st = sig.get('scan_time')
+        if isinstance(st, str):
+            try:
+                st = datetime.fromisoformat(st)
+            except Exception:
+                return datetime.max
+        if isinstance(st, datetime):
+            return st.replace(tzinfo=None)
+        return datetime.max
+
+    initial = {}
+    for r in matches:
+        gk = (str(r.get('exchange')), _norm(r.get('symbol')), str(r.get('bias')))
+        if gk not in initial or _st(r) < _st(initial[gk]):
+            initial[gk] = r
+    collapsed = sorted(initial.values(), key=_st, reverse=True)
+    return collapsed
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6847,7 +6898,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-# ─────────────────────────────────────────────
+# ───────────────────��─────────────────────────
 # MENU RUN CALLBACK — execute commands from menu buttons
 # ─────────────────────────────────────────────
 async def menu_run_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9396,7 +9447,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             elif rsi4 < 35:
                 score -= 5; warnings.append(f"⚠️ RSI 4H oversold ({rsi4:.1f}) — limited downside room")
             if 40 <= rsi_d <= 60:
-                score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) — sustainable")
+                score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) ��� sustainable")
 
         # ── 4. VOLUME CONVICTION ─��──────────────────────���────
         vol_ratio       = vol / vol_ma if vol_ma > 0 else 1.0
@@ -12612,7 +12663,7 @@ def render_fgi_card(data):
     # ── title ─────────────────────────────────────────────────────────────
     ax.text(0.05, 0.690, "FEAR & GREED", color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=3)
 
-    # ── score badge ───────────────────────────────────────────────────────
+    # ── score badge ──────────────────────────────────────────────���────────
     # Badge is wide enough to hold score + classif + trend without overlapping bars
     bx, by, bw, bh = 0.05, 0.385, 0.455, 0.195
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
