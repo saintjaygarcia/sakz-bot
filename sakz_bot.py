@@ -40,18 +40,6 @@ from matplotlib.lines import Line2D
 import sakz_memory
 
 # ─────────────────────────────────────────────
-# EXECUTION LAYER (Phase 1) — encrypted Bybit key vault
-# ─────────────────────────────────────────────
-try:
-    import sakz_execution
-    _EXEC_AVAILABLE = True
-    print(f"[sakz_bot] Execution layer loaded (testnet={sakz_execution.BYBIT_TESTNET}, vault_ready={sakz_execution.vault_ready()})")
-except Exception as _exec_err:
-    print(f"[sakz_bot] WARNING: sakz_execution unavailable — execution layer disabled ({_exec_err})")
-    sakz_execution = None
-    _EXEC_AVAILABLE = False
-
-# ─────────────────────────────────────────────
 # CONVICTION LAYER — CVD / OI / VWAP
 # sakz_conviction.py must live in the same directory as sakz_bot.py
 # ─────────────────────────────────────────────
@@ -207,10 +195,6 @@ from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_admin_set_auth,
     db_admin_revoke,
     db_admin_get_stats,
-    db_save_user_keys,
-    db_get_user_keys,
-    db_delete_user_keys,
-    db_user_has_keys,
     DB_PATH, ACTIVE_WINDOW_MIN, TURSO_URL, TURSO_TOKEN, _USE_TURSO,
 )
 # === Extracted exchange layer (sakz_exchanges.py) ===
@@ -291,9 +275,6 @@ REASON_LOW_VOLUME     = "LOW_VOLUME"       # 24h volume below minimum threshold
 PICK_TRADE   = 1
 ASK_REMINDER = 2
 ASK_INTERVAL = 3
-# Phase 1 execution layer — /connect key-vault conversation states
-CONNECT_KEY    = 10
-CONNECT_SECRET = 11
 
 # FIX H3 — bound the per-chat caches so they can't grow without limit (OOM guard).
 class _BoundedDict(dict):
@@ -427,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�������������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�����������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -795,7 +776,7 @@ def _pro_format_uptrend_card(uptrend: dict, rank: int = 1) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {exch} | {sym}\n"
         f"\n"
-        f"��� BIAS: LONG (trend confirmed)\n"
+        f"🟢 BIAS: LONG (trend confirmed)\n"
         f"⭐ AVG DAILY GAIN: {bar} +{avg:.1f}%/day\n"
         f"\n"
         f"⏱ STREAK DURATION: {lbl}\n"
@@ -1136,7 +1117,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ──────────────────────────────────────────���─������─���────────────
+# ── /pro Command handler ────────────────────────────────────────────────────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1449,7 +1430,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ────────────────────────────────���───���──������──���─
+# ─────────────────────────────────────────────
 try:
     from sakz_ws import (
         start_ws,
@@ -1702,7 +1683,7 @@ _MIN_SIGNAL_RR = max(0.1, float(os.getenv("MIN_SIGNAL_RR", "1.5")))
 #   bybit_con    — Bybit API interval string for confirmation
 #   mexc_pri     — MEXC interval string for primary
 #   mexc_con     — MEXC interval string for confirmation
-#   binance_pri  ��� Binance interval string for primary
+#   binance_pri  — Binance interval string for primary
 #   binance_con  — Binance interval string for confirmation
 #   min_candles  — minimum closed candles required on the primary TF
 #   label        ��� human-readable label shown in signals
@@ -2213,7 +2194,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • EMA20 / EMA50 overlaid on candles
 #   • Bollinger Bands (shaded)
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
-#   ��� Volume bars    (panel 2, coloured by candle direction)
+#   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
 # ──���─���────────────────────────────────────────
 def generate_chart(signal, df4h):
@@ -2382,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ─────────�����───────���────���─������─���─���──────────────
+# ─────────────────────────������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2511,8 +2492,8 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 3-thread executor allows concurrent scans
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
-# ───────────────────────────────────������────���───
-# ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
+# ─────────────────────────────────────────────
+# ═══════════════════════��══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -2696,28 +2677,26 @@ def run_full_scan():
         cutoff = datetime.now() - timedelta(hours=24)
         state.price_history[key] = [p for p in state.price_history[key] if p['time'] > cutoff]
 
-    # ── SINGLE-VENUE SCAN — Bybit primary, MEXC fallback (user directive) ───
-    # Display rule: surface Bybit's scans only. If Bybit's API is unreachable
-    # this session, fall back to MEXC. Binance is no longer surfaced in scans,
-    # so every scan card shows exactly one venue — clean, no duplicates.
-    if sakz_exchanges.BYBIT_AVAILABLE:
-        active_venue, active_analyze = 'BYBIT', analyze_bybit
-        active_syms = bybit_get_top_symbols(50)
-        if not active_syms:   # reachable but returned nothing → fall back to MEXC
-            logger.warning("Bybit returned no symbols — falling back to MEXC this scan")
-            active_venue, active_analyze = 'MEXC', analyze_mexc
-            active_syms = mexc_get_top_symbols(50)
-    else:
-        active_venue, active_analyze = 'MEXC', analyze_mexc
-        active_syms = mexc_get_top_symbols(50)
+    bybit_syms   = bybit_get_top_symbols(50)
+    mexc_syms    = mexc_get_top_symbols(50)
+    binance_syms = binance_get_top_symbols(50) if sakz_exchanges.BINANCE_AVAILABLE else []
 
-    logger.info("Scan venue: %s (%d symbols)", active_venue, len(active_syms))
+    # Warm volume cache with a single ticker request per exchange
+    _warm_vol_cache(set(bybit_syms),   'BYBIT')
+    _warm_vol_cache(set(mexc_syms),    'MEXC')
+    if binance_syms:
+        _warm_vol_cache(set(binance_syms), 'BINANCE')
 
-    # Warm volume cache with a single ticker request for the active venue
-    _warm_vol_cache(set(active_syms), active_venue)
+    for sym in bybit_syms:
+        _process(analyze_bybit(sym), 'BYBIT')
+        time.sleep(0.2)
 
-    for sym in active_syms:
-        _process(active_analyze(sym), active_venue)
+    for sym in mexc_syms:
+        _process(analyze_mexc(sym), 'MEXC')
+        time.sleep(0.2)
+
+    for sym in binance_syms:
+        _process(analyze_binance(sym), 'BINANCE')
         time.sleep(0.2)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
@@ -2725,26 +2704,6 @@ def run_full_scan():
         key=lambda x: (x["confidence"], (x.get("consensus_score") or 0.5), x["score"], _vol_rank.get(x.get("vol_regime", "MEDIUM"), 2)),
         reverse=True
     )
-
-    # ── DEDUP — one signal per symbol ───────────────────────────────────────
-    # The multi-exchange scan (Bybit + MEXC + Binance) emits a near-identical
-    # signal for the same symbol on every venue it trades on — only the price
-    # differs slightly (cross-exchange divergence). Showing XRPUSDT 3x is just
-    # noise, so collapse to the single best entry per symbol. `results` is
-    # already sorted best-first, so the first time we see a symbol is the one
-    # to keep; ties favour BYBIT since the Bybit loop appends first.
-    _seen_syms = set()
-    _deduped   = []
-    for _r in results:
-        _sym = _r.get("symbol")
-        if _sym in _seen_syms:
-            continue
-        _seen_syms.add(_sym)
-        _deduped.append(_r)
-    if len(_deduped) != len(results):
-        logger.info("Dedup: collapsed %d multi-exchange duplicate(s) -> %d unique symbols",
-                    len(results) - len(_deduped), len(_deduped))
-    results = _deduped
 
     # ── FIX #DD — Portfolio-level correlation gate ──────────────────────────
     # Problem: every signal in the list is treated as independent.  In reality,
@@ -3343,7 +3302,7 @@ async def check_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Outcome check error for %s: %s", row['symbol'], e)
 
 
-# ──────────────────────────────────────────���──
+# ─────────────────────────────────────────────
 # /stats — Dynamic win rate stats
 # Supports minute-level windows for short-term live evaluation.
 #
@@ -4015,7 +3974,7 @@ async def stats_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Users register interest in a specific symbol.
 # When that symbol appears in a scan above their
 # min confidence threshold, they're notified.
-# ──────────────��──────────────────────────────
+# ─────────────────────────────────────────────
 async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -4242,24 +4201,6 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         _autoscan_mark_sent(dedup_key)
-
-        # Persist any pair autoscan surfaces so a PnL can be pulled for it later
-        # — but only the INITIAL call. Re-detections (reminders) are NOT re-saved,
-        # so they can't pile up or override the original entry used for PnL.
-        try:
-            _base = sym[:-4] if sym.endswith('USDT') else sym
-            _seen_setup = any(
-                (s.get('symbol') == sym and str(s.get('bias')) == str(bias)
-                 and str(s.get('exchange')) == str(exch))
-                for s in db_find_signals_by_symbol(_base)
-            )
-            if not _seen_setup:
-                db_save_scan([r])
-                db_register_outcome(r)
-                logger.info("Autoscan: recorded initial call %s %s %s for PnL history",
-                            exch, sym, bias)
-        except Exception as _pe:
-            logger.warning("Autoscan persist failed for %s %s: %s", exch, sym, _pe)
 
         # FIX #RESTART-FLOOD — within the post-restart grace window, the
         # mark-sent above seeds the (wiped) dedup table, but we skip the actual
@@ -5089,7 +5030,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # CONVERSATION: PICK → REMINDER → INTERVAL
-# ───────────────────────────────────────���─────
+# ─────────────────────────────────────────────
 async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     if not state.last_scan_results:
@@ -5199,142 +5140,6 @@ async def receive_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ Please reply with a number (minutes).")
         return ASK_INTERVAL
-
-# ─────────────────────────────────────────────
-# EXECUTION LAYER (Phase 1) — /connect encrypted Bybit key vault
-# ─────────────────────────────────────────────
-def _exec_enabled():
-    """Guard: execution layer importable AND vault key configured."""
-    return bool(_EXEC_AVAILABLE and sakz_execution and sakz_execution.vault_ready())
-
-
-async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _track(update)
-    if update.effective_chat and update.effective_chat.type != "private":
-        await update.message.reply_text(
-            "🔒 For your security, run /connect in a private DM with me — not in a group."
-        )
-        return ConversationHandler.END
-    if not _exec_enabled():
-        await update.message.reply_text(
-            "⚠️ Trading is not enabled on this deployment yet (vault key not configured). "
-            "Ask the admin to set the SAKZ_VAULT_KEY secret."
-        )
-        return ConversationHandler.END
-    net = "TESTNET" if sakz_execution.BYBIT_TESTNET else "LIVE"
-    await update.message.reply_text(
-        f"🔐 CONNECT BYBIT API ({net})\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "Create a Bybit API key with *Trade* permission ONLY — never enable *Withdraw*.\n\n"
-        "Step 1/2 — send me your *API KEY* now.\n"
-        "Send /cancel to abort.",
-        parse_mode="Markdown",
-    )
-    return CONNECT_KEY
-
-
-async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    api_key = (update.message.text or "").strip()
-    chat_id = update.effective_chat.id
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    if not api_key or len(api_key) < 8 or " " in api_key:
-        await context.bot.send_message(chat_id, "⚠️ That doesn't look like a valid API key. Send it again, or /cancel.")
-        return CONNECT_KEY
-    context.user_data['pending_api_key'] = api_key
-    await context.bot.send_message(
-        chat_id,
-        "✅ Got your API key (message deleted for safety).\n\nStep 2/2 — now send your *API SECRET*.",
-        parse_mode="Markdown",
-    )
-    return CONNECT_SECRET
-
-
-async def receive_api_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    api_secret = (update.message.text or "").strip()
-    chat_id    = update.effective_chat.id
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    api_key = context.user_data.get('pending_api_key')
-    if not api_key:
-        await context.bot.send_message(chat_id, "⚠️ Session expired. Run /connect again.")
-        return ConversationHandler.END
-    if not api_secret or len(api_secret) < 8 or " " in api_secret:
-        await context.bot.send_message(chat_id, "⚠️ That doesn't look like a valid API secret. Send it again, or /cancel.")
-        return CONNECT_SECRET
-    testnet = sakz_execution.BYBIT_TESTNET
-    await context.bot.send_message(chat_id, "🔄 Testing your keys against Bybit…")
-    try:
-        ok, detail = await asyncio.to_thread(sakz_execution.test_connection, api_key, api_secret, testnet)
-    except Exception as e:
-        ok, detail = False, str(e)
-    if not ok:
-        context.user_data.pop('pending_api_key', None)
-        await context.bot.send_message(
-            chat_id,
-            f"❌ Connection failed: {detail}\n\nCheck the key/secret and that *Trade* permission is enabled, then run /connect again.",
-            parse_mode="Markdown",
-        )
-        return ConversationHandler.END
-    try:
-        key_enc = sakz_execution.encrypt_secret(api_key)
-        sec_enc = sakz_execution.encrypt_secret(api_secret)
-        db_save_user_keys(chat_id, key_enc, sec_enc, testnet)
-    except Exception as e:
-        logger.error("db_save_user_keys failed: %s", e)
-        context.user_data.pop('pending_api_key', None)
-        await context.bot.send_message(chat_id, "❌ Could not securely store your keys. Please try again later.")
-        return ConversationHandler.END
-    context.user_data.pop('pending_api_key', None)
-    net = "TESTNET" if testnet else "LIVE"
-    await context.bot.send_message(
-        chat_id,
-        f"✅ CONNECTED ({net})\n{detail}\n\nYour keys are encrypted at rest. "
-        "Use /connstatus to re-check, or /disconnect to remove them.",
-    )
-    return ConversationHandler.END
-
-
-async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _track(update)
-    chat_id = update.effective_chat.id
-    try:
-        existed = db_delete_user_keys(chat_id)
-    except Exception as e:
-        logger.error("db_delete_user_keys failed: %s", e)
-        existed = False
-    if existed:
-        await update.message.reply_text("🗑 Disconnected. Your stored Bybit keys have been deleted.")
-    else:
-        await update.message.reply_text("ℹ️ You have no stored keys to disconnect.")
-
-
-async def connstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _track(update)
-    chat_id = update.effective_chat.id
-    if not _exec_enabled():
-        await update.message.reply_text("⚠️ Trading vault is not configured on this deployment.")
-        return
-    rec = db_get_user_keys(chat_id)
-    if not rec:
-        await update.message.reply_text("🔌 Not connected. Run /connect to link your Bybit API keys.")
-        return
-    key_enc, sec_enc, testnet = rec
-    net = "TESTNET" if testnet else "LIVE"
-    await context.bot.send_message(chat_id, "🔄 Checking your connection…")
-    try:
-        api_key    = sakz_execution.decrypt_secret(key_enc)
-        api_secret = sakz_execution.decrypt_secret(sec_enc)
-        ok, detail = await asyncio.to_thread(sakz_execution.test_connection, api_key, api_secret, testnet)
-    except Exception as e:
-        ok, detail = False, str(e)
-    status = "✅ Connected" if ok else "❌ Error"
-    await context.bot.send_message(chat_id, f"{status} ({net})\n{detail}")
-
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.", reply_markup=ReplyKeyboardRemove())
@@ -5634,7 +5439,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ───────────────────────────────��─────��─��───��─
+# ───────────────────────────────────────��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -5809,7 +5614,6 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     INK      = "#0A0D11"
     BTC_ORANGE = "#F7931A"
     MEXC_BLUE  = "#1D6CFF"
-    BYBIT_GOLD = "#F7A600"
 
     ASPECT = 10.24 / 6.83
 
@@ -5852,7 +5656,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
     raw_sym  = str(signal.get('symbol', '')).upper().replace('/', '').replace('_', '')
     base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
-    exch     = (str(signal.get('exchange', '')).upper() or 'BYBIT')
+    exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
 
     # exit price: peak price if it ran into profit past entry, else current price
     if fav_raw and fav_raw > 0 and entry > 0:
@@ -5952,14 +5756,9 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
             boxstyle="round,pad=0,rounding_size=0.020",
             linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
         tx = x + pad
-        if icon in ('coin', 'mexc', 'bybit'):
+        if icon in ('coin', 'mexc'):
             disc(x + pad + 0.013, y + h / 2, 0.014, facecolor=icon_col, edgecolor='none', zorder=5)
-            if icon == 'coin':
-                glyph = base_sym[:1]
-            elif icon == 'bybit':
-                glyph = 'B'
-            else:
-                glyph = 'M'
+            glyph = base_sym[:1] if icon == 'coin' else 'M'
             ax.text(x + pad + 0.013, y + h / 2, glyph, color=WHITE if icon == 'mexc' else INK,
                     fontsize=8.5, fontweight='bold', va='center', ha='center', zorder=6)
             tx = x + pad + 0.032
@@ -5972,12 +5771,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=bias_color)
     nx = chip(nx, cy, base_sym, icon='coin', icon_col=BTC_ORANGE)
     nx = chip(nx, cy, f"{lev}x")
-    if exch == 'BYBIT':
-        nx = chip(nx, cy, exch, icon='bybit', icon_col=BYBIT_GOLD)
-    elif exch == 'MEXC':
-        nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
-    else:
-        nx = chip(nx, cy, exch)
+    nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
 
     # ---- My Vault PnL ---------------------------------------------------
     ax.text(0.080, 0.508, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
@@ -5994,50 +5788,15 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Entry / Exit / Current price + Duration ---------------
-    # Time it took to run from the signal (entry) to the peak (exit) price.
-    def _fmt_dur(a, b):
-        try:
-            if a is None or b is None:
-                return "\u2014"
-            if isinstance(a, str):
-                a = datetime.fromisoformat(a)
-            if isinstance(b, str):
-                b = datetime.fromisoformat(b)
-            if not isinstance(a, datetime) or not isinstance(b, datetime):
-                return "\u2014"
-            a = a.replace(tzinfo=None)
-            b = b.replace(tzinfo=None)
-            secs = max(int((b - a).total_seconds()), 0)
-            days, rem = divmod(secs, 86400)
-            hours, rem = divmod(rem, 3600)
-            mins = rem // 60
-            if days > 0:
-                return f"{days}d {hours}h {mins}m"
-            if hours > 0:
-                return f"{hours}h {mins}m"
-            return f"{mins}m"
-        except Exception:
-            return "\u2014"
-
-    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
-
+    # ---- footer: Entry / Exit price ------------------------------------
     fy = 0.180
-    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=10.5, fontweight='bold',
+    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=14, fontweight='bold',
+    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=10.5, fontweight='bold',
+    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=14, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.520, fy + 0.030, "Current Price", color=GRAY, fontsize=10.5, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.520, fy - 0.014, _fmt_price(cur), color=WHITE, fontsize=14, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.740, fy + 0.030, "Duration", color=GRAY, fontsize=10.5, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.740, fy - 0.014, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
+    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
             va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
@@ -6049,7 +5808,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ─────────────────────────���──���────���───���────────
+# ────────────────────────────���────���───���────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -6216,8 +5975,8 @@ def compose_3d_card(flat_png, up=True):
     sprite.putalpha(mask)
     sprite = _add_card_patterns(sprite, ACCENT)
 
-    front = _build_card_slab(_warp_card(sprite, tilt=0.04, rot=-2.5, scale=1.0))
-    back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.04, rot=-5.0, scale=0.93), 0.62))
+    front = _build_card_slab(_warp_card(sprite, tilt=0.07, rot=-7.0, scale=1.0))
+    back  = _build_card_slab(_dim_rgba(_warp_card(sprite, tilt=0.07, rot=-11.0, scale=0.93), 0.62))
 
     fw, fh = front.size
     bw, bh = back.size
@@ -6441,29 +6200,7 @@ def _gather_pnl_matches(arg, results):
     except Exception as e:
         logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    # Collapse re-detections to the INITIAL call per (exchange, symbol, direction).
-    # A live pair gets re-scanned repeatedly (manual scans + autoscan reminders),
-    # and each detection is persisted — but a PnL is only meaningful from the
-    # FIRST (initial) call's entry. For each exchange+symbol+bias we keep the
-    # earliest scan, so subsequent reminders never appear as separate picks.
-    def _st(sig):
-        st = sig.get('scan_time')
-        if isinstance(st, str):
-            try:
-                st = datetime.fromisoformat(st)
-            except Exception:
-                return datetime.max
-        if isinstance(st, datetime):
-            return st.replace(tzinfo=None)
-        return datetime.max
-
-    initial = {}
-    for r in matches:
-        gk = (str(r.get('exchange')), _norm(r.get('symbol')), str(r.get('bias')))
-        if gk not in initial or _st(r) < _st(initial[gk]):
-            initial[gk] = r
-    collapsed = sorted(initial.values(), key=_st, reverse=True)
-    return collapsed
+    return matches
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6624,7 +6361,7 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             buttons = []
             if bot_lev:
                 buttons.append(InlineKeyboardButton(
-                    f"�� Use bot leverage ({bot_lev}x)",
+                    f"⚡ Use bot leverage ({bot_lev}x)",
                     callback_data=f"pnl_bot|{bot_lev}|{capital}"
                 ))
             buttons.append(InlineKeyboardButton(
@@ -6770,7 +6507,7 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /tg — TOP GAINS
-# ─────────────────────���───────────────────────
+# ─────────────────────────────────────────────
 async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     ph = db_load_price_history() if not state.price_history else state.price_history
@@ -6792,7 +6529,7 @@ async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not top:
         await update.message.reply_text("📊 No positive gainers yet. Run /scan more times.")
         return
-    lines = [f"📈 TOP GAINS — Last 24 Hours\n━���━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    lines = [f"📈 TOP GAINS — Last 24 Hours\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
     for i, g in enumerate(top, 1):
         lines.append(f"🟢 #{i} {g['exchange']} | {g['symbol']}\n"
                      f"   Change: +{g['change_pct']:.2f}%\n"
@@ -7053,7 +6790,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-# ───────────────────��─────────────────────────
+# ─────────────────────────────────────────────
 # MENU RUN CALLBACK — execute commands from menu buttons
 # ─────────────────────────────────────────────
 async def menu_run_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7508,14 +7245,6 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         bybit_count  = sum(1 for r in shown if r.get('exchange') == 'BYBIT')
         bin_count    = sum(1 for r in shown if r.get('exchange') == 'BINANCE')
-        mexc_count   = sum(1 for r in shown if r.get('exchange') == 'MEXC')
-        # ── SCAN SOURCE notif (single-venue: Bybit primary, MEXC fallback) ──
-        if sakz_exchanges.MEXC_ONLY:
-            scan_source_note = f"📡 Source: MEXC ({len(shown)} pairs)"
-        elif sakz_exchanges.BYBIT_AVAILABLE:
-            scan_source_note = f"📡 Source: Bybit ({len(shown)} pairs)"
-        else:
-            scan_source_note = f"📡 Source: MEXC — Bybit API down ({len(shown)} pairs)"
         bybit_note   = f"BYBIT: {bybit_count}" if sakz_exchanges.BYBIT_AVAILABLE else "BYBIT: skipped (blocked)"
         binance_note = f"BINANCE: {bin_count}"  if sakz_exchanges.BINANCE_AVAILABLE else "BINANCE: skipped (blocked)"
         cache_note   = "⚡ cached" if from_cache else "🔄 fresh"
@@ -7524,7 +7253,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_alerts(results, context.bot)
             await post_broadcast(results, context.bot)
 
-        title = f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}\n{scan_source_note}"
+        title = f"📊 TOP SIGNALS — {state.last_scan_time.strftime('%H:%M')}"
         if hidden:
             title += f"\n({hidden} lower-confidence setup(s) hidden — use /scan all to view)"
 
@@ -7644,7 +7373,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # /compare
 # ─────────────────────────────────────────────
-# ���────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # /cscan — Custom pair scanner
 # Usage: /cscan BTC   or   /cscan BTCUSDT
 # Analyses that specific perp on all available
@@ -7792,7 +7521,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"couldn't produce a signal (not enough candles on any timeframe yet).\n\n"
                 f"💡 Options:\n"
                 f"• Wait ~1–2 hours and try again — new listings fill up fast\n"
-                f"��� Try /cscan {sym_base} 15m once more candles accumulate\n"
+                f"• Try /cscan {sym_base} 15m once more candles accumulate\n"
                 f"• Check the pair exists as a perpetual on MEXC/Bybit futures"
             )
         elif dominant_reason == REASON_REGIME_BLOCK:
@@ -9602,9 +9331,9 @@ def snail_score_signal(r, df4h, df1d, funding):
             elif rsi4 < 35:
                 score -= 5; warnings.append(f"⚠️ RSI 4H oversold ({rsi4:.1f}) — limited downside room")
             if 40 <= rsi_d <= 60:
-                score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) ��� sustainable")
+                score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) — sustainable")
 
-        # ── 4. VOLUME CONVICTION ─��──────────────────────���────
+        # ── 4. VOLUME CONVICTION ─��───────────────────────────
         vol_ratio       = vol / vol_ma if vol_ma > 0 else 1.0
         price_change_pct = abs(price - P['close']) / P['close'] * 100 if P['close'] > 0 else 0
 
@@ -9859,7 +9588,7 @@ def format_snail_signal(r, sa, day_num, days_left):
     bar_w  = int(sa['snail_score'] / 10)
     bar    = "█" * bar_w + "░" * (10 - bar_w)
 
-    # ── Leverage-aware 2x target ───────────────────────��──────
+    # ── Leverage-aware 2x target ──────────────────────────────
     t2_lev, t2_desc = _snail_2x_target(r)
     lev_val = lev['suggested'] if lev else 5
 
@@ -10301,7 +10030,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 6. Admin user-count tracking (/admin)
 # ══════════════════════════════════════════════════════════���════
 
-# ─── TIMEFRAME HELPERS ───────────────────────────��──────���─────
+# ─── TIMEFRAME HELPERS ────────────────────────────────────────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -10780,7 +10509,7 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_command(update, context)
 
 
-# ────────────────────────────��────────────────
+# ─────────────────────────────────────────────
 # /scan new — Newly listed pairs scanner
 # Usage:
 #   /scan new 24h   — pairs listed in last 24 hours
@@ -11374,7 +11103,7 @@ def _analyse_raw_indicators(symbol: str, tf_key: str):
         # RSI
         if rsi < 30:    bull_signals.append(f"RSI {rsi:.1f} — extremely oversold 🔴")
         elif rsi < 40:  bull_signals.append(f"RSI {rsi:.1f} — oversold")
-        elif rsi < 48:  bull_signals.append(f"RSI {rsi:.1f} ��� leaning oversold")
+        elif rsi < 48:  bull_signals.append(f"RSI {rsi:.1f} — leaning oversold")
         elif rsi > 70:  bear_signals.append(f"RSI {rsi:.1f} — extremely overbought 🔴")
         elif rsi > 60:  bear_signals.append(f"RSI {rsi:.1f} — overbought")
         elif rsi > 52:  bear_signals.append(f"RSI {rsi:.1f} — leaning overbought")
@@ -12409,7 +12138,7 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(f"❌ Chart refresh failed: {e}")
 
 
-# ─── USER TRACKING ───────────────────────────────────���────────
+# ─── USER TRACKING ────────────────────────────────────────────
 def track_user_interaction(chat_id: int):
     """Record a unique user interaction in the DB."""
     try:
@@ -12781,7 +12510,7 @@ def render_fgi_card(data):
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ───────────────────────────────────────────��────────────
+    # ── card panel ────────────────────────────────────────────────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
@@ -12818,7 +12547,7 @@ def render_fgi_card(data):
     # ── title ─────────────────────────────────────────────────────────────
     ax.text(0.05, 0.690, "FEAR & GREED", color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=3)
 
-    # ── score badge ──────────────────────────────────────────────���────────
+    # ── score badge ───────────────────────────────────────────────────────
     # Badge is wide enough to hold score + classif + trend without overlapping bars
     bx, by, bw, bh = 0.05, 0.385, 0.455, 0.195
     ax.add_patch(FancyBboxPatch((bx, by), bw, bh,
@@ -12983,7 +12712,7 @@ async def fgi_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-# ─────────────────�����───────────────────────────────────────────────────────────
+# ─────────────────���───────────────────────────────────────────────────────────
 # CEILING #6 — MID-TIER UNIVERSE SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 # Problem:  The standard /scan covers only the top-50 pairs by volume on each
@@ -13690,7 +13419,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trade = (
         "\n💼  T R A D E  M A N A G E R\n"
-        "━━��━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "/pick                  Track a trade with auto-reminders\n"
         "/stoptrade             Stop tracking your current trade\n"
         "/check BTC LONG 98000 95000\n"
@@ -14506,7 +14235,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────��───��─��────────
+# ──────────────────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
@@ -14760,30 +14489,6 @@ def _install_auto_refresh(app):
                 AUTO_REFRESH_SECS, AUTO_REFRESH_MAX_CYCLES, AUTO_REFRESH_MAX_JOBS)
 
 
-async def on_error(update, context):
-    """Global error handler.
-
-    Without this, any uncaught exception in a handler dies silently (PTB only
-    logs it and the user sees nothing). This logs the full traceback AND sends
-    the actual error back to the chat so a command can never fail silently.
-    """
-    err = context.error
-    logger.error("Unhandled exception while processing update", exc_info=err)
-    try:
-        chat_id = None
-        if isinstance(update, Update) and update.effective_chat:
-            chat_id = update.effective_chat.id
-        if chat_id is not None:
-            # Plain text on purpose: error strings often contain Markdown
-            # metacharacters that would make a formatted send fail too.
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Something errored while handling that command:\n{type(err).__name__}: {err}",
-            )
-    except Exception as _notify_e:
-        logger.warning("Failed to notify user of error: %s", _notify_e)
-
-
 def main():
 
 
@@ -14851,7 +14556,6 @@ def main():
     logger.info("Restored %d autoscan subscribers from DB", len(auto_scan_subscribers))
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_error_handler(on_error)   # never die silently — log + notify the chat
 
     # FIX #AUTOREFRESH — every card with a 🔄 button also auto-refreshes (30s)
     _install_auto_refresh(app)
@@ -15025,19 +14729,6 @@ def main():
     )
 
     app.add_handler(conv_handler)
-
-    # ── Execution layer (Phase 1): /connect encrypted key vault ────────────
-    connect_conv = ConversationHandler(
-        entry_points=[CommandHandler("connect", connect_command)],
-        states={
-            CONNECT_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_key)],
-            CONNECT_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_api_secret)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(connect_conv)
-    app.add_handler(CommandHandler("disconnect", disconnect_command))
-    app.add_handler(CommandHandler("connstatus", connstatus_command))
     app.add_handler(CommandHandler("start",      start_command))
     app.add_handler(CommandHandler("menu",       menu_command))
     app.add_handler(CommandHandler("status",     status_command))
@@ -15139,24 +14830,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _admin_pw_gate))
     # unknown_command MUST be last — it catches everything else including /scan1234JP$$
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-    # -- Exchange reachability probe (startup trial) -------------------------
-    # Probe Bybit FIRST; MEXC is always the fallback. This makes it obvious in
-    # the logs whether the current host region can reach Bybit's public API.
-    try:
-        _bybit_ok = bybit_check_available()
-        binance_check_available()
-        if sakz_exchanges.MEXC_ONLY:
-            logger.info("SCAN SOURCE: MEXC only (MEXC_ONLY=true) -- Bybit disabled")
-            print("SCAN SOURCE: MEXC only (MEXC_ONLY=true)")
-        elif _bybit_ok:
-            logger.info("SCAN SOURCE: Bybit PRIMARY + MEXC fallback (region unblocked)")
-            print("SCAN SOURCE: Bybit PRIMARY + MEXC fallback -- migration effective")
-        else:
-            logger.info("SCAN SOURCE: Bybit blocked -> MEXC fallback active")
-            print("SCAN SOURCE: Bybit blocked -> MEXC fallback (region still blocked)")
-    except Exception as _probe_e:
-        logger.warning("Exchange reachability probe failed: %s", _probe_e)
 
     print("\n✅ Bot running. Open Telegram and type /menu\n")
 
