@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────���������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�����������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -1117,7 +1117,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ───────────────────────────────────────────────���────────────
+# ── /pro Command handler ────────────────────────────────────────────������─���────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1430,7 +1430,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ────────────────────────────────────────���──���─
+# ────────────────────────────────────���──������──���─
 try:
     from sakz_ws import (
         start_ws,
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ──────────���───────���────���─������─���─���──────────────
+# ─────────�����───────���────���─������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2492,7 +2492,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 3-thread executor allows concurrent scans
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────���───
 # ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
@@ -2677,26 +2677,28 @@ def run_full_scan():
         cutoff = datetime.now() - timedelta(hours=24)
         state.price_history[key] = [p for p in state.price_history[key] if p['time'] > cutoff]
 
-    bybit_syms   = bybit_get_top_symbols(50)
-    mexc_syms    = mexc_get_top_symbols(50)
-    binance_syms = binance_get_top_symbols(50) if sakz_exchanges.BINANCE_AVAILABLE else []
+    # ── SINGLE-VENUE SCAN — Bybit primary, MEXC fallback (user directive) ───
+    # Display rule: surface Bybit's scans only. If Bybit's API is unreachable
+    # this session, fall back to MEXC. Binance is no longer surfaced in scans,
+    # so every scan card shows exactly one venue — clean, no duplicates.
+    if sakz_exchanges.BYBIT_AVAILABLE:
+        active_venue, active_analyze = 'BYBIT', analyze_bybit
+        active_syms = bybit_get_top_symbols(50)
+        if not active_syms:   # reachable but returned nothing → fall back to MEXC
+            logger.warning("Bybit returned no symbols — falling back to MEXC this scan")
+            active_venue, active_analyze = 'MEXC', analyze_mexc
+            active_syms = mexc_get_top_symbols(50)
+    else:
+        active_venue, active_analyze = 'MEXC', analyze_mexc
+        active_syms = mexc_get_top_symbols(50)
 
-    # Warm volume cache with a single ticker request per exchange
-    _warm_vol_cache(set(bybit_syms),   'BYBIT')
-    _warm_vol_cache(set(mexc_syms),    'MEXC')
-    if binance_syms:
-        _warm_vol_cache(set(binance_syms), 'BINANCE')
+    logger.info("Scan venue: %s (%d symbols)", active_venue, len(active_syms))
 
-    for sym in bybit_syms:
-        _process(analyze_bybit(sym), 'BYBIT')
-        time.sleep(0.2)
+    # Warm volume cache with a single ticker request for the active venue
+    _warm_vol_cache(set(active_syms), active_venue)
 
-    for sym in mexc_syms:
-        _process(analyze_mexc(sym), 'MEXC')
-        time.sleep(0.2)
-
-    for sym in binance_syms:
-        _process(analyze_binance(sym), 'BINANCE')
+    for sym in active_syms:
+        _process(active_analyze(sym), active_venue)
         time.sleep(0.2)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
@@ -2704,6 +2706,26 @@ def run_full_scan():
         key=lambda x: (x["confidence"], (x.get("consensus_score") or 0.5), x["score"], _vol_rank.get(x.get("vol_regime", "MEDIUM"), 2)),
         reverse=True
     )
+
+    # ── DEDUP — one signal per symbol ───────────────────────────────────────
+    # The multi-exchange scan (Bybit + MEXC + Binance) emits a near-identical
+    # signal for the same symbol on every venue it trades on — only the price
+    # differs slightly (cross-exchange divergence). Showing XRPUSDT 3x is just
+    # noise, so collapse to the single best entry per symbol. `results` is
+    # already sorted best-first, so the first time we see a symbol is the one
+    # to keep; ties favour BYBIT since the Bybit loop appends first.
+    _seen_syms = set()
+    _deduped   = []
+    for _r in results:
+        _sym = _r.get("symbol")
+        if _sym in _seen_syms:
+            continue
+        _seen_syms.add(_sym)
+        _deduped.append(_r)
+    if len(_deduped) != len(results):
+        logger.info("Dedup: collapsed %d multi-exchange duplicate(s) -> %d unique symbols",
+                    len(results) - len(_deduped), len(_deduped))
+    results = _deduped
 
     # ── FIX #DD — Portfolio-level correlation gate ──────────────────────────
     # Problem: every signal in the list is treated as independent.  In reality,
@@ -6396,7 +6418,7 @@ async def pnl_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             buttons = []
             if bot_lev:
                 buttons.append(InlineKeyboardButton(
-                    f"⚡ Use bot leverage ({bot_lev}x)",
+                    f"�� Use bot leverage ({bot_lev}x)",
                     callback_data=f"pnl_bot|{bot_lev}|{capital}"
                 ))
             buttons.append(InlineKeyboardButton(
@@ -6542,7 +6564,7 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /tg — TOP GAINS
-# ─────────────────────────────────────────────
+# ─────────────────────���───────────────────────
 async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     ph = db_load_price_history() if not state.price_history else state.price_history
@@ -7281,18 +7303,13 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bybit_count  = sum(1 for r in shown if r.get('exchange') == 'BYBIT')
         bin_count    = sum(1 for r in shown if r.get('exchange') == 'BINANCE')
         mexc_count   = sum(1 for r in shown if r.get('exchange') == 'MEXC')
-        # ── SCAN SOURCE notif: shows which exchange(s) these scans came from ──
+        # ── SCAN SOURCE notif (single-venue: Bybit primary, MEXC fallback) ──
         if sakz_exchanges.MEXC_ONLY:
-            scan_source_note = f"📡 Source: MEXC only ({mexc_count} pairs)"
+            scan_source_note = f"📡 Source: MEXC ({len(shown)} pairs)"
         elif sakz_exchanges.BYBIT_AVAILABLE:
-            _src_parts = [f"Bybit {bybit_count}", f"MEXC {mexc_count}"]
-            if sakz_exchanges.BINANCE_AVAILABLE:
-                _src_parts.append(f"Binance {bin_count}")
-            scan_source_note = "📡 Source: Bybit ✅ primary + MEXC fallback — " + " | ".join(_src_parts)
-        elif sakz_exchanges.BYBIT_AVAILABLE is False:
-            scan_source_note = f"📡 Source: Bybit ❌ blocked → MEXC fallback ({mexc_count} pairs)"
+            scan_source_note = f"📡 Source: Bybit ({len(shown)} pairs)"
         else:
-            scan_source_note = f"📡 Source: MEXC ({mexc_count} pairs)"
+            scan_source_note = f"📡 Source: MEXC — Bybit API down ({len(shown)} pairs)"
         bybit_note   = f"BYBIT: {bybit_count}" if sakz_exchanges.BYBIT_AVAILABLE else "BYBIT: skipped (blocked)"
         binance_note = f"BINANCE: {bin_count}"  if sakz_exchanges.BINANCE_AVAILABLE else "BINANCE: skipped (blocked)"
         cache_note   = "⚡ cached" if from_cache else "🔄 fresh"
@@ -7569,7 +7586,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"couldn't produce a signal (not enough candles on any timeframe yet).\n\n"
                 f"💡 Options:\n"
                 f"• Wait ~1–2 hours and try again — new listings fill up fast\n"
-                f"• Try /cscan {sym_base} 15m once more candles accumulate\n"
+                f"��� Try /cscan {sym_base} 15m once more candles accumulate\n"
                 f"• Check the pair exists as a perpetual on MEXC/Bybit futures"
             )
         elif dominant_reason == REASON_REGIME_BLOCK:
@@ -9381,7 +9398,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             if 40 <= rsi_d <= 60:
                 score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) — sustainable")
 
-        # ── 4. VOLUME CONVICTION ─��───────────────────────────
+        # ── 4. VOLUME CONVICTION ─��──────────────────────���────
         vol_ratio       = vol / vol_ma if vol_ma > 0 else 1.0
         price_change_pct = abs(price - P['close']) / P['close'] * 100 if P['close'] > 0 else 0
 
@@ -10557,7 +10574,7 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_command(update, context)
 
 
-# ─────────────────────────────────────────────
+# ────────────────────────────��────────────────
 # /scan new — Newly listed pairs scanner
 # Usage:
 #   /scan new 24h   — pairs listed in last 24 hours
@@ -12760,7 +12777,7 @@ async def fgi_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-# ─────────────────���───────────────────────────────────────────────────────────
+# ─────────────────�����───────────────────────────────────────────────────────────
 # CEILING #6 — MID-TIER UNIVERSE SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 # Problem:  The standard /scan covers only the top-50 pairs by volume on each
@@ -13467,7 +13484,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trade = (
         "\n💼  T R A D E  M A N A G E R\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━��━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "/pick                  Track a trade with auto-reminders\n"
         "/stoptrade             Stop tracking your current trade\n"
         "/check BTC LONG 98000 95000\n"
@@ -14283,7 +14300,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────��─��────────
+# ──────────────────────────────��───��─��────────
 # MAIN
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
