@@ -5,6 +5,7 @@ the BYBIT_AVAILABLE / BINANCE_AVAILABLE runtime flags they mutate via `global`.
 Other modules MUST read those flags as attributes (sakz_exchanges.BYBIT_AVAILABLE)
 to see live updates. Behaviour identical to the original in-line code.
 """
+import os
 import logging
 import requests
 import pandas as pd
@@ -29,13 +30,16 @@ _TIMEOUT = HTTP_TIMEOUT
 # exchange API variable on Railway (or anywhere). The only env vars the bot
 # reads are TELEGRAM_TOKEN and the optional TURSO_URL / TURSO_TOKEN.
 #
-# The switch below is baked into the bot (hardcoded True). While it is on:
+# The switch below is controlled by the MEXC_ONLY env var (default OFF). While on:
 #   * Bybit/Binance availability is forced False (no startup network probe), and
 #   * every Bybit/Binance fetcher short-circuits to an empty result, so NO
 #     request is ever sent to those venues regardless of which call site runs.
 # The existing "if BYBIT_AVAILABLE ... else MEXC" fallbacks throughout the bot
 # then route 100% of market-data traffic to MEXC automatically.
-MEXC_ONLY = True
+# Trial mode: probe Bybit FIRST, fall back to MEXC. Controlled by the MEXC_ONLY
+# env var (default OFF, now that the host can sit in a Bybit-reachable region).
+# Set MEXC_ONLY=true on the host to force the old MEXC-only behaviour.
+MEXC_ONLY = os.environ.get("MEXC_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
 
 BYBIT_AVAILABLE = False if MEXC_ONLY else None    # None=unchecked, True=ok, False=blocked
 BINANCE_AVAILABLE = False if MEXC_ONLY else None  # None=unchecked, True=ok, False=blocked
