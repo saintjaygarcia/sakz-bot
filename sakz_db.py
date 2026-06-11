@@ -6,8 +6,11 @@ Connection helper, schema init and all 73 db_* functions. Self-contained
 import os
 import json
 import uuid
+import time
 import sqlite3
 import logging
+import functools
+import threading
 from datetime import datetime, timedelta
 
 # NOTE: dotenv is loaded once in config.py (single source of truth); importing
@@ -18,6 +21,80 @@ from config import (  # centralised configuration (single source of truth)
 from sakz_errors import SakzDBError  # typed DB failure (vs silent empty result)
 
 logger = logging.getLogger(__name__)
+
+# ── Hrana / Turso resilience (FIX: "stream not found" 404) ──────────────────
+# libsql_experimental talks to Turso over the Hrana protocol, which keeps a
+# server-side "stream" per connection. Two failure modes were crashing /scan:
+#   1. Concurrency — SCAN_EXECUTOR runs up to 3 scans at once and the telegram
+#      job-queue fires autoscan/mid-scan in parallel. libsql_experimental is
+#      NOT thread-safe; concurrent use of the client loses/corrupts Hrana
+#      stream IDs -> "stream not found: <id>" (HTTP 404).
+#   2. Idle/expired streams — a stream the server has already reclaimed gets
+#      reused on the next statement, again yielding a 404 "stream not found".
+#
+# Fix: serialise every db_* helper behind one re-entrant lock (kills the
+# concurrency races) AND transparently retry the whole operation on a fresh
+# connection when a transient Hrana/stream error is seen. Each db_* helper
+# opens its own connection and commits before returning, so replaying the whole
+# call is safe: a stream-lost failure means nothing was committed.
+_DB_LOCK         = threading.RLock()
+_DB_MAX_ATTEMPTS = 4      # 1 initial try + 3 retries
+_DB_RETRY_SLEEP  = 0.4    # base seconds; grows linearly per attempt
+
+_TRANSIENT_DB_MARKERS = (
+    "stream not found",
+    "stream expired",
+    "hrana",
+    "baton",
+    "status=404",
+    "status=503",
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "timed out",
+    "temporarily unavailable",
+)
+
+def _is_transient_db_error(exc):
+    """True for Hrana/Turso stream errors that succeed after reconnecting."""
+    if exc is None:
+        return False
+    msg = (str(exc) or "").lower()
+    if any(m in msg for m in _TRANSIENT_DB_MARKERS):
+        return True
+    # SakzDBError wraps the original libsql error as __cause__
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return _is_transient_db_error(cause)
+    return False
+
+def _db_resilient(fn):
+    """Serialise + auto-retry a db_* helper against transient Turso errors."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _DB_LOCK:
+            last = None
+            for attempt in range(1, _DB_MAX_ATTEMPTS + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last = e
+                    if not _is_transient_db_error(e):
+                        raise
+                if attempt < _DB_MAX_ATTEMPTS:
+                    logger.warning(
+                        "db.%s transient error (attempt %d/%d): %s — reconnecting",
+                        getattr(fn, "__name__", "?"), attempt,
+                        _DB_MAX_ATTEMPTS, last,
+                    )
+                    time.sleep(_DB_RETRY_SLEEP * attempt)
+            logger.error("db.%s failed after %d attempts: %s",
+                         getattr(fn, "__name__", "?"), _DB_MAX_ATTEMPTS, last)
+            raise SakzDBError(
+                f"database operation failed after {_DB_MAX_ATTEMPTS} attempts: {last}"
+            ) from last
+    wrapper.__wrapped_db_resilient__ = True
+    return wrapper
 
 # -- Turso / libsql support (moved verbatim from sakz_bot.py) --
 
@@ -1306,3 +1383,28 @@ def db_admin_get_stats():
         'all_users':  rows,
     }
 
+
+
+# ── Apply Hrana-resilience wrapper to every public db_* helper ──────────────
+# Runs once at import time so all data-access helpers gain serialised access +
+# transparent reconnect/retry without touching each call site. db_connect is
+# left unwrapped on purpose: it is the primitive the wrapped helpers call
+# internally, so retrying happens at the operation level (which re-opens the
+# connection anyway). This executes after every db_* function is defined, and
+# before any other module does `from sakz_db import db_*`, so importers bind to
+# the wrapped versions.
+def _install_db_resilience():
+    import sys as _sys
+    _mod = _sys.modules[__name__]
+    wrapped = 0
+    for _name in list(vars(_mod)):
+        if not _name.startswith("db_") or _name == "db_connect":
+            continue
+        _obj = getattr(_mod, _name)
+        if callable(_obj) and not getattr(_obj, "__wrapped_db_resilient__", False):
+            setattr(_mod, _name, _db_resilient(_obj))
+            wrapped += 1
+    logger.info("db resilience: wrapped %d db_* helpers (Turso=%s)",
+                wrapped, bool(_USE_TURSO and libsql))
+
+_install_db_resilience()

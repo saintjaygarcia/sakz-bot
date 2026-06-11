@@ -116,6 +116,87 @@ def http_get(url, **kwargs):
     return _HTTP_SESSION.get(url, **kwargs)
 
 
+# === SAKZ_TOKEN_LOGO_V1 — real token logo fetch + circular render ===
+# Pulls a token's actual logo PNG from symbol-keyed icon CDNs, caches it on
+# disk + in memory, and circular-masks it so it drops into a card chip. Every
+# failure path returns None so callers fall back to the lettered colour badge.
+# Rendered with matplotlib (imshow) — the card axes use 0..1 coords, so the
+# masked RGBA composites straight onto the glass without extra figures.
+_TOKEN_LOGO_DIR = os.environ.get("SAKZ_LOGO_CACHE", "/tmp/sakz_logos")
+_TOKEN_LOGO_MEM = {}
+
+def _token_logo_urls(sym):
+    s = sym.lower()
+    return [
+        "https://assets.coincap.io/assets/icons/" + s + "@2x.png",
+        "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/" + s + ".png",
+    ]
+
+def _logo_bytes_to_rgba(data, px=128):
+    """Decode PNG bytes -> square, circular-masked RGBA numpy array."""
+    from PIL import Image, ImageDraw, ImageChops
+    import numpy as _np
+    im = Image.open(io.BytesIO(data)).convert("RGBA")
+    w, h = im.size
+    m = min(w, h)
+    im = im.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m))
+    im = im.resize((px, px), Image.LANCZOS)
+    mask = Image.new("L", (px, px), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, px - 1, px - 1), fill=255)
+    alpha = ImageChops.multiply(im.split()[3], mask)
+    im.putalpha(alpha)
+    return _np.asarray(im)
+
+def fetch_token_logo(symbol, *, timeout=4):
+    """Return an RGBA numpy array of the token's real logo, or None."""
+    try:
+        base = str(symbol or "").upper().replace("/", "").replace("_", "")
+        if base.endswith("USDT"):
+            base = base[:-4]
+        if not base:
+            return None
+        if base in _TOKEN_LOGO_MEM:
+            return _TOKEN_LOGO_MEM[base]
+        try:
+            os.makedirs(_TOKEN_LOGO_DIR, exist_ok=True)
+        except Exception:
+            pass
+        cache_png = os.path.join(_TOKEN_LOGO_DIR, base.lower() + ".png")
+        data = None
+        if os.path.exists(cache_png) and os.path.getsize(cache_png) > 0:
+            with open(cache_png, "rb") as f:
+                data = f.read()
+        if data is None:
+            for url in _token_logo_urls(base):
+                try:
+                    r = http_get(url, timeout=timeout)
+                    if getattr(r, "status_code", 0) == 200 and r.content and len(r.content) > 200:
+                        data = r.content
+                        try:
+                            with open(cache_png, "wb") as f:
+                                f.write(data)
+                        except Exception:
+                            pass
+                        break
+                except Exception as _e:
+                    logger.debug("token logo fetch failed %s: %s", url, _e)
+        if not data:
+            _TOKEN_LOGO_MEM[base] = None
+            return None
+        arr = _logo_bytes_to_rgba(data)
+        _TOKEN_LOGO_MEM[base] = arr
+        return arr
+    except Exception as e:
+        logger.debug("fetch_token_logo error for %s: %s", symbol, e)
+        return None
+
+def _draw_token_logo(ax, cx, cy, r, arr, aspect, zorder=7):
+    """Composite a circular-masked logo RGBA array onto the card at (cx, cy)."""
+    half_w = r / aspect
+    ax.imshow(arr, extent=[cx - half_w, cx + half_w, cy - r, cy + r],
+              aspect="auto", zorder=zorder, interpolation="bilinear", origin="upper")
+
+
 # === Extracted data-access layer (sakz_db.py) ===
 from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_connect,
@@ -6486,27 +6567,29 @@ def render_pnl_card_tablet_v3(signal, current_price, leverage, capital=None, clo
 
     peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
 
-    # ── card body + glass edge ────────────────────────────────────────────
+    # ── SAKZ_CARD3_V2_MOCKUP — clean continuous glass body (no header bar) ──
     ax.add_patch(FancyBboxPatch((0.028, 0.040), 0.944, 0.920,
-        boxstyle="round,pad=0,rounding_size=0.048",
+        boxstyle="round,pad=0,rounding_size=0.052",
         linewidth=1.6, edgecolor=CARD_ED, facecolor=CARD, zorder=1))
-
-    # Silver rim highlight (top edge only — like the tablet bezel in the image)
     ax.add_patch(FancyBboxPatch((0.028, 0.040), 0.944, 0.920,
-        boxstyle="round,pad=0,rounding_size=0.048",
-        linewidth=3.2, edgecolor=SILVER, facecolor="none", alpha=0.18, zorder=2))
+        boxstyle="round,pad=0,rounding_size=0.052",
+        linewidth=3.0, edgecolor=SILVER, facecolor="none", alpha=0.16, zorder=2))
 
-    # ── subtle right-side arc decorations (echo the curved lines on back card) ──
-    for k, (r, alpha) in enumerate([(0.36, 0.12), (0.28, 0.18), (0.20, 0.22), (0.12, 0.16)]):
-        arc = Arc((1.02, 0.50), width=r * 2 / ASPECT, height=r * 2,
-                  angle=0, theta1=110, theta2=250,
-                  color=accent, lw=2.2 - k * 0.3, alpha=alpha, zorder=2)
-        ax.add_patch(arc)
+    # faint sweeping chart curve + nested chevrons on the right
+    _cx = np.linspace(0.50, 0.95, 60)
+    _cy = 0.30 + 0.34 * (((_cx - 0.50) / 0.45) ** 1.6) + 0.015 * np.sin((_cx - 0.50) * 22)
+    for _w, _a in [(4.5, 0.06), (2.4, 0.13), (1.3, 0.28)]:
+        ax.plot(_cx, _cy, color=accent, lw=_w, alpha=_a, solid_capstyle="round", zorder=2)
+    for _k in range(4):
+        _o = 0.022 * _k
+        ax.add_patch(FancyBboxPatch((0.60 + _o, 0.28 + _o), 0.32 - 2 * _o, 0.40 - 2 * _o,
+            boxstyle="round,pad=0,rounding_size=0.02",
+            linewidth=1.0, edgecolor=SILVER, facecolor="none", alpha=0.06, zorder=1))
 
-    # ── soft radial glow behind the headline ─────────────────────────────
+    # soft radial glow behind the headline
     gx = np.linspace(0, 1, 200); gy = np.linspace(0, 1, 200)
     GXX, GYY = np.meshgrid(gx, gy)
-    dist = np.sqrt((GXX - 0.38) ** 2 + (GYY - 0.42) ** 2)
+    dist = np.sqrt((GXX - 0.34) ** 2 + (GYY - 0.44) ** 2)
     glow = np.clip(0.22 - dist * 0.55, 0, 0.22)
     rgba = np.zeros((200, 200, 4))
     if up:
@@ -6514,102 +6597,96 @@ def render_pnl_card_tablet_v3(signal, current_price, leverage, capital=None, clo
     else:
         rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.94, 0.33, 0.42
     rgba[..., 3] = glow * 1.8
-    ax.imshow(rgba, extent=[0.03, 0.97, 0.03, 0.97], aspect='auto', origin='lower',
-              zorder=1, interpolation='bilinear')
+    ax.imshow(rgba, extent=[0.03, 0.97, 0.03, 0.97], aspect="auto", origin="lower",
+              zorder=2, interpolation="bilinear")
 
-    # ── header bar ───────────────────────────────────────────────────────
-    ax.add_patch(FancyBboxPatch((0.028, 0.820), 0.944, 0.140,
-        boxstyle="round,pad=0,rounding_size=0.030",
-        linewidth=0, facecolor=HEADER_BG, zorder=3))
-    # thin accent underline on header
-    ax.plot([0.028, 0.972], [0.820, 0.820], color=accent, lw=1.4, alpha=0.55, zorder=4)
+    # brand wordmark (triangle + Sakz) top-left
+    bx0, by0 = 0.082, 0.886
+    ax.add_patch(Polygon([(bx0 - 0.012, by0 - 0.014), (bx0 + 0.012, by0 - 0.014),
+                          (bx0, by0 + 0.018)], closed=True,
+                         facecolor=accent, edgecolor="none", zorder=6))
+    ax.text(bx0 + 0.026, by0, brand, color=WHITE, fontsize=21, fontweight="bold",
+            va="center", ha="left", zorder=6, fontstyle="italic")
 
-    # bias triangle + brand wordmark in header
-    hx, hy = 0.072, 0.888
-    if is_long:
-        ax.add_patch(Polygon([(hx - 0.013, hy - 0.016), (hx + 0.013, hy - 0.016), (hx, hy + 0.018)],
-            closed=True, facecolor=bias_color, edgecolor='none', zorder=6))
-    else:
-        ax.add_patch(Polygon([(hx - 0.013, hy + 0.016), (hx + 0.013, hy + 0.016), (hx, hy - 0.018)],
-            closed=True, facecolor=bias_color, edgecolor='none', zorder=6))
-    ax.text(hx + 0.028, hy, brand, color=WHITE, fontsize=22, fontweight='bold',
-            va='center', ha='left', zorder=6, fontstyle='italic')
+    # avatar circle + username
+    av_x, av_y = 0.099, 0.762
+    disc(av_x, av_y, 0.034, facecolor="#182535", edgecolor=CARD_ED, lw=1.4, zorder=4)
+    ax.text(av_x, av_y, (uname[:1].upper() or "T"), color=WHITE, fontsize=15,
+            fontweight="bold", va="center", ha="center", zorder=5)
+    ax.text(av_x + 0.060, av_y, uname, color=WHITE, fontsize=15, fontweight="bold",
+            va="center", ha="left", zorder=5)
 
-    # ── avatar circle + username + Trader badge ───────────────────────────
-    av_x, av_y = 0.095, 0.728
-    disc(av_x, av_y, 0.038, facecolor="#182535", edgecolor=CARD_ED, lw=1.4, zorder=4)
-    ax.text(av_x, av_y, (uname[:1].upper() or 'T'), color=WHITE, fontsize=16,
-            fontweight='bold', va='center', ha='center', zorder=5)
-    name_x = av_x + 0.062
-    ax.text(name_x, av_y, uname, color=WHITE, fontsize=15, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    badge_x = name_x + 0.0148 * len(uname) + 0.022
-    badge_w = 0.018 * 2 + 0.0116 * len("Trader")
-    ax.add_patch(FancyBboxPatch((badge_x, av_y - 0.028), badge_w, 0.056,
-        boxstyle="round,pad=0,rounding_size=0.022",
-        linewidth=0, facecolor=GOLD, zorder=4))
-    ax.text(badge_x + badge_w / 2, av_y, "Trader", color=INK, fontsize=11,
-            fontweight='bold', va='center', ha='center', zorder=5)
-
-    # ── chips row ─────────────────────────────────────────────────────────
-    def chip(x, y, label, *, fg=WHITE, border=CHIP_ED, fill=CHIP_BG, dot=None, dot_glyph=None):
+    # chip helper
+    def chip(x, y, label, *, fg=WHITE, border=CHIP_ED, fill=CHIP_BG,
+             dot=None, dot_glyph=None, logo=None, h=0.054, fs=12):
         pad   = 0.018
-        dot_w = 0.032 if dot else 0.0
-        tw    = 0.0138 * len(label)
+        has_badge = (logo is not None) or bool(dot)
+        dot_w = 0.030 if has_badge else 0.0
+        tw    = 0.0140 * len(label)
         w     = pad * 2 + dot_w + tw
-        h     = 0.054
         ax.add_patch(FancyBboxPatch((x, y), w, h,
             boxstyle="round,pad=0,rounding_size=0.020",
             linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
         tx = x + pad
-        if dot:
-            disc(x + pad + 0.013, y + h / 2, 0.013, facecolor=dot, edgecolor='none', zorder=5)
-            if dot_glyph:
-                ax.text(x + pad + 0.013, y + h / 2, dot_glyph, color=WHITE,
-                        fontsize=8, fontweight='bold', va='center', ha='center', zorder=6)
-            tx = x + pad + 0.032
-        ax.text(tx, y + h / 2, label, color=fg, fontsize=12, fontweight='bold',
-                va='center', ha='left', zorder=6)
-        return x + w + 0.016
+        if has_badge:
+            bxc = x + pad + 0.012
+            if logo is not None:
+                _draw_token_logo(ax, bxc, y + h / 2, 0.0155, logo, ASPECT, zorder=7)
+            else:
+                disc(bxc, y + h / 2, 0.013, facecolor=dot, edgecolor="none", zorder=5)
+                if dot_glyph:
+                    ax.text(bxc, y + h / 2, dot_glyph, color=WHITE,
+                            fontsize=8, fontweight="bold", va="center", ha="center", zorder=6)
+            tx = x + pad + 0.030
+        ax.text(tx, y + h / 2, label, color=fg, fontsize=fs, fontweight="bold",
+                va="center", ha="left", zorder=6)
+        return x + w + 0.015
 
-    cy = 0.618
-    nx = 0.072
-    nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=bias_color, fill=CHIP_BG)
-    nx = chip(nx, cy, base_sym, dot=BTC_ORANGE, dot_glyph=base_sym[:1])
-    nx = chip(nx, cy, f"{lev}x")
-    nx = chip(nx, cy, exch, dot=(BYBIT_GOLD if exch == 'BYBIT' else EX_BLUE),
-              dot_glyph=exch[:1])
+    sym_glyph = base_sym[:1] or "?"   # font lacks the bitcoin glyph; orange dot conveys it
+    _tok_logo = fetch_token_logo(base_sym)   # real logo (None -> lettered fallback)
 
-    # ── My Vault PnL headline ─────────────────────────────────────────────
-    ax.text(0.072, 0.540, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
-            va='center', ha='left', zorder=5)
+    # chips row 1: bias . asset . Trader badge
+    cy1 = 0.650
+    nx = 0.082
+    nx = chip(nx, cy1, f"{tri} {bias}", fg=bias_color, border=bias_color, fill=CHIP_BG)
+    nx = chip(nx, cy1, base_sym, dot=BTC_ORANGE, dot_glyph=sym_glyph, logo=_tok_logo)
+    nx = chip(nx, cy1, "Trader", fg=INK, border=GOLD, fill=GOLD)
 
+    # My Vault PnL headline
+    ax.text(0.082, 0.552, "My Vault PnL", color=SOFT, fontsize=13, fontweight="bold",
+            va="center", ha="left", zorder=5)
     if show_amount:
-        _td = ax.text(0.068, 0.438, dollar_str, color=accent, fontsize=46, fontweight='bold',
-                      va='center', ha='left', zorder=5)
+        _td = ax.text(0.078, 0.456, dollar_str, color=accent, fontsize=44, fontweight="bold",
+                      va="center", ha="left", zorder=5)
         fig.canvas.draw()
         _bb  = _td.get_window_extent(renderer=fig.canvas.get_renderer())
         _x_r = ax.transData.inverted().transform((_bb.x1, _bb.y0))[0]
-        ax.text(min(_x_r + 0.022, 0.62), 0.426, pct_str, color=accent, fontsize=20,
-                fontweight='bold', va='center', ha='left', zorder=5)
+        ax.text(min(_x_r + 0.020, 0.64), 0.444, pct_str, color=accent, fontsize=19,
+                fontweight="bold", va="center", ha="left", zorder=5)
     else:
-        ax.text(0.068, 0.438, pct_str, color=accent, fontsize=48, fontweight='bold',
-                va='center', ha='left', zorder=5)
+        ax.text(0.078, 0.456, pct_str, color=accent, fontsize=46, fontweight="bold",
+                va="center", ha="left", zorder=5)
 
-    # ── footer: four price columns ────────────────────────────────────────
-    fy = 0.148
+    # chips row 2: asset . leverage . exchange
+    cy2 = 0.322
+    nx = 0.082
+    nx = chip(nx, cy2, base_sym, dot=BTC_ORANGE, dot_glyph=sym_glyph, logo=_tok_logo, h=0.050, fs=11)
+    nx = chip(nx, cy2, f"{lev}x", h=0.050, fs=11)
+    nx = chip(nx, cy2, exch, dot=(BYBIT_GOLD if exch == "BYBIT" else EX_BLUE),
+              dot_glyph=exch[:1], h=0.050, fs=11)
+
+    # staggered footer prices (diagonal, following the curve, like the mockup)
     _foot = [
-        ("Entry Price",   _fmt_price(entry),      WHITE),
-        ("Exit Price",    _fmt_price(exit_price),  accent),
-        ("Current Price", _fmt_price(cur),         WHITE),
-        ("Duration",      peak_dur,                WHITE),
+        ("Entry Price",   _fmt_price(entry),     WHITE,  0.086, 0.232),
+        ("Exit Price",    _fmt_price(exit_price), accent, 0.312, 0.196),
+        ("Current Price", _fmt_price(cur),        WHITE,  0.548, 0.158),
+        ("Duration",      peak_dur,               WHITE,  0.782, 0.120),
     ]
-    _col_x = [0.072, 0.296, 0.520, 0.756]
-    for (_lbl, _val, _col), _fx in zip(_foot, _col_x):
-        ax.text(_fx, fy + 0.042, _lbl, color=GRAY, fontsize=10, fontweight='bold',
-                va='center', ha='left', zorder=5)
-        ax.text(_fx, fy - 0.012, _val, color=_col, fontsize=14, fontweight='bold',
-                va='center', ha='left', zorder=5)
+    for _lbl, _val, _col, _fx, _fy in _foot:
+        ax.text(_fx, _fy + 0.040, _lbl, color=GRAY, fontsize=10, fontweight="bold",
+                va="center", ha="left", zorder=5)
+        ax.text(_fx, _fy - 0.008, _val, color=_col, fontsize=14, fontweight="bold",
+                va="center", ha="left", zorder=5)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
