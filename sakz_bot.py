@@ -147,7 +147,7 @@ def _logo_bytes_to_rgba(data, px=128):
     im.putalpha(alpha)
     return _np.asarray(im)
 
-def fetch_token_logo(symbol, *, timeout=4):
+def fetch_token_logo(symbol, *, timeout=3):
     """Return an RGBA numpy array of the token's real logo, or None."""
     try:
         base = str(symbol or "").upper().replace("/", "").replace("_", "")
@@ -1409,6 +1409,7 @@ def _safemode_store_signals(chat_id: int, signals: list):
 from concurrent.futures import ThreadPoolExecutor
 
 SCAN_EXECUTOR  = ThreadPoolExecutor(max_workers=3)   # max 3 simultaneous scans
+RENDER_EXECUTOR = ThreadPoolExecutor(max_workers=1)  # SAKZ_PERF_V1: serialize matplotlib (pyplot not thread-safe); keeps event loop free
 CACHE_TTL_SECS = 600                                  # 10 minutes — matches continuous_scan_job interval
 
 # Global scan cache — served to users who scan within TTL of last scan
@@ -1584,29 +1585,41 @@ def _load_best_params():
 # This is the single change that eliminates REST calls for price during tracking,
 # PnL updates, price alerts, and any other live-price read in the bot.
 
+_PRICE_CACHE = {}          # symbol -> (price, ts); short-TTL REST de-dupe
+_PRICE_CACHE_TTL = 3.0     # seconds; WS cache still short-circuits first
+
 def _get_live_price(symbol: str, exchange: str = '') -> float:
     """
-    WS-first price lookup. Returns float (0 on total failure).
+    WS-first price lookup with a short REST cache. Returns float (0 on failure).
     exchange hint: 'BYBIT' | 'BINANCE' | 'MEXC' — used only for REST fallback.
     """
-    # 1. Try WebSocket cache (sub-millisecond, no network)
+    # 1. WebSocket cache (sub-millisecond, no network)
     cached = ws_price(symbol)
     if cached and cached > 0:
         return cached
-
-    # 2. REST fallback — ordered by preference / availability
+    # 2. Short-TTL REST cache — avoids hammering REST on repeated calls
+    _now = time.time()
+    _entry = _PRICE_CACHE.get(symbol)
+    if _entry is not None and (_now - _entry[1]) < _PRICE_CACHE_TTL:
+        return _entry[0]
+    # 3. REST fallback — ordered by preference / availability
     exch = (exchange or '').upper()
+    price = 0
     if exch == 'BYBIT' or (not exch and sakz_exchanges.BYBIT_AVAILABLE is not False):
         p = bybit_get_current_price(symbol)
         if p and p > 0:
-            return p
-    if exch == 'BINANCE' or (not exch and sakz_exchanges.BINANCE_AVAILABLE):
+            price = p
+    if not price and (exch == 'BINANCE' or (not exch and sakz_exchanges.BINANCE_AVAILABLE)):
         p = binance_get_current_price(symbol)
         if p and p > 0:
-            return p
-    # MEXC always last (no futures ticker endpoint as fast)
-    p = mexc_get_current_price(symbol)
-    return p if p else 0
+            price = p
+    if not price:
+        p = mexc_get_current_price(symbol)
+        if p and p > 0:
+            price = p
+    if price > 0:
+        _PRICE_CACHE[symbol] = (price, _now)
+    return price
 
 
 def _get_live_funding(symbol: str, exchange: str = '') -> float:
@@ -6805,6 +6818,43 @@ async def prompt_pnl_display_mode(update, context):
     )
 
 
+class _PnLPriceUnavailable(Exception):
+    """Raised inside the render worker when no live price is available."""
+    pass
+
+
+def _build_pnl_card_png(signal, leverage, capital, username, style):
+    """Blocking PnL pipeline (live price + chart closes + excursions + matplotlib
+    render). Runs in RENDER_EXECUTOR so the asyncio event loop is never blocked
+    while a card image is generated."""
+    current = _get_live_price(signal['symbol'], signal.get('exchange', ''))
+    if not current or current <= 0:
+        raise _PnLPriceUnavailable()
+    closes = _fetch_pnl_chart_closes(signal, current)
+    fav_raw, fav_at, adv_raw, adv_at = _compute_peak_excursions(signal, current)
+    _fav = fav_raw if fav_raw is not None else 0.0
+    up_flag = (_fav * (leverage or 1)) >= 0
+    if style == 1:
+        return render_pnl_card_flat_v2(signal, current, leverage, capital, closes,
+                                       peak_raw_pct=fav_raw, peak_at=fav_at,
+                                       peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                       username=username, out_scale=2.0)
+    if style == 2:
+        return render_pnl_card_tablet_v3(signal, current, leverage, capital, closes,
+                                         peak_raw_pct=fav_raw, peak_at=fav_at,
+                                         peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                         username=username, out_scale=2.0)
+    flat = render_pnl_card_image(signal, current, leverage, capital, closes,
+                                 peak_raw_pct=fav_raw, peak_at=fav_at,
+                                 peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                 username=username, out_scale=2.0)
+    try:
+        return compose_3d_card(flat, up=up_flag)
+    except Exception as _e3d:
+        logger.warning("3D compose failed, using flat card: %s", _e3d)
+        return flat
+
+
 async def send_pnl_image_card(update, context):
     """Fetch live price, render the branded PnL card image, and send it with buttons."""
     msg = update.effective_message
@@ -6824,40 +6874,15 @@ async def send_pnl_image_card(update, context):
     except Exception:
         username = "Trader"
 
-    current = _get_live_price(signal['symbol'], signal.get('exchange', ''))
-    if not current or current <= 0:
+    _style = int(context.user_data.get('pnl_card_style', 0)) % 3
+    loop = asyncio.get_running_loop()
+    try:
+        png = await loop.run_in_executor(
+            RENDER_EXECUTOR,
+            _build_pnl_card_png, signal, leverage, capital, username, _style)
+    except _PnLPriceUnavailable:
         await msg.reply_text("⚠️ Couldn't fetch the live price right now. Try again in a moment.")
         return
-
-    try:
-        closes = _fetch_pnl_chart_closes(signal, current)
-        fav_raw, fav_at, adv_raw, adv_at = _compute_peak_excursions(signal, current)
-        _fav = fav_raw if fav_raw is not None else 0.0
-        up_flag = (_fav * (leverage or 1)) >= 0
-        # PnL has three alternating displays. Style 0 = 3D stacked-deck vault card;
-        # style 1 = flat 'terminal' card; style 2 = glass tablet card.
-        # Refresh cycles through all three.
-        _style = int(context.user_data.get('pnl_card_style', 0)) % 3
-        if _style == 1:
-            png = render_pnl_card_flat_v2(signal, current, leverage, capital, closes,
-                                          peak_raw_pct=fav_raw, peak_at=fav_at,
-                                          peak_loss_pct=adv_raw, peak_loss_at=adv_at,
-                                          username=username, out_scale=2.0)
-        elif _style == 2:
-            png = render_pnl_card_tablet_v3(signal, current, leverage, capital, closes,
-                                            peak_raw_pct=fav_raw, peak_at=fav_at,
-                                            peak_loss_pct=adv_raw, peak_loss_at=adv_at,
-                                            username=username, out_scale=2.0)
-        else:
-            flat = render_pnl_card_image(signal, current, leverage, capital, closes,
-                                         peak_raw_pct=fav_raw, peak_at=fav_at,
-                                         peak_loss_pct=adv_raw, peak_loss_at=adv_at,
-                                         username=username, out_scale=2.0)
-            try:
-                png = compose_3d_card(flat, up=up_flag)
-            except Exception as _e3d:
-                logger.warning("3D compose failed, using flat card: %s", _e3d)
-                png = flat
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
