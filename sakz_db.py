@@ -437,9 +437,6 @@ def db_save_scan(results):
     conn = db_connect()
     c    = conn.cursor()
     now  = datetime.now().isoformat()
-    # keep only last 500 signals total to avoid bloat
-    c.execute("DELETE FROM scan_results WHERE id NOT IN "
-              "(SELECT id FROM scan_results ORDER BY id DESC LIMIT 500)")
     for r in results:
         data = {k: v for k, v in r.items()
                 if k not in ('scan_time', 'leverage') and not callable(v)}
@@ -447,6 +444,13 @@ def db_save_scan(results):
             data['leverage'] = r['leverage']
         try:
             data['scan_time_str'] = r['scan_time'].isoformat() if isinstance(r.get('scan_time'), datetime) else now
+            # ── ONE ACTIVE CALL PER PAIR ──
+            # A pair may only have a single live call at a time. Saving a fresh
+            # signal (e.g. BTC LONG now) first removes any previous call on the
+            # same pair (e.g. BTC SHORT from an hour ago) so /pnl can never
+            # collide two opposite-direction calls for the same symbol.
+            c.execute("DELETE FROM scan_results WHERE exchange=? AND symbol=?",
+                      (r['exchange'], r['symbol']))
             c.execute(
                 "INSERT INTO scan_results (scan_time,exchange,symbol,bias,confidence,score,data_json) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -455,6 +459,9 @@ def db_save_scan(results):
             )
         except Exception as e:
             logger.warning("db save scan_result failed for %s: %s", r.get('symbol', '?'), e)
+    # Safety net only — one row per live pair already keeps this table small.
+    c.execute("DELETE FROM scan_results WHERE id NOT IN "
+              "(SELECT id FROM scan_results ORDER BY id DESC LIMIT 250)")
     conn.commit()
     conn.close()
 

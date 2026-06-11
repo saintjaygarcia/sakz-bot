@@ -395,7 +395,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── Gainers log ──────────────────────────────────────────────────────────────────
+# ── Gainers log ──────────���───────────────────────────────────────────────────────
 
 
 
@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�����������─────────────────────────────────��────
+# ── /pro Detection engine ────────────────���─������������������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -776,7 +776,7 @@ def _pro_format_uptrend_card(uptrend: dict, rank: int = 1) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {exch} | {sym}\n"
         f"\n"
-        f"🟢 BIAS: LONG (trend confirmed)\n"
+        f"��� BIAS: LONG (trend confirmed)\n"
         f"⭐ AVG DAILY GAIN: {bar} +{avg:.1f}%/day\n"
         f"\n"
         f"⏱ STREAK DURATION: {lbl}\n"
@@ -1117,7 +1117,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ────────────────────────────────────────────────────────────
+# ── /pro Command handler ───────────────────────────────────────������───���������─────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1125,7 +1125,7 @@ def _pro_full_command_guide() -> str:
     and secret commands are intentionally excluded."""
     return (
         "📖  SAKZ BOT — FULL COMMAND GUIDE\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━\n"
         "Everything the bot can do, in one place.\n\n"
         "���  SCANNING\n"
         "/scan                Full market scan (4H, top pairs)\n"
@@ -1170,7 +1170,7 @@ def _pro_full_command_guide() -> str:
         "/unalert BTCUSDT     Remove an alert\n"
         "/watch BTCUSDT 7     Watchlist — auto-notify on signal\n"
         "/unwatch BTCUSDT     Remove from watchlist\n"
-        "/autoscan            Toggle periodic auto-scan\n"
+        "/autoscan [tf]       Auto-scan on/off — e.g. /autoscan 4h, /autoscan off\n"
         "/broadcast on|off    Toggle signal auto-posting here\n"
         "/safemode            Toggle automatic dying-trend alerts\n\n"
         "🔬  PRO ALERT SUITE\n"
@@ -1372,7 +1372,7 @@ def get_chat_lock(chat_id):
 # ML MODEL AVAILABILITY FLAGS
 # Graceful fallback — bot runs normally if these
 # optional modules are not installed.
-# ─────────────────────────────────────────────
+# ───────────────────────────────────��─────────
 try:
     from xgboost_train import predict_signal as xgb_predict_signal, train as xgb_train, model_meta as xgb_model_meta
     _XGB_AVAILABLE = True
@@ -1430,7 +1430,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ─────────────────────────────────────────────
+# ────────────────────────────────────���─────���──
 try:
     from sakz_ws import (
         start_ws,
@@ -2194,7 +2194,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • EMA20 / EMA50 overlaid on candles
 #   • Bollinger Bands (shaded)
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
-#   • Volume bars    (panel 2, coloured by candle direction)
+#   ��� Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
 # ──���─���────────────────────────────────────────
 def generate_chart(signal, df4h):
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ─────────────────────────������─���─���──────────────
+# ───────────���───────────���─������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2414,6 +2414,19 @@ def analyze_mexc(symbol):
         return None
 
 
+def _display_exchanges() -> list:
+    """Single source-of-truth exchange policy for ALL scan output.
+
+    Bybit is the only venue we display. MEXC is used *only* as a fallback
+    when Bybit's API is unavailable. Binance is never a display source.
+    Restricting output to one venue means each pair appears exactly once
+    (no MEXC/BYBIT/BINANCE triplicates in /scan, /tg, /tl, /pnl, etc.).
+    """
+    if sakz_exchanges.BYBIT_AVAILABLE is not False:
+        return ["BYBIT"]
+    return ["MEXC"]
+
+
 def run_mid_scan(rank_from=51, rank_to=200):
     """
     CEILING #6 — Mid-tier universe scan.
@@ -2453,17 +2466,17 @@ def run_mid_scan(rank_from=51, rank_to=200):
         r['tier'] = 'MID'   # tag so UI can badge these signals
         results.append(r)
 
-    for sym in bybit_get_mid_symbols(rank_from, rank_to):
-        _process(analyze_bybit(sym))
-        time.sleep(0.15)
-
-    for sym in mexc_get_mid_symbols(rank_from, rank_to):
-        _process(analyze_mexc(sym))
-        time.sleep(0.15)
-
-    for sym in binance_get_mid_symbols(rank_from, rank_to):
-        _process(analyze_binance(sym))
-        time.sleep(0.15)
+    # ── SINGLE DISPLAY VENUE ── scan only the active venue (Bybit, or MEXC
+    # when Bybit is down) so a pair never appears more than once.
+    _venue = _display_exchanges()[0]
+    if _venue == 'BYBIT':
+        for sym in bybit_get_mid_symbols(rank_from, rank_to):
+            _process(analyze_bybit(sym))
+            time.sleep(0.15)
+    else:
+        for sym in mexc_get_mid_symbols(rank_from, rank_to):
+            _process(analyze_mexc(sym))
+            time.sleep(0.15)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
@@ -2493,7 +2506,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ═══════════════════════��══��══����══����══����══════════════����═══════════════════════
+# ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -2677,27 +2690,24 @@ def run_full_scan():
         cutoff = datetime.now() - timedelta(hours=24)
         state.price_history[key] = [p for p in state.price_history[key] if p['time'] > cutoff]
 
-    bybit_syms   = bybit_get_top_symbols(50)
-    mexc_syms    = mexc_get_top_symbols(50)
-    binance_syms = binance_get_top_symbols(50) if sakz_exchanges.BINANCE_AVAILABLE else []
-
-    # Warm volume cache with a single ticker request per exchange
-    _warm_vol_cache(set(bybit_syms),   'BYBIT')
-    _warm_vol_cache(set(mexc_syms),    'MEXC')
-    if binance_syms:
-        _warm_vol_cache(set(binance_syms), 'BINANCE')
-
-    for sym in bybit_syms:
-        _process(analyze_bybit(sym), 'BYBIT')
-        time.sleep(0.2)
-
-    for sym in mexc_syms:
-        _process(analyze_mexc(sym), 'MEXC')
-        time.sleep(0.2)
-
-    for sym in binance_syms:
-        _process(analyze_binance(sym), 'BINANCE')
-        time.sleep(0.2)
+    # ── SINGLE DISPLAY VENUE ──
+    # Only ONE exchange feeds the scan output. Bybit is primary; MEXC is the
+    # fallback used only when Bybit's API is down. Binance is never a display
+    # source. This guarantees each pair appears exactly once — no
+    # MEXC/BYBIT/BINANCE triplicates in /scan, /tg, /tl or /pnl.
+    _venue = _display_exchanges()[0]
+    if _venue == 'BYBIT':
+        bybit_syms = bybit_get_top_symbols(50)
+        _warm_vol_cache(set(bybit_syms), 'BYBIT')
+        for sym in bybit_syms:
+            _process(analyze_bybit(sym), 'BYBIT')
+            time.sleep(0.2)
+    else:
+        mexc_syms = mexc_get_top_symbols(50)
+        _warm_vol_cache(set(mexc_syms), 'MEXC')
+        for sym in mexc_syms:
+            _process(analyze_mexc(sym), 'MEXC')
+            time.sleep(0.2)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
@@ -2817,22 +2827,6 @@ def run_full_scan():
             "Correlation gate: dropped %d conflicting over-correlated signal(s) "
             "(kept %d optimum)", _dropped_corr, len(results)
         )
-
-    # FIX #1 — Single display venue: if the same base symbol appears on multiple
-    # exchanges keep only the highest-confidence instance (results already sorted
-    # best-first so the first occurrence wins).  Prevents /scan, /tg, /tl, /pnl
-    # from showing BTCUSDT three times — once per exchange.
-    _seen_syms_full = set()
-    _deduped_full   = []
-    for _r in results:
-        _base = _r['symbol'].replace('_USDT', 'USDT')
-        if _base not in _seen_syms_full:
-            _seen_syms_full.add(_base)
-            _deduped_full.append(_r)
-    _dropped_venue = len(results) - len(_deduped_full)
-    if _dropped_venue:
-        logger.info("Venue dedup: dropped %d cross-exchange duplicate(s)", _dropped_venue)
-    results = _deduped_full
 
     state.last_scan_results = results
     state.last_scan_time    = datetime.now()
@@ -3306,36 +3300,30 @@ async def check_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
                 c2.execute(f"UPDATE signal_outcomes SET {set_clause} WHERE id=?",
                            list(updates.values()) + [row['id']])
                 conn2.commit()
-
-                # FIX #6 — scan history cleanup: once a signal is fully resolved
-                # (T1/SL hit or expired) delete its scan_results row so stale
-                # finished signals don't accumulate and /pnl only shows live calls.
-                _resolved_outcome = updates.get('outcome', '')
-                if _resolved_outcome and _resolved_outcome != 'pending':
-                    _sig_id = row.get('signal_id')
-                    if _sig_id:
-                        try:
-                            c2.execute("DELETE FROM scan_results WHERE id=?", (_sig_id,))
-                            conn2.commit()
-                            logger.debug(
-                                "Scan history cleanup: deleted scan_results id=%s (%s %s → %s)",
-                                _sig_id, exchange, symbol, _resolved_outcome
-                            )
-                        except Exception as _del_err:
-                            logger.debug("scan_results cleanup failed id=%s: %s", _sig_id, _del_err)
-
                 conn2.close()
+
+            # ── DONE → REMOVE FROM SCAN HISTORY ──
+            # Once a call is resolved (target hit, SL hit, or expired at 48h),
+            # drop its scan_results row so /pnl only ever reflects a live call
+            # and never serves a stale, already-finished signal for this pair.
+            final_outcome = updates.get('outcome')
+            if final_outcome and final_outcome != 'pending':
+                try:
+                    conn3 = db_connect()
+                    conn3.execute(
+                        "DELETE FROM scan_results WHERE exchange=? AND symbol=? AND bias=?",
+                        (exchange, symbol, bias),
+                    )
+                    conn3.commit()
+                    conn3.close()
+                except Exception as e:
+                    logger.warning("scan_results cleanup failed for %s %s: %s", exchange, symbol, e)
 
             if outcome != 'pending':
                 conf_tag = {1: 'confirmed', 0: 'missed-entry', -1: 'legacy'}
                 logger.info("Outcome resolved: %s %s %s → %s (best=%s, sl_after=%s, entry=%s)",
                             exchange, symbol, bias, outcome, best_tgt, sl_after,
                             conf_tag.get(entry_confirmed, '?'))
-                # FIX #2 — record SL hits so autoscan suppresses re-pushes for 24h
-                if outcome == 'sl_hit':
-                    _sl_key = f"{exchange}_{symbol}_{bias}"
-                    _autoscan_record_sl(_sl_key)
-                    logger.debug("Autoscan SL recorded for %s", _sl_key)
 
         except Exception as e:
             logger.warning("Outcome check error for %s: %s", row['symbol'], e)
@@ -4166,43 +4154,7 @@ _autoscan_awaiting_tf: set = set()  # chat_ids that have been shown the TF menu 
 _autoscan_sent: dict = {}
 _AUTOSCAN_COOLDOWN_H = 4    # hours before the same signal can fire again
 _AUTOSCAN_MIN_CONF   = 8    # minimum confidence to push a signal
-
-# FIX #2 — SL suppression: track stopped-out signals for 24 h so autoscan
-# doesn't re-push the same setup every cycle after a stop-loss hit.
-# Key: "EXCHANGE_SYMBOL_BIAS"  Value: datetime when SL was recorded
-_autoscan_recently_stopped: dict = {}
-_AUTOSCAN_SL_BLOCK_H = 24   # block re-surface for 24 hours after SL hit
-
-
-def _autoscan_record_sl(key: str) -> None:
-    """Record a stop-loss hit for *key* and prune stale entries.
-
-    Args:
-        key: Dedup key in the form ``"EXCHANGE_SYMBOL_BIAS"``.  After this call
-            the key will be blocked from re-surfacing for
-            ``_AUTOSCAN_SL_BLOCK_H`` hours.
-    """
-    _autoscan_recently_stopped[key] = datetime.now()
-    cutoff: datetime = datetime.now() - timedelta(hours=_AUTOSCAN_SL_BLOCK_H)
-    for k in list(_autoscan_recently_stopped):
-        if _autoscan_recently_stopped[k] < cutoff:
-            del _autoscan_recently_stopped[k]
-
-
-def _autoscan_is_sl_blocked(key: str) -> bool:
-    """Return ``True`` if *key* hit its SL within the last 24 hours.
-
-    Args:
-        key: Dedup key in the form ``"EXCHANGE_SYMBOL_BIAS"``.
-
-    Returns:
-        ``True`` when the key is in the SL-suppression window and should be
-        skipped by autoscan; ``False`` otherwise.
-    """
-    stopped_at: datetime | None = _autoscan_recently_stopped.get(key)
-    if stopped_at is None:
-        return False
-    return (datetime.now() - stopped_at).total_seconds() < _AUTOSCAN_SL_BLOCK_H * 3600
+_AUTOSCAN_SL_SUPPRESS_H = 24   # don't re-push a setup that hit SL within this window
 
 # FIX #RESTART-FLOOD — _autoscan_sent lives in memory and is wiped on every
 # restart.  Without a guard, the first continuous_scan_job tick after a restart
@@ -4247,6 +4199,36 @@ def _autoscan_mark_sent(key: str):
             del _autoscan_sent[k]
 
 
+def _autoscan_recently_stopped(exch: str, sym: str, bias: str) -> bool:
+    """
+    FIX #SL-SUPPRESS — Return True if this exact setup (exchange + symbol +
+    bias) has hit its stop-loss recently.
+
+    Autoscan re-detects the same pairs every cycle. Once a call gets stopped
+    out, re-surfacing it within a short window just spams subscribers and drags
+    the win streak / win-rate down with the same loser being logged again and
+    again. Suppressing recently stopped-out setups keeps the streak clean and
+    lets a pair re-qualify only after conditions have had time to genuinely
+    change (outside the suppression window).
+    """
+    try:
+        cutoff = (datetime.now() - timedelta(hours=_AUTOSCAN_SL_SUPPRESS_H)).isoformat()
+        conn = db_connect()
+        c    = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM signal_outcomes "
+            "WHERE exchange=? AND symbol=? AND bias=? "
+            "AND outcome='sl_hit' AND scan_time >= ? LIMIT 1",
+            (exch, sym, bias, cutoff),
+        )
+        stopped = c.fetchone() is not None
+        conn.close()
+        return stopped
+    except Exception as e:
+        logger.warning("autoscan SL-suppress check failed for %s %s %s: %s", exch, sym, bias, e)
+        return False
+
+
 async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 10 minutes.
@@ -4276,9 +4258,11 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if not _autoscan_is_fresh(dedup_key):
             continue
 
-        # FIX #2 — SL suppression: skip signals that hit stop-loss in last 24 h
-        if _autoscan_is_sl_blocked(dedup_key):
-            logger.debug("Autoscan SL-blocked (24h window): %s", dedup_key)
+        # FIX #SL-SUPPRESS — don't keep re-surfacing a setup that already hit
+        # its stop-loss recently. Re-pushing a freshly stopped-out pair spams
+        # subscribers and pollutes the win streak with the same repeat loser.
+        if _autoscan_recently_stopped(exch, sym, bias):
+            logger.debug("AUTOSCAN SL-suppress: skipping %s %s %s (recent stop-out)", exch, sym, bias)
             continue
 
         _autoscan_mark_sent(dedup_key)
@@ -4398,6 +4382,46 @@ async def autoscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
 
+    # ── Direct timeframe argument — no buttons needed ──
+    # e.g. /autoscan 4h | /autoscan 15m | /autoscan always | /autoscan off
+    if context.args:
+        arg = str(context.args[0]).strip().lower()
+
+        if arg in ('off', 'stop', 'disable', 'none'):
+            auto_scan_subscribers.pop(chat_id, None)
+            db_autoscan_remove(chat_id)
+            _autoscan_awaiting_tf.discard(chat_id)
+            await update.message.reply_text(
+                "🔕 Auto-scan *OFF*. Use /autoscan to turn back on.",
+                parse_mode='Markdown',
+            )
+            return
+
+        if arg in ('always', 'all', 'any', 'on'):
+            tf_pref = None
+        else:
+            tf_pref = _parse_tf_arg(arg)
+            if not tf_pref:
+                await update.message.reply_text(
+                    f"❓ `{arg}` isn't a recognised timeframe.\n"
+                    f"Try: `/autoscan 15m`, `/autoscan 1h`, `/autoscan 4h`, "
+                    f"`/autoscan 1d`, `/autoscan always`, or `/autoscan off`.",
+                    parse_mode='Markdown',
+                )
+                return
+
+        tf_label = _tf_display(tf_pref) if tf_pref else "All timeframes"
+        auto_scan_subscribers[chat_id] = tf_pref
+        db_autoscan_set(chat_id, tf_pref)
+        _autoscan_awaiting_tf.discard(chat_id)
+        await update.message.reply_text(
+            f"✅ *Auto-scan ON!*  Receiving *{tf_label}* signals.\n\n"
+            f"Change anytime with `/autoscan <tf>` (e.g. `/autoscan 1h`) "
+            f"or stop with `/autoscan off`.",
+            parse_mode='Markdown',
+        )
+        return
+
     if chat_id in auto_scan_subscribers:
         # Already ON — show status + options
         tf_pref    = auto_scan_subscribers[chat_id]
@@ -4427,7 +4451,8 @@ async def autoscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• *15M* — 15-minute signals only (scalp/intraday)\n"
             "• *4H* — 4-hour signals only (swing trades)\n"
             "• *1D* — daily signals only (position trades)\n\n"
-            "Or *reply with a custom timeframe* — e.g. `1h`, `30m`, `1w`",
+            "💡 *No buttons needed* — just type it directly, e.g. "
+            "`/autoscan 4h`, `/autoscan 15m`, `/autoscan always`, or `/autoscan off`.",
             parse_mode='Markdown',
             reply_markup=keyboard,
         )
@@ -4676,7 +4701,7 @@ def format_signal_primary(r, rank):
       📊 Token: XMRUSDT
       🟢 Direction: LONG
       💰 Entry: $x – $x
-      ⚡️ Leverage: 8x
+      ��️ Leverage: 8x
       📐 R:R: 1:2.3
       🎯 TP1: $x  (+X% profit) 💰
       🎯 TP2: $x
@@ -5034,7 +5059,7 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────��─────────────
 # TRADE REMINDER JOB
 # ───────────────────��─────────────────────────
 async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
@@ -5109,7 +5134,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard)
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────���─────────────
 # CONVERSATION: PICK → REMINDER → INTERVAL
 # ─────────────────────────────────────────────
 async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5520,7 +5545,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ───────────────────────────────────────��───��─
+# ───────────────────────────────��─────��─��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -5739,9 +5764,10 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
     exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
 
-    # exit price: peak price if it ran into profit past entry, else current price
-    # FIX #4 — use `is not None` so fav_raw == 0.0 doesn't fall through to `cur`
-    if entry > 0 and fav_raw is not None and fav_raw > 0:
+    # exit price ALWAYS reflects the same peak (favourable) move the headline %
+    # is built from, so Entry -> Exit is internally consistent with 'My Vault PnL'.
+    # (current price is shown separately in its own column.)
+    if entry > 0 and fav_raw is not None:
         exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
     else:
         exit_price = cur or entry
@@ -5870,28 +5896,316 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Entry / Exit / Current Price + Duration --------------------
-    fy = 0.180
-    # Compute duration label from signal scan_time
-    _scan_t_raw = signal.get('scan_time') if isinstance(signal, dict) else None
-    _duration_label = _fmt_held_for(_scan_t_raw) if _scan_t_raw else "\u2014"
+    # ---- footer: Duration + balanced Entry / Exit / Current price row ----
+    # Time it took to run from the signal (entry) to the peak (exit) price.
+    def _fmt_dur(a, b):
+        try:
+            if a is None or b is None:
+                return "\u2014"
+            if isinstance(a, str):
+                a = datetime.fromisoformat(a)
+            if isinstance(b, str):
+                b = datetime.fromisoformat(b)
+            if not isinstance(a, datetime) or not isinstance(b, datetime):
+                return "\u2014"
+            a = a.replace(tzinfo=None)
+            b = b.replace(tzinfo=None)
+            secs = max(int((b - a).total_seconds()), 0)
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                return f"{days}d {hours}h {mins}m"
+            if hours > 0:
+                return f"{hours}h {mins}m"
+            return f"{mins}m"
+        except Exception:
+            return "\u2014"
 
-    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
+    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
+
+    # Duration (first call -> peak) sits under the headline, left-aligned & lit.
+    ax.text(0.080, 0.312, "Duration", color=GRAY, fontsize=10.5, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
+    ax.text(0.080, 0.268, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
+
+    # Three balanced, evenly-spaced price columns kept inside the lit face so
+    # they read as one clean row on the tilted card (no cascade off the edge).
+    fy = 0.168
+    _foot = [
+        ("Entry Price",   _fmt_price(entry),      WHITE),
+        ("Exit Price",    _fmt_price(exit_price),  accent),
+        ("Current Price", _fmt_price(cur),         WHITE),
+    ]
+    _col_x = [0.080, 0.290, 0.500]
+    for (_lbl, _val, _col), _fx in zip(_foot, _col_x):
+        ax.text(_fx, fy + 0.030, _lbl, color=GRAY, fontsize=10.5, fontweight='bold',
+                va='center', ha='left', zorder=5)
+        ax.text(_fx, fy - 0.014, _val, color=_col, fontsize=14, fontweight='bold',
+                va='center', ha='left', zorder=5)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_pnl_card_flat_v2(signal, current_price, leverage, capital=None, closes=None,
+                            peak_raw_pct=None, peak_at=None, peak_loss_pct=None, peak_loss_at=None,
+                            username=None, out_scale=1.0):
+    """Render the flat 'terminal' SAKZ PnL card (PNG bytes) -- the second display.
+
+    Clean grid face, nested right-pointing chevrons, a 'MY VAULT PNL' headline
+    with a percentage badge, and a single Entry / Exit / Current / Duration
+    footer row. Inputs and value semantics mirror render_pnl_card_image so the
+    two card styles always show identical numbers; only the look differs.
+    """
+    import io
+    import numpy as np
+    from matplotlib.patches import FancyBboxPatch, Polygon, Ellipse
+
+    # ---- palette (sampled from the reference card) ----------------------
+    BG        = "#07080A"
+    CARD      = "#080D0B"
+    CARD_ED   = "#1E3A2B"
+    CHIP_BG   = "#0C140F"
+    CHIP_ED   = "#24352B"
+    GRID      = "#103A26"
+    GREEN     = "#21F07A"
+    GREEN_DK  = "#0E3D1E"
+    RED       = "#F0556B"
+    RED_DK    = "#3D1119"
+    WHITE     = "#F4F8F5"
+    SOFT      = "#9AA6A0"
+    GRAY      = "#6E7A74"
+    GOLD      = "#E7B53C"
+    INK       = "#0A0D0B"
+    BTC_ORANGE = "#F7931A"
+    BYBIT_GOLD = "#F7A600"
+    EX_BLUE    = "#2E6BFF"
+
+    ASPECT = 648.0 / 371.0
+    W_IN = 10.24
+    H_IN = W_IN / ASPECT
+    fig = plt.figure(figsize=(W_IN, H_IN), dpi=100, facecolor=BG)
+    ax  = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+
+    def disc(x, y, r, **kw):
+        ax.add_patch(Ellipse((x, y), width=2 * r / ASPECT, height=2 * r, **kw))
+
+    # ---- derive values (same logic as the vault card) -------------------
+    brand = os.environ.get("BOT_NAME", "Sakz")
+    entry = float(signal.get('price') or 0) or float(current_price or 0)
+    bias  = str(signal.get('bias', 'LONG')).upper()
+    is_long = bias == 'LONG'
+    cur   = float(current_price or 0)
+    lev   = int(leverage or 1)
+
+    if entry > 0 and cur > 0:
+        cur_raw = ((cur - entry) / entry * 100) if is_long else ((entry - cur) / entry * 100)
+    else:
+        cur_raw = 0.0
+    fav_raw = peak_raw_pct if peak_raw_pct is not None else cur_raw
+    if fav_raw < cur_raw:
+        fav_raw = cur_raw
+    peak_lev = fav_raw * lev
+    if peak_lev < -100.0:
+        peak_lev = -100.0
+
+    up = peak_lev >= 0
+    if not up:
+        GREEN, GREEN_DK = RED, RED_DK
+    accent = GREEN
+    bias_color = "#21F07A" if is_long else "#F0556B"
+    tri = "\u25B2" if is_long else "\u25BC"
+
+    raw_sym  = str(signal.get('symbol', '')).upper().replace('/', '').replace('_', '')
+    base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
+    exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
+
+    if entry > 0 and fav_raw is not None:
+        exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
+    else:
+        exit_price = cur or entry
+
+    def _fmt_price(p):
+        if not p:
+            return "\u2014"
+        p = float(p)
+        if p >= 1000:
+            return f"{p:,.2f}"
+        if p >= 1:
+            return f"{p:,.4f}"
+        return f"{p:.6f}"
+
+    pct_str = f"{peak_lev:+.2f}%"
+    show_amount = (capital is not None) and (capital > 0)
+    if show_amount:
+        dval = capital * peak_lev / 100.0
+        if abs(dval) >= 100:
+            headline = f"{'+' if dval >= 0 else '-'}${abs(dval):,.0f}"
+        else:
+            headline = f"{'+' if dval >= 0 else '-'}${abs(dval):,.2f}"
+    else:
+        headline = pct_str
+
+    uname = str(username or signal.get('username') or "Trader").lstrip('@')
+    if len(uname) > 16:
+        uname = uname[:15] + "\u2026"
+
+    # ---- card face ------------------------------------------------------
+    ax.add_patch(FancyBboxPatch((0.012, 0.022), 0.976, 0.956,
+        boxstyle="round,pad=0,rounding_size=0.05",
+        linewidth=1.4, edgecolor=CARD_ED, facecolor=CARD, zorder=1))
+
+    clip = FancyBboxPatch((0.012, 0.022), 0.976, 0.956,
+        boxstyle="round,pad=0,rounding_size=0.05", transform=ax.transData)
+    for gx in np.arange(0.05, 0.99, 0.0455):
+        ln, = ax.plot([gx, gx], [0.03, 0.97], color=GRID, lw=0.6, alpha=0.5, zorder=1)
+        ln.set_clip_path(clip)
+    for gy in np.arange(0.06, 0.97, 0.08):
+        ln, = ax.plot([0.02, 0.98], [gy, gy], color=GRID, lw=0.6, alpha=0.5, zorder=1)
+        ln.set_clip_path(clip)
+
+    gx = np.linspace(0, 1, 240); gy = np.linspace(0, 1, 240)
+    GXX, GYY = np.meshgrid(gx, gy)
+    glow = np.zeros_like(GXX)
+    for cxp, cyp, s in [(0.92, 0.92, 0.16), (0.86, 0.10, 0.10), (0.07, 0.55, 0.06)]:
+        d = np.sqrt((GXX - cxp) ** 2 + (GYY - cyp) ** 2)
+        glow = np.maximum(glow, np.clip(s - d * 0.32, 0, s))
+    rgba = np.zeros((glow.shape[0], glow.shape[1], 4))
+    if up:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.13, 0.94, 0.48
+    else:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.94, 0.33, 0.42
+    rgba[..., 3] = glow * 2.2
+    im = ax.imshow(rgba, extent=[0.0, 1.0, 0.0, 1.0], aspect='auto', origin='lower',
+                   zorder=1, interpolation='bilinear')
+    im.set_clip_path(clip)
+
+    # ---- nested right chevrons (the >> arrow) ---------------------------
+    chev_cx = 0.79
+    chev_cy = 0.56
+    for k in range(3):
+        bx = chev_cx + k * 0.052
+        h = 0.135
+        w = 0.052
+        alpha = [0.9, 0.55, 0.28][k]
+        lw = [10, 9, 8][k]
+        ln, = ax.plot([bx - w, bx, bx - w],
+                      [chev_cy + h, chev_cy, chev_cy - h],
+                      color=accent, lw=lw, solid_capstyle='round',
+                      solid_joinstyle='round', alpha=alpha, zorder=2)
+        ln.set_clip_path(clip)
+
+    # ---- header: bias triangle + wordmark -------------------------------
+    hx, hy = 0.066, 0.875
+    if is_long:
+        ax.add_patch(Polygon([(hx - 0.012, hy - 0.018), (hx + 0.012, hy - 0.018), (hx, hy + 0.020)],
+            closed=True, facecolor=bias_color, edgecolor='none', zorder=5))
+    else:
+        ax.add_patch(Polygon([(hx - 0.012, hy + 0.018), (hx + 0.012, hy + 0.018), (hx, hy - 0.020)],
+            closed=True, facecolor=bias_color, edgecolor='none', zorder=5))
+    ax.text(hx + 0.026, hy, brand, color=WHITE, fontsize=21, fontweight='bold',
+            va='center', ha='left', zorder=5, fontstyle='italic')
+
+    # ---- avatar + username + TRADER badge -------------------------------
+    av_x, av_y = 0.085, 0.715
+    disc(av_x, av_y, 0.034, facecolor="#13251A", edgecolor=GREEN_DK, lw=1.2, zorder=4)
+    ax.text(av_x, av_y, (uname[:1].upper() or 'T'), color=GREEN, fontsize=15,
+            fontweight='bold', va='center', ha='center', zorder=5)
+    name_x = av_x + 0.058
+    ax.text(name_x, av_y, uname, color=WHITE, fontsize=15, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
+    badge_x = name_x + 0.0150 * len(uname) + 0.024
+    badge_w = 0.018 * 2 + 0.0112 * len("TRADER")
+    ax.add_patch(FancyBboxPatch((badge_x, av_y - 0.027), badge_w, 0.054,
+        boxstyle="round,pad=0,rounding_size=0.022",
+        linewidth=0, facecolor=GOLD, zorder=4))
+    ax.text(badge_x + badge_w / 2, av_y, "TRADER", color=INK, fontsize=10.5,
+            fontweight='bold', va='center', ha='center', zorder=5)
+
+    # ---- chips row ------------------------------------------------------
+    def chip(x, y, label, *, fg=WHITE, border=CHIP_ED, fill=CHIP_BG, dot=None):
+        pad = 0.019
+        dot_w = 0.030 if dot else 0.0
+        tw = 0.0132 * len(label)
+        w = pad * 2 + dot_w + tw
+        h = 0.058
+        ax.add_patch(FancyBboxPatch((x, y), w, h,
+            boxstyle="round,pad=0,rounding_size=0.024",
+            linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
+        tx = x + pad
+        if dot:
+            disc(x + pad + 0.011, y + h / 2, 0.012, facecolor=dot, edgecolor='none', zorder=5)
+            tx = x + pad + 0.030
+        ax.text(tx, y + h / 2, label, color=fg, fontsize=12, fontweight='bold',
+                va='center', ha='left', zorder=6)
+        return x + w + 0.017
+
+    cy = 0.560
+    nx = 0.066
+    nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=GREEN_DK, fill=GREEN_DK)
+    nx = chip(nx, cy, base_sym, dot=BTC_ORANGE)
+    nx = chip(nx, cy, f"{lev}x")
+    nx = chip(nx, cy, exch, dot=(BYBIT_GOLD if exch == 'BYBIT' else EX_BLUE))
+
+    # ---- MY VAULT PNL ---------------------------------------------------
+    ax.text(0.068, 0.452, "MY VAULT PNL", color=SOFT, fontsize=12, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.520, fy + 0.030, "Current Price", color=GRAY, fontsize=11, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.520, fy - 0.014, _fmt_price(cur if cur > 0 else entry), color=WHITE, fontsize=15,
-            fontweight='bold', va='center', ha='left', zorder=5)
-    ax.text(0.740, fy + 0.030, "Duration", color=GRAY, fontsize=11, fontweight='bold',
-            va='center', ha='left', zorder=5)
-    ax.text(0.740, fy - 0.014, _duration_label, color=SOFT, fontsize=15, fontweight='bold',
-            va='center', ha='left', zorder=5)
+    _td = ax.text(0.064, 0.340, headline, color=accent, fontsize=46, fontweight='bold',
+                  va='center', ha='left', zorder=5)
+    fig.canvas.draw()
+    _bb = _td.get_window_extent(renderer=fig.canvas.get_renderer())
+    _x_right = ax.transData.inverted().transform((_bb.x1, _bb.y0))[0]
+    bx0 = min(_x_right + 0.022, 0.62)
+    bw = 0.020 * 2 + 0.0118 * len(pct_str)
+    ax.add_patch(FancyBboxPatch((bx0, 0.312), bw, 0.060,
+        boxstyle="round,pad=0,rounding_size=0.022",
+        linewidth=1.2, edgecolor=accent, facecolor=GREEN_DK, zorder=5))
+    ax.text(bx0 + bw / 2, 0.342, pct_str, color=accent, fontsize=14, fontweight='bold',
+            va='center', ha='center', zorder=6)
+
+    # ---- footer: Entry / Exit / Current / Duration ----------------------
+    def _fmt_dur(a, b):
+        try:
+            if a is None or b is None:
+                return "\u2014"
+            if isinstance(a, str):
+                a = datetime.fromisoformat(a)
+            if isinstance(b, str):
+                b = datetime.fromisoformat(b)
+            if not isinstance(a, datetime) or not isinstance(b, datetime):
+                return "\u2014"
+            a = a.replace(tzinfo=None); b = b.replace(tzinfo=None)
+            secs = max(int((b - a).total_seconds()), 0)
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                return f"{days}d {hours}h {mins}m"
+            if hours > 0:
+                return f"{hours}h {mins}m"
+            return f"{mins}m"
+        except Exception:
+            return "\u2014"
+
+    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
+    fy = 0.150
+    _foot = [
+        ("ENTRY PRICE",   _fmt_price(entry),      WHITE),
+        ("EXIT PRICE",    _fmt_price(exit_price),  accent),
+        ("CURRENT PRICE", _fmt_price(cur),         WHITE),
+        ("DURATION",      peak_dur,                WHITE),
+    ]
+    _col_x_v2 = [0.068, 0.300, 0.520, 0.760]
+    for (_lbl, _val, _col), _fx in zip(_foot, _col_x_v2):
+        ax.text(_fx, fy + 0.040, _lbl, color=GRAY, fontsize=9.5, fontweight='bold',
+                va='center', ha='left', zorder=5)
+        ax.text(_fx, fy - 0.018, _val, color=_col, fontsize=13.5, fontweight='bold',
+                va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
@@ -5902,7 +6216,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ────────────────────────────���────���───���────────
+# ─────────────────────────���──���────���───���────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -6128,6 +6442,7 @@ async def prompt_pnl_display_mode(update, context):
     sugg = lev_data['suggested'] if lev_data else 10
     context.user_data.setdefault('pnl_leverage', sugg)
     context.user_data['pnl_capital'] = None
+    context.user_data['pnl_card_style'] = 0   # each new /pnl starts on the initial 3D deck view
     cur_lev = int(context.user_data.get('pnl_leverage', sugg))
 
     def _lvb(n):
@@ -6177,17 +6492,26 @@ async def send_pnl_image_card(update, context):
     try:
         closes = _fetch_pnl_chart_closes(signal, current)
         fav_raw, fav_at, adv_raw, adv_at = _compute_peak_excursions(signal, current)
-        flat = render_pnl_card_image(signal, current, leverage, capital, closes,
-                                     peak_raw_pct=fav_raw, peak_at=fav_at,
-                                     peak_loss_pct=adv_raw, peak_loss_at=adv_at,
-                                     username=username, out_scale=2.0)
         _fav = fav_raw if fav_raw is not None else 0.0
         up_flag = (_fav * (leverage or 1)) >= 0
-        try:
-            png = compose_3d_card(flat, up=up_flag)
-        except Exception as _e3d:
-            logger.warning("3D compose failed, using flat card: %s", _e3d)
-            png = flat
+        # PnL has two alternating displays. Style 0 = the initial 3D stacked-deck
+        # vault card; style 1 = the flat 'terminal' card. Refresh flips between them.
+        _style = int(context.user_data.get('pnl_card_style', 0)) % 2
+        if _style == 1:
+            png = render_pnl_card_flat_v2(signal, current, leverage, capital, closes,
+                                          peak_raw_pct=fav_raw, peak_at=fav_at,
+                                          peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                          username=username, out_scale=2.0)
+        else:
+            flat = render_pnl_card_image(signal, current, leverage, capital, closes,
+                                         peak_raw_pct=fav_raw, peak_at=fav_at,
+                                         peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                         username=username, out_scale=2.0)
+            try:
+                png = compose_3d_card(flat, up=up_flag)
+            except Exception as _e3d:
+                logger.warning("3D compose failed, using flat card: %s", _e3d)
+                png = flat
     except Exception as e:
         logger.exception("PnL card render failed")
         await msg.reply_text(f"⚠️ Couldn't render the PnL card: {e}")
@@ -6195,7 +6519,10 @@ async def send_pnl_image_card(update, context):
 
     raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
     cap_note = f" • capital ${capital:,.0f}" if capital else ""
-    caption  = f"📈 Live PnL • {signal.get('exchange', '')} {raw_sym} • {leverage}x{cap_note}"
+    _style_now = int(context.user_data.get('pnl_card_style', 0)) % 2
+    style_note = "🃏 3D deck" if _style_now == 0 else "🟩 Flat card"
+    caption  = (f"📈 Live PnL • {signal.get('exchange', '')} {raw_sym} • {leverage}x{cap_note}\n"
+                f"{style_note} • 🔄 Refresh updates the price & flips the card")
 
     _cur_lev = int(leverage)
     def _lvb(n):
@@ -6256,10 +6583,8 @@ def _gather_pnl_matches(arg, results):
     persisted scan history — so users can pull a PnL for a past call even if it
     rolled off the bot or has since reversed direction.
 
-    FIX #5 — Returns one entry per (exchange, symbol, bias) direction, keeping
-    the earliest (first) call for each combination so /pnl BTCUSDT shows one
-    clean card per setup rather than 15 re-detected duplicates.
-    Current-scan matches take priority; historical matches are appended newest-first.
+    Returns a de-duplicated list, current-scan matches first, then historical
+    matches newest-first.
     """
     def _norm(s):
         return str(s or '').upper().replace('/', '').replace('_', '')
@@ -6277,34 +6602,50 @@ def _gather_pnl_matches(arg, results):
         st = st.isoformat() if hasattr(st, 'isoformat') else str(st)
         return (str(sig.get('exchange')), _norm(sig.get('symbol')), st)
 
-    # FIX #5 — dedup key collapses all re-detections to one card per direction
-    def _dedup_key(sig):
-        return (str(sig.get('exchange')), _norm(sig.get('symbol')), str(sig.get('bias')))
-
     # 1) Current scan results (freshest)
     for r in (results or []):
         sym = _norm(r.get('symbol'))
         if sym == q or sym == q_base + 'USDT' or sym.startswith(q_base):
             k = _key(r)
-            dk = _dedup_key(r)
-            if k not in seen and dk not in seen:
+            if k not in seen:
                 seen.add(k)
-                seen.add(dk)
                 matches.append(r)
 
-    # 2) Persisted scan history (newest-first via db ordering)
+    # 2) Persisted scan history
     try:
         for r in db_find_signals_by_symbol(q_base):
             k = _key(r)
-            dk = _dedup_key(r)
-            if k not in seen and dk not in seen:
+            if k not in seen:
                 seen.add(k)
-                seen.add(dk)
                 matches.append(r)
     except Exception as e:
         logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    return matches
+    # Option A — collapse to the FIRST (earliest) call per exchange+symbol+bias.
+    # The autoscanner re-saves a fresh signal every time it re-detects a pair, so
+    # without this users see the same call repeated at many timestamps. We keep
+    # one clean card per direction, anchored to the original (first) call.
+    def _ts(sig):
+        st = sig.get('scan_time')
+        try:
+            if hasattr(st, 'isoformat'):
+                st = st.isoformat()
+            if isinstance(st, str) and st:
+                return datetime.fromisoformat(st).replace(tzinfo=None)
+        except Exception:
+            pass
+        return datetime.max
+
+    grouped = {}
+    for r in matches:
+        gk = (str(r.get('exchange')), _norm(r.get('symbol')), str(r.get('bias')).upper())
+        keep = grouped.get(gk)
+        if keep is None or _ts(r) < _ts(keep):
+            grouped[gk] = r
+
+    collapsed = list(grouped.values())
+    collapsed.sort(key=_ts, reverse=True)   # most-recent first call first
+    return collapsed
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6358,7 +6699,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Multiple scans for this symbol — let the user pick one.
         context.user_data['pnl_matches'] = gathered
         context.user_data['pnl_step']    = 'pnl_pick_match'
-        lines = [f"🔎 Found {len(gathered)} scans for \"{arg0.upper()}\".\nPick one:\n"]
+        lines = [f"🔎 Found {len(gathered)} calls for \"{arg0.upper()}\" (first call per direction).\nPick one:\n"]
         for i, r in enumerate(gathered[:20], 1):
             emoji = "🟢" if str(r.get('bias')) == "LONG" else "🔴"
             lev   = r.get('leverage')
@@ -6527,7 +6868,7 @@ async def pnl_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─────────────────────────────────────────────
 # /best
-# ──────────────────────────────��──────────────
+# ──────────────────────────────��──��───────────
 async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Buttons under the image PnL card: add capital / refresh / done."""
     query = update.callback_query
@@ -6577,6 +6918,9 @@ async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💵 Enter your capital in USDT (e.g. 100, 500, 1000):"
         )
     elif data == 'pnlimg_refresh':
+        # Refresh re-fetches the live price AND flips to the other card style,
+        # so each tap both updates the numbers and alternates the two displays.
+        context.user_data['pnl_card_style'] = 1 - (int(context.user_data.get('pnl_card_style', 0)) % 2)
         await send_pnl_image_card(update, context)
     elif data == 'pnlimg_done':
         try:
@@ -6611,7 +6955,7 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /tg — TOP GAINS
-# ─────────────────────────────────────────────
+# ─────────────────���───────────────────────────
 async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     ph = db_load_price_history() if not state.price_history else state.price_history
@@ -6629,7 +6973,21 @@ async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gainers.append({'exchange': ex, 'symbol': sym, 'change_pct': pct,
                             'price_now': newest, 'price_then': oldest})
     gainers.sort(key=lambda x: x['change_pct'], reverse=True)
-    top = [g for g in gainers if g['change_pct'] > 0][:10]
+    # ── SINGLE DISPLAY VENUE ── show only the active venue (Bybit, or MEXC
+    # when Bybit is down) and one row per pair, so residual cross-exchange
+    # price history can't surface the same pair multiple times.
+    _venue = _display_exchanges()[0]
+    _seen = set()
+    top = []
+    for g in gainers:
+        if g['change_pct'] <= 0:
+            continue
+        if g['exchange'] != _venue or g['symbol'] in _seen:
+            continue
+        _seen.add(g['symbol'])
+        top.append(g)
+        if len(top) >= 10:
+            break
     if not top:
         await update.message.reply_text("📊 No positive gainers yet. Run /scan more times.")
         return
@@ -6661,7 +7019,20 @@ async def tl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             losers.append({'exchange': ex, 'symbol': sym, 'change_pct': pct,
                            'price_now': newest, 'price_then': oldest})
     losers.sort(key=lambda x: x['change_pct'])
-    top = [g for g in losers if g['change_pct'] < 0][:10]
+    # ── SINGLE DISPLAY VENUE ── (see /tg) show only the active venue, one row
+    # per pair.
+    _venue = _display_exchanges()[0]
+    _seen = set()
+    top = []
+    for g in losers:
+        if g['change_pct'] >= 0:
+            continue
+        if g['exchange'] != _venue or g['symbol'] in _seen:
+            continue
+        _seen.add(g['symbol'])
+        top.append(g)
+        if len(top) >= 10:
+            break
     if not top:
         await update.message.reply_text("📊 No losses recorded yet. Run /scan more times.")
         return
@@ -7474,7 +7845,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
 
 
-# ─────────────────────────────────────────────
+# ��────────────────────────────────────────────
 # /compare
 # ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
@@ -7624,7 +7995,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔄 The dynamic new-listing scanner was attempted but also\n"
                 f"couldn't produce a signal (not enough candles on any timeframe yet).\n\n"
                 f"💡 Options:\n"
-                f"• Wait ~1–2 hours and try again — new listings fill up fast\n"
+                f"��� Wait ~1–2 hours and try again — new listings fill up fast\n"
                 f"• Try /cscan {sym_base} 15m once more candles accumulate\n"
                 f"• Check the pair exists as a perpetual on MEXC/Bybit futures"
             )
@@ -7885,7 +8256,7 @@ async def cscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _chat_scan_ctx[chat_id] = {
         'source':   'custom',
         'results':  results,
-        'title':    f"📡 {best['symbol']}",
+        'title':    f"���� {best['symbol']}",
         'max_show': 15,
     }
     _safemode_store_signals(chat_id, results)
@@ -9048,7 +9419,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"BTC {direction}: {pct_change:+.2f}% in 1 hour\n"
         f"BTC: ${price_1h_ago:.0f} → ${btc_price:.0f}\n\n"
-        f"🔄 Triggered emergency market scan\n"
+        f"��� Triggered emergency market scan\n"
         f"📊 {len(results)} signals | 🟢 {longs}L  🔴 {shorts}S\n\n"
         f"🏆 BEST NOW: {emoji} {best['exchange']} {best['symbol']}\n"
         f"   {best['bias']} | {best['confidence']}/10 | Hold {best['hold']}\n\n"
@@ -9067,7 +9438,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
 # Usage: run in the target channel as admin.
 # /broadcast on   — enable for this chat
 # /broadcast off  — disable for this chat
-# ─────────────────────────────────────────────
+# ─────────────────────���─────────���─────────────
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -9328,7 +9699,7 @@ async def leaderboard_time_callback(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════��═════════════════
 # 🐌  S N A I L   M O D E  — HIDDEN PREMIUM FEATURE
 # ═══════════════���═════════════════════════════���═══���═════════════
 # Access gate: user must first type the secret passphrase
@@ -9686,7 +10057,7 @@ def snail_full_analyze(symbol):
 
 def format_snail_signal(r, sa, day_num, days_left):
     """Format a full SNAIL TRADE alert message."""
-    bias_e = "🟢" if r['bias'] == 'LONG' else "🔴"
+    bias_e = "���" if r['bias'] == 'LONG' else "🔴"
     lev    = r.get('leverage')
     link   = get_exchange_link(r['exchange'], r['symbol'])
     bar_w  = int(sa['snail_score'] / 10)
@@ -9727,7 +10098,7 @@ def format_snail_signal(r, sa, day_num, days_left):
         ]
 
     lines += [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━���━━",
         f"📈 TECHNICAL ANALYSIS",
     ]
     for note in sa['ta_reasons'][:6]:
@@ -9911,7 +10282,7 @@ async def _send_snail_final_report(bot, chat_id):
 
     lines = [
         f"🐌  SNAIL WEEK COMPLETE!\n",
-        f"━━━━━━━━━━━━━━━━━━���━━━━━━━━━━━",
+        f"━━━━━��━━━━━━━━━━━━���━━━━━━━━━━━",
         f"Your 7-day SNAIL session has ended.\n",
         f"📊 SESSION RESULTS",
         f"   Signals fired: {total}",
@@ -10134,7 +10505,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 6. Admin user-count tracking (/admin)
 # ══════════════════════════════════════════════════════════���════
 
-# ─── TIMEFRAME HELPERS ────────────────────────────────────────
+# ─── TIMEFRAME HELPERS ──────────────────────────────────���─────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -12614,7 +12985,7 @@ def render_fgi_card(data):
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ────────────────────────────────────────────────────────
+    # ── card panel ───────────────────────────────────────────��────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
@@ -14089,7 +14460,7 @@ async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "🌳 Starting Random Forest training...\n"
+        "��� Starting Random Forest training...\n"
         "Reads signal outcomes from DB and trains a win-probability model.\n"
         "Usually completes in 10–30 seconds."
     )
@@ -14219,7 +14590,7 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("📋 No closed paper positions yet.")
             return
-        lines = ["📋 *Paper Trading — Last 20 Closed*", ""]
+        lines = ["📋 *Paper Trading ��� Last 20 Closed*", ""]
         for r in rows:
             oc_e = '✅' if r.get('outcome') not in ('SL', 'EXPIRED') else '❌'
             lines.append(
@@ -14339,7 +14710,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────��──────────
+# ─────────────���────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
