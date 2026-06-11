@@ -2414,19 +2414,6 @@ def analyze_mexc(symbol):
         return None
 
 
-def _display_exchanges() -> list:
-    """Single source-of-truth exchange policy for ALL scan output.
-
-    Bybit is the only venue we display. MEXC is used *only* as a fallback
-    when Bybit's API is unavailable. Binance is never a display source.
-    Restricting output to one venue means each pair appears exactly once
-    (no MEXC/BYBIT/BINANCE triplicates in /scan, /tg, /tl, /pnl, etc.).
-    """
-    if sakz_exchanges.BYBIT_AVAILABLE is not False:
-        return ["BYBIT"]
-    return ["MEXC"]
-
-
 def run_mid_scan(rank_from=51, rank_to=200):
     """
     CEILING #6 — Mid-tier universe scan.
@@ -2466,17 +2453,17 @@ def run_mid_scan(rank_from=51, rank_to=200):
         r['tier'] = 'MID'   # tag so UI can badge these signals
         results.append(r)
 
-    # ── SINGLE DISPLAY VENUE ── scan only the active venue (Bybit, or MEXC
-    # when Bybit is down) so a pair never appears more than once.
-    _venue = _display_exchanges()[0]
-    if _venue == 'BYBIT':
-        for sym in bybit_get_mid_symbols(rank_from, rank_to):
-            _process(analyze_bybit(sym))
-            time.sleep(0.15)
-    else:
-        for sym in mexc_get_mid_symbols(rank_from, rank_to):
-            _process(analyze_mexc(sym))
-            time.sleep(0.15)
+    for sym in bybit_get_mid_symbols(rank_from, rank_to):
+        _process(analyze_bybit(sym))
+        time.sleep(0.15)
+
+    for sym in mexc_get_mid_symbols(rank_from, rank_to):
+        _process(analyze_mexc(sym))
+        time.sleep(0.15)
+
+    for sym in binance_get_mid_symbols(rank_from, rank_to):
+        _process(analyze_binance(sym))
+        time.sleep(0.15)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
@@ -2690,24 +2677,27 @@ def run_full_scan():
         cutoff = datetime.now() - timedelta(hours=24)
         state.price_history[key] = [p for p in state.price_history[key] if p['time'] > cutoff]
 
-    # ── SINGLE DISPLAY VENUE ──
-    # Only ONE exchange feeds the scan output. Bybit is primary; MEXC is the
-    # fallback used only when Bybit's API is down. Binance is never a display
-    # source. This guarantees each pair appears exactly once — no
-    # MEXC/BYBIT/BINANCE triplicates in /scan, /tg, /tl or /pnl.
-    _venue = _display_exchanges()[0]
-    if _venue == 'BYBIT':
-        bybit_syms = bybit_get_top_symbols(50)
-        _warm_vol_cache(set(bybit_syms), 'BYBIT')
-        for sym in bybit_syms:
-            _process(analyze_bybit(sym), 'BYBIT')
-            time.sleep(0.2)
-    else:
-        mexc_syms = mexc_get_top_symbols(50)
-        _warm_vol_cache(set(mexc_syms), 'MEXC')
-        for sym in mexc_syms:
-            _process(analyze_mexc(sym), 'MEXC')
-            time.sleep(0.2)
+    bybit_syms   = bybit_get_top_symbols(50)
+    mexc_syms    = mexc_get_top_symbols(50)
+    binance_syms = binance_get_top_symbols(50) if sakz_exchanges.BINANCE_AVAILABLE else []
+
+    # Warm volume cache with a single ticker request per exchange
+    _warm_vol_cache(set(bybit_syms),   'BYBIT')
+    _warm_vol_cache(set(mexc_syms),    'MEXC')
+    if binance_syms:
+        _warm_vol_cache(set(binance_syms), 'BINANCE')
+
+    for sym in bybit_syms:
+        _process(analyze_bybit(sym), 'BYBIT')
+        time.sleep(0.2)
+
+    for sym in mexc_syms:
+        _process(analyze_mexc(sym), 'MEXC')
+        time.sleep(0.2)
+
+    for sym in binance_syms:
+        _process(analyze_binance(sym), 'BINANCE')
+        time.sleep(0.2)
 
     _vol_rank = {"MEDIUM": 4, "HIGH": 3, "LOW": 2, "EXTREME": 1, "RANGING": 0}
     results.sort(
@@ -2827,6 +2817,22 @@ def run_full_scan():
             "Correlation gate: dropped %d conflicting over-correlated signal(s) "
             "(kept %d optimum)", _dropped_corr, len(results)
         )
+
+    # FIX #1 — Single display venue: if the same base symbol appears on multiple
+    # exchanges keep only the highest-confidence instance (results already sorted
+    # best-first so the first occurrence wins).  Prevents /scan, /tg, /tl, /pnl
+    # from showing BTCUSDT three times — once per exchange.
+    _seen_syms_full = set()
+    _deduped_full   = []
+    for _r in results:
+        _base = _r['symbol'].replace('_USDT', 'USDT')
+        if _base not in _seen_syms_full:
+            _seen_syms_full.add(_base)
+            _deduped_full.append(_r)
+    _dropped_venue = len(results) - len(_deduped_full)
+    if _dropped_venue:
+        logger.info("Venue dedup: dropped %d cross-exchange duplicate(s)", _dropped_venue)
+    results = _deduped_full
 
     state.last_scan_results = results
     state.last_scan_time    = datetime.now()
@@ -3300,30 +3306,36 @@ async def check_signal_outcomes(context: ContextTypes.DEFAULT_TYPE):
                 c2.execute(f"UPDATE signal_outcomes SET {set_clause} WHERE id=?",
                            list(updates.values()) + [row['id']])
                 conn2.commit()
-                conn2.close()
 
-            # ── DONE → REMOVE FROM SCAN HISTORY ──
-            # Once a call is resolved (target hit, SL hit, or expired at 48h),
-            # drop its scan_results row so /pnl only ever reflects a live call
-            # and never serves a stale, already-finished signal for this pair.
-            final_outcome = updates.get('outcome')
-            if final_outcome and final_outcome != 'pending':
-                try:
-                    conn3 = db_connect()
-                    conn3.execute(
-                        "DELETE FROM scan_results WHERE exchange=? AND symbol=? AND bias=?",
-                        (exchange, symbol, bias),
-                    )
-                    conn3.commit()
-                    conn3.close()
-                except Exception as e:
-                    logger.warning("scan_results cleanup failed for %s %s: %s", exchange, symbol, e)
+                # FIX #6 — scan history cleanup: once a signal is fully resolved
+                # (T1/SL hit or expired) delete its scan_results row so stale
+                # finished signals don't accumulate and /pnl only shows live calls.
+                _resolved_outcome = updates.get('outcome', '')
+                if _resolved_outcome and _resolved_outcome != 'pending':
+                    _sig_id = row.get('signal_id')
+                    if _sig_id:
+                        try:
+                            c2.execute("DELETE FROM scan_results WHERE id=?", (_sig_id,))
+                            conn2.commit()
+                            logger.debug(
+                                "Scan history cleanup: deleted scan_results id=%s (%s %s → %s)",
+                                _sig_id, exchange, symbol, _resolved_outcome
+                            )
+                        except Exception as _del_err:
+                            logger.debug("scan_results cleanup failed id=%s: %s", _sig_id, _del_err)
+
+                conn2.close()
 
             if outcome != 'pending':
                 conf_tag = {1: 'confirmed', 0: 'missed-entry', -1: 'legacy'}
                 logger.info("Outcome resolved: %s %s %s → %s (best=%s, sl_after=%s, entry=%s)",
                             exchange, symbol, bias, outcome, best_tgt, sl_after,
                             conf_tag.get(entry_confirmed, '?'))
+                # FIX #2 — record SL hits so autoscan suppresses re-pushes for 24h
+                if outcome == 'sl_hit':
+                    _sl_key = f"{exchange}_{symbol}_{bias}"
+                    _autoscan_record_sl(_sl_key)
+                    logger.debug("Autoscan SL recorded for %s", _sl_key)
 
         except Exception as e:
             logger.warning("Outcome check error for %s: %s", row['symbol'], e)
@@ -4154,7 +4166,43 @@ _autoscan_awaiting_tf: set = set()  # chat_ids that have been shown the TF menu 
 _autoscan_sent: dict = {}
 _AUTOSCAN_COOLDOWN_H = 4    # hours before the same signal can fire again
 _AUTOSCAN_MIN_CONF   = 8    # minimum confidence to push a signal
-_AUTOSCAN_SL_SUPPRESS_H = 24   # don't re-push a setup that hit SL within this window
+
+# FIX #2 — SL suppression: track stopped-out signals for 24 h so autoscan
+# doesn't re-push the same setup every cycle after a stop-loss hit.
+# Key: "EXCHANGE_SYMBOL_BIAS"  Value: datetime when SL was recorded
+_autoscan_recently_stopped: dict = {}
+_AUTOSCAN_SL_BLOCK_H = 24   # block re-surface for 24 hours after SL hit
+
+
+def _autoscan_record_sl(key: str) -> None:
+    """Record a stop-loss hit for *key* and prune stale entries.
+
+    Args:
+        key: Dedup key in the form ``"EXCHANGE_SYMBOL_BIAS"``.  After this call
+            the key will be blocked from re-surfacing for
+            ``_AUTOSCAN_SL_BLOCK_H`` hours.
+    """
+    _autoscan_recently_stopped[key] = datetime.now()
+    cutoff: datetime = datetime.now() - timedelta(hours=_AUTOSCAN_SL_BLOCK_H)
+    for k in list(_autoscan_recently_stopped):
+        if _autoscan_recently_stopped[k] < cutoff:
+            del _autoscan_recently_stopped[k]
+
+
+def _autoscan_is_sl_blocked(key: str) -> bool:
+    """Return ``True`` if *key* hit its SL within the last 24 hours.
+
+    Args:
+        key: Dedup key in the form ``"EXCHANGE_SYMBOL_BIAS"``.
+
+    Returns:
+        ``True`` when the key is in the SL-suppression window and should be
+        skipped by autoscan; ``False`` otherwise.
+    """
+    stopped_at: datetime | None = _autoscan_recently_stopped.get(key)
+    if stopped_at is None:
+        return False
+    return (datetime.now() - stopped_at).total_seconds() < _AUTOSCAN_SL_BLOCK_H * 3600
 
 # FIX #RESTART-FLOOD — _autoscan_sent lives in memory and is wiped on every
 # restart.  Without a guard, the first continuous_scan_job tick after a restart
@@ -4199,36 +4247,6 @@ def _autoscan_mark_sent(key: str):
             del _autoscan_sent[k]
 
 
-def _autoscan_recently_stopped(exch: str, sym: str, bias: str) -> bool:
-    """
-    FIX #SL-SUPPRESS — Return True if this exact setup (exchange + symbol +
-    bias) has hit its stop-loss recently.
-
-    Autoscan re-detects the same pairs every cycle. Once a call gets stopped
-    out, re-surfacing it within a short window just spams subscribers and drags
-    the win streak / win-rate down with the same loser being logged again and
-    again. Suppressing recently stopped-out setups keeps the streak clean and
-    lets a pair re-qualify only after conditions have had time to genuinely
-    change (outside the suppression window).
-    """
-    try:
-        cutoff = (datetime.now() - timedelta(hours=_AUTOSCAN_SL_SUPPRESS_H)).isoformat()
-        conn = db_connect()
-        c    = conn.cursor()
-        c.execute(
-            "SELECT 1 FROM signal_outcomes "
-            "WHERE exchange=? AND symbol=? AND bias=? "
-            "AND outcome='sl_hit' AND scan_time >= ? LIMIT 1",
-            (exch, sym, bias, cutoff),
-        )
-        stopped = c.fetchone() is not None
-        conn.close()
-        return stopped
-    except Exception as e:
-        logger.warning("autoscan SL-suppress check failed for %s %s %s: %s", exch, sym, bias, e)
-        return False
-
-
 async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 10 minutes.
@@ -4258,11 +4276,9 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if not _autoscan_is_fresh(dedup_key):
             continue
 
-        # FIX #SL-SUPPRESS — don't keep re-surfacing a setup that already hit
-        # its stop-loss recently. Re-pushing a freshly stopped-out pair spams
-        # subscribers and pollutes the win streak with the same repeat loser.
-        if _autoscan_recently_stopped(exch, sym, bias):
-            logger.debug("AUTOSCAN SL-suppress: skipping %s %s %s (recent stop-out)", exch, sym, bias)
+        # FIX #2 — SL suppression: skip signals that hit stop-loss in last 24 h
+        if _autoscan_is_sl_blocked(dedup_key):
+            logger.debug("Autoscan SL-blocked (24h window): %s", dedup_key)
             continue
 
         _autoscan_mark_sent(dedup_key)
@@ -5723,10 +5739,9 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
     exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
 
-    # exit price ALWAYS reflects the same peak (favourable) move the headline %
-    # is built from, so Entry -> Exit is internally consistent with 'My Vault PnL'.
-    # (current price is shown separately in its own column.)
-    if entry > 0 and fav_raw is not None:
+    # exit price: peak price if it ran into profit past entry, else current price
+    # FIX #4 — use `is not None` so fav_raw == 0.0 doesn't fall through to `cur`
+    if entry > 0 and fav_raw is not None and fav_raw > 0:
         exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
     else:
         exit_price = cur or entry
@@ -5855,54 +5870,28 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Duration + balanced Entry / Exit / Current price row ----
-    # Time it took to run from the signal (entry) to the peak (exit) price.
-    def _fmt_dur(a, b):
-        try:
-            if a is None or b is None:
-                return "—"
-            if isinstance(a, str):
-                a = datetime.fromisoformat(a)
-            if isinstance(b, str):
-                b = datetime.fromisoformat(b)
-            if not isinstance(a, datetime) or not isinstance(b, datetime):
-                return "—"
-            a = a.replace(tzinfo=None)
-            b = b.replace(tzinfo=None)
-            secs = max(int((b - a).total_seconds()), 0)
-            days, rem = divmod(secs, 86400)
-            hours, rem = divmod(rem, 3600)
-            mins = rem // 60
-            if days > 0:
-                return f"{days}d {hours}h {mins}m"
-            if hours > 0:
-                return f"{hours}h {mins}m"
-            return f"{mins}m"
-        except Exception:
-            return "—"
+    # ---- footer: Entry / Exit / Current Price + Duration --------------------
+    fy = 0.180
+    # Compute duration label from signal scan_time
+    _scan_t_raw = signal.get('scan_time') if isinstance(signal, dict) else None
+    _duration_label = _fmt_held_for(_scan_t_raw) if _scan_t_raw else "\u2014"
 
-    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
-
-    # Duration (first call -> peak) sits under the headline, left-aligned & lit.
-    ax.text(0.080, 0.312, "Duration", color=GRAY, fontsize=10.5, fontweight='bold',
+    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.080, 0.268, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
+    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
             va='center', ha='left', zorder=5)
-
-    # Three balanced, evenly-spaced price columns kept inside the lit face so
-    # they read as one clean row on the tilted card (no cascade off the edge).
-    fy = 0.168
-    _foot = [
-        ("Entry Price",   _fmt_price(entry),      WHITE),
-        ("Exit Price",    _fmt_price(exit_price),  accent),
-        ("Current Price", _fmt_price(cur),         WHITE),
-    ]
-    _col_x = [0.080, 0.290, 0.500]
-    for (_lbl, _val, _col), _fx in zip(_foot, _col_x):
-        ax.text(_fx, fy + 0.030, _lbl, color=GRAY, fontsize=10.5, fontweight='bold',
-                va='center', ha='left', zorder=5)
-        ax.text(_fx, fy - 0.014, _val, color=_col, fontsize=14, fontweight='bold',
-                va='center', ha='left', zorder=5)
+    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.520, fy + 0.030, "Current Price", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.520, fy - 0.014, _fmt_price(cur if cur > 0 else entry), color=WHITE, fontsize=15,
+            fontweight='bold', va='center', ha='left', zorder=5)
+    ax.text(0.740, fy + 0.030, "Duration", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.740, fy - 0.014, _duration_label, color=SOFT, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
@@ -6267,8 +6256,10 @@ def _gather_pnl_matches(arg, results):
     persisted scan history — so users can pull a PnL for a past call even if it
     rolled off the bot or has since reversed direction.
 
-    Returns a de-duplicated list, current-scan matches first, then historical
-    matches newest-first.
+    FIX #5 — Returns one entry per (exchange, symbol, bias) direction, keeping
+    the earliest (first) call for each combination so /pnl BTCUSDT shows one
+    clean card per setup rather than 15 re-detected duplicates.
+    Current-scan matches take priority; historical matches are appended newest-first.
     """
     def _norm(s):
         return str(s or '').upper().replace('/', '').replace('_', '')
@@ -6286,50 +6277,34 @@ def _gather_pnl_matches(arg, results):
         st = st.isoformat() if hasattr(st, 'isoformat') else str(st)
         return (str(sig.get('exchange')), _norm(sig.get('symbol')), st)
 
+    # FIX #5 — dedup key collapses all re-detections to one card per direction
+    def _dedup_key(sig):
+        return (str(sig.get('exchange')), _norm(sig.get('symbol')), str(sig.get('bias')))
+
     # 1) Current scan results (freshest)
     for r in (results or []):
         sym = _norm(r.get('symbol'))
         if sym == q or sym == q_base + 'USDT' or sym.startswith(q_base):
             k = _key(r)
-            if k not in seen:
+            dk = _dedup_key(r)
+            if k not in seen and dk not in seen:
                 seen.add(k)
+                seen.add(dk)
                 matches.append(r)
 
-    # 2) Persisted scan history
+    # 2) Persisted scan history (newest-first via db ordering)
     try:
         for r in db_find_signals_by_symbol(q_base):
             k = _key(r)
-            if k not in seen:
+            dk = _dedup_key(r)
+            if k not in seen and dk not in seen:
                 seen.add(k)
+                seen.add(dk)
                 matches.append(r)
     except Exception as e:
         logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    # Collapse to the FIRST (earliest) call per exchange+symbol+bias.
-    # The autoscanner re-saves a fresh signal every time it re-detects a pair, so
-    # without this users see the same call repeated at many timestamps. We keep
-    # one clean card per direction, anchored to the original (first) call.
-    def _ts(sig):
-        st = sig.get('scan_time')
-        try:
-            if hasattr(st, 'isoformat'):
-                st = st.isoformat()
-            if isinstance(st, str) and st:
-                return datetime.fromisoformat(st).replace(tzinfo=None)
-        except Exception:
-            pass
-        return datetime.max
-
-    grouped = {}
-    for r in matches:
-        gk = (str(r.get('exchange')), _norm(r.get('symbol')), str(r.get('bias')).upper())
-        keep = grouped.get(gk)
-        if keep is None or _ts(r) < _ts(keep):
-            grouped[gk] = r
-
-    collapsed = list(grouped.values())
-    collapsed.sort(key=_ts, reverse=True)   # most-recent first call first
-    return collapsed
+    return matches
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6383,7 +6358,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Multiple scans for this symbol — let the user pick one.
         context.user_data['pnl_matches'] = gathered
         context.user_data['pnl_step']    = 'pnl_pick_match'
-        lines = [f"🔎 Found {len(gathered)} calls for \"{arg0.upper()}\" (first call per direction).\nPick one:\n"]
+        lines = [f"🔎 Found {len(gathered)} scans for \"{arg0.upper()}\".\nPick one:\n"]
         for i, r in enumerate(gathered[:20], 1):
             emoji = "🟢" if str(r.get('bias')) == "LONG" else "🔴"
             lev   = r.get('leverage')
@@ -6654,21 +6629,7 @@ async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gainers.append({'exchange': ex, 'symbol': sym, 'change_pct': pct,
                             'price_now': newest, 'price_then': oldest})
     gainers.sort(key=lambda x: x['change_pct'], reverse=True)
-    # ── SINGLE DISPLAY VENUE ── show only the active venue (Bybit, or MEXC
-    # when Bybit is down) and one row per pair, so residual cross-exchange
-    # price history can't surface the same pair multiple times.
-    _venue = _display_exchanges()[0]
-    _seen = set()
-    top = []
-    for g in gainers:
-        if g['change_pct'] <= 0:
-            continue
-        if g['exchange'] != _venue or g['symbol'] in _seen:
-            continue
-        _seen.add(g['symbol'])
-        top.append(g)
-        if len(top) >= 10:
-            break
+    top = [g for g in gainers if g['change_pct'] > 0][:10]
     if not top:
         await update.message.reply_text("📊 No positive gainers yet. Run /scan more times.")
         return
@@ -6700,20 +6661,7 @@ async def tl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             losers.append({'exchange': ex, 'symbol': sym, 'change_pct': pct,
                            'price_now': newest, 'price_then': oldest})
     losers.sort(key=lambda x: x['change_pct'])
-    # ── SINGLE DISPLAY VENUE ── (see /tg) show only the active venue, one row
-    # per pair.
-    _venue = _display_exchanges()[0]
-    _seen = set()
-    top = []
-    for g in losers:
-        if g['change_pct'] >= 0:
-            continue
-        if g['exchange'] != _venue or g['symbol'] in _seen:
-            continue
-        _seen.add(g['symbol'])
-        top.append(g)
-        if len(top) >= 10:
-            break
+    top = [g for g in losers if g['change_pct'] < 0][:10]
     if not top:
         await update.message.reply_text("📊 No losses recorded yet. Run /scan more times.")
         return
