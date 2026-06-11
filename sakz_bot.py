@@ -408,7 +408,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ──────────────────�����������������─────────────────────────────────��────
+# ── /pro Detection engine ──────────────────�����������─────────────────────────────────��────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -776,7 +776,7 @@ def _pro_format_uptrend_card(uptrend: dict, rank: int = 1) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {exch} | {sym}\n"
         f"\n"
-        f"��� BIAS: LONG (trend confirmed)\n"
+        f"🟢 BIAS: LONG (trend confirmed)\n"
         f"⭐ AVG DAILY GAIN: {bar} +{avg:.1f}%/day\n"
         f"\n"
         f"⏱ STREAK DURATION: {lbl}\n"
@@ -1117,7 +1117,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ────────────────────────────────────────────���������─────────────
+# ── /pro Command handler ────────────────────────────────────────────────────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1170,7 +1170,7 @@ def _pro_full_command_guide() -> str:
         "/unalert BTCUSDT     Remove an alert\n"
         "/watch BTCUSDT 7     Watchlist — auto-notify on signal\n"
         "/unwatch BTCUSDT     Remove from watchlist\n"
-        "/autoscan [tf]       Auto-scan on/off — e.g. /autoscan 4h, /autoscan off\n"
+        "/autoscan            Toggle periodic auto-scan\n"
         "/broadcast on|off    Toggle signal auto-posting here\n"
         "/safemode            Toggle automatic dying-trend alerts\n\n"
         "🔬  PRO ALERT SUITE\n"
@@ -1430,7 +1430,7 @@ except ImportError:
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ────────────────────────────────────���─────���──
+# ─────────────────────────────────────────────
 try:
     from sakz_ws import (
         start_ws,
@@ -2194,7 +2194,7 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • EMA20 / EMA50 overlaid on candles
 #   • Bollinger Bands (shaded)
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
-#   ��� Volume bars    (panel 2, coloured by candle direction)
+#   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
 # ──���─���────────────────────────────────────────
 def generate_chart(signal, df4h):
@@ -2363,7 +2363,7 @@ def generate_chart(signal, df4h):
         return None
 
 
-# ───────────���───────────���─������─���─���──────────────
+# ─────────────────────────������─���─���──────────────
 # ANALYZE FUNCTIONS
 # ────────���───���────────────────────────────────
 def analyze_bybit(symbol):
@@ -2493,7 +2493,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
+# ═══════════════════════��══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -4127,7 +4127,6 @@ _autoscan_awaiting_tf: set = set()  # chat_ids that have been shown the TF menu 
 _autoscan_sent: dict = {}
 _AUTOSCAN_COOLDOWN_H = 4    # hours before the same signal can fire again
 _AUTOSCAN_MIN_CONF   = 8    # minimum confidence to push a signal
-_AUTOSCAN_SL_SUPPRESS_H = 24   # don't re-push a setup that hit SL within this window
 
 # FIX #RESTART-FLOOD — _autoscan_sent lives in memory and is wiped on every
 # restart.  Without a guard, the first continuous_scan_job tick after a restart
@@ -4172,36 +4171,6 @@ def _autoscan_mark_sent(key: str):
             del _autoscan_sent[k]
 
 
-def _autoscan_recently_stopped(exch: str, sym: str, bias: str) -> bool:
-    """
-    FIX #SL-SUPPRESS — Return True if this exact setup (exchange + symbol +
-    bias) has hit its stop-loss recently.
-
-    Autoscan re-detects the same pairs every cycle. Once a call gets stopped
-    out, re-surfacing it within a short window just spams subscribers and drags
-    the win streak / win-rate down with the same loser being logged again and
-    again. Suppressing recently stopped-out setups keeps the streak clean and
-    lets a pair re-qualify only after conditions have had time to genuinely
-    change (outside the suppression window).
-    """
-    try:
-        cutoff = (datetime.now() - timedelta(hours=_AUTOSCAN_SL_SUPPRESS_H)).isoformat()
-        conn = db_connect()
-        c    = conn.cursor()
-        c.execute(
-            "SELECT 1 FROM signal_outcomes "
-            "WHERE exchange=? AND symbol=? AND bias=? "
-            "AND outcome='sl_hit' AND scan_time >= ? LIMIT 1",
-            (exch, sym, bias, cutoff),
-        )
-        stopped = c.fetchone() is not None
-        conn.close()
-        return stopped
-    except Exception as e:
-        logger.warning("autoscan SL-suppress check failed for %s %s %s: %s", exch, sym, bias, e)
-        return False
-
-
 async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 10 minutes.
@@ -4229,13 +4198,6 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         dedup_key = f"{exch}_{sym}_{bias}_{sig_tf}"
 
         if not _autoscan_is_fresh(dedup_key):
-            continue
-
-        # FIX #SL-SUPPRESS — don't keep re-surfacing a setup that already hit
-        # its stop-loss recently. Re-pushing a freshly stopped-out pair spams
-        # subscribers and pollutes the win streak with the same repeat loser.
-        if _autoscan_recently_stopped(exch, sym, bias):
-            logger.debug("AUTOSCAN SL-suppress: skipping %s %s %s (recent stop-out)", exch, sym, bias)
             continue
 
         _autoscan_mark_sent(dedup_key)
@@ -4355,46 +4317,6 @@ async def autoscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
 
-    # ── Direct timeframe argument — no buttons needed ──
-    # e.g. /autoscan 4h | /autoscan 15m | /autoscan always | /autoscan off
-    if context.args:
-        arg = str(context.args[0]).strip().lower()
-
-        if arg in ('off', 'stop', 'disable', 'none'):
-            auto_scan_subscribers.pop(chat_id, None)
-            db_autoscan_remove(chat_id)
-            _autoscan_awaiting_tf.discard(chat_id)
-            await update.message.reply_text(
-                "🔕 Auto-scan *OFF*. Use /autoscan to turn back on.",
-                parse_mode='Markdown',
-            )
-            return
-
-        if arg in ('always', 'all', 'any', 'on'):
-            tf_pref = None
-        else:
-            tf_pref = _parse_tf_arg(arg)
-            if not tf_pref:
-                await update.message.reply_text(
-                    f"❓ `{arg}` isn't a recognised timeframe.\n"
-                    f"Try: `/autoscan 15m`, `/autoscan 1h`, `/autoscan 4h`, "
-                    f"`/autoscan 1d`, `/autoscan always`, or `/autoscan off`.",
-                    parse_mode='Markdown',
-                )
-                return
-
-        tf_label = _tf_display(tf_pref) if tf_pref else "All timeframes"
-        auto_scan_subscribers[chat_id] = tf_pref
-        db_autoscan_set(chat_id, tf_pref)
-        _autoscan_awaiting_tf.discard(chat_id)
-        await update.message.reply_text(
-            f"✅ *Auto-scan ON!*  Receiving *{tf_label}* signals.\n\n"
-            f"Change anytime with `/autoscan <tf>` (e.g. `/autoscan 1h`) "
-            f"or stop with `/autoscan off`.",
-            parse_mode='Markdown',
-        )
-        return
-
     if chat_id in auto_scan_subscribers:
         # Already ON — show status + options
         tf_pref    = auto_scan_subscribers[chat_id]
@@ -4424,8 +4346,7 @@ async def autoscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• *15M* — 15-minute signals only (scalp/intraday)\n"
             "• *4H* — 4-hour signals only (swing trades)\n"
             "• *1D* — daily signals only (position trades)\n\n"
-            "💡 *No buttons needed* — just type it directly, e.g. "
-            "`/autoscan 4h`, `/autoscan 15m`, `/autoscan always`, or `/autoscan off`.",
+            "Or *reply with a custom timeframe* — e.g. `1h`, `30m`, `1w`",
             parse_mode='Markdown',
             reply_markup=keyboard,
         )
@@ -5107,7 +5028,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard)
 
 
-# ───────────────────────────────���─────────────
+# ─────────────────────────────────────────────
 # CONVERSATION: PICK → REMINDER → INTERVAL
 # ─────────────────────────────────────────────
 async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5518,7 +5439,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ───────────────────────────────��─────��─��───��─
+# ───────────────────────────────────────��───��─
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -5737,10 +5658,8 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
     exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
 
-    # exit price ALWAYS reflects the same peak (favourable) move the headline %
-    # is built from, so Entry -> Exit is internally consistent with 'My Vault PnL'.
-    # (current price is shown separately in its own column.)
-    if entry > 0 and fav_raw is not None:
+    # exit price: peak price if it ran into profit past entry, else current price
+    if fav_raw and fav_raw > 0 and entry > 0:
         exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
     else:
         exit_price = cur or entry
@@ -5869,54 +5788,16 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
         ax.text(0.076, 0.410, pct_str, color=accent, fontsize=46, fontweight='bold',
                 va='center', ha='left', zorder=5)
 
-    # ---- footer: Duration + balanced Entry / Exit / Current price row ----
-    # Time it took to run from the signal (entry) to the peak (exit) price.
-    def _fmt_dur(a, b):
-        try:
-            if a is None or b is None:
-                return "\u2014"
-            if isinstance(a, str):
-                a = datetime.fromisoformat(a)
-            if isinstance(b, str):
-                b = datetime.fromisoformat(b)
-            if not isinstance(a, datetime) or not isinstance(b, datetime):
-                return "\u2014"
-            a = a.replace(tzinfo=None)
-            b = b.replace(tzinfo=None)
-            secs = max(int((b - a).total_seconds()), 0)
-            days, rem = divmod(secs, 86400)
-            hours, rem = divmod(rem, 3600)
-            mins = rem // 60
-            if days > 0:
-                return f"{days}d {hours}h {mins}m"
-            if hours > 0:
-                return f"{hours}h {mins}m"
-            return f"{mins}m"
-        except Exception:
-            return "\u2014"
-
-    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
-
-    # Duration (first call -> peak) sits under the headline, left-aligned & lit.
-    ax.text(0.080, 0.312, "Duration", color=GRAY, fontsize=10.5, fontweight='bold',
+    # ---- footer: Entry / Exit price ------------------------------------
+    fy = 0.180
+    ax.text(0.080, fy + 0.030, "Entry Price", color=GRAY, fontsize=11, fontweight='bold',
             va='center', ha='left', zorder=5)
-    ax.text(0.080, 0.268, peak_dur, color=WHITE, fontsize=14, fontweight='bold',
+    ax.text(0.080, fy - 0.014, _fmt_price(entry), color=WHITE, fontsize=15, fontweight='bold',
             va='center', ha='left', zorder=5)
-
-    # Three balanced, evenly-spaced price columns kept inside the lit face so
-    # they read as one clean row on the tilted card (no cascade off the edge).
-    fy = 0.168
-    _foot = [
-        ("Entry Price",   _fmt_price(entry),      WHITE),
-        ("Exit Price",    _fmt_price(exit_price),  accent),
-        ("Current Price", _fmt_price(cur),         WHITE),
-    ]
-    _col_x = [0.080, 0.290, 0.500]
-    for (_lbl, _val, _col), _fx in zip(_foot, _col_x):
-        ax.text(_fx, fy + 0.030, _lbl, color=GRAY, fontsize=10.5, fontweight='bold',
-                va='center', ha='left', zorder=5)
-        ax.text(_fx, fy - 0.014, _val, color=_col, fontsize=14, fontweight='bold',
-                va='center', ha='left', zorder=5)
+    ax.text(0.300, fy + 0.030, "Exit Price", color=GRAY, fontsize=11, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    ax.text(0.300, fy - 0.014, _fmt_price(exit_price), color=accent, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
 
     buf = io.BytesIO()
     fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
@@ -5927,7 +5808,7 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ─────────────────────────���──���────���───���────────
+# ────────────────────────────���────���───���────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -6319,31 +6200,7 @@ def _gather_pnl_matches(arg, results):
     except Exception as e:
         logger.warning("_gather_pnl_matches DB lookup failed: %s", e)
 
-    # Option A — collapse to the FIRST (earliest) call per exchange+symbol+bias.
-    # The autoscanner re-saves a fresh signal every time it re-detects a pair, so
-    # without this users see the same call repeated at many timestamps. We keep
-    # one clean card per direction, anchored to the original (first) call.
-    def _ts(sig):
-        st = sig.get('scan_time')
-        try:
-            if hasattr(st, 'isoformat'):
-                st = st.isoformat()
-            if isinstance(st, str) and st:
-                return datetime.fromisoformat(st).replace(tzinfo=None)
-        except Exception:
-            pass
-        return datetime.max
-
-    grouped = {}
-    for r in matches:
-        gk = (str(r.get('exchange')), _norm(r.get('symbol')), str(r.get('bias')).upper())
-        keep = grouped.get(gk)
-        if keep is None or _ts(r) < _ts(keep):
-            grouped[gk] = r
-
-    collapsed = list(grouped.values())
-    collapsed.sort(key=_ts, reverse=True)   # most-recent first call first
-    return collapsed
+    return matches
 
 
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6397,7 +6254,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Multiple scans for this symbol — let the user pick one.
         context.user_data['pnl_matches'] = gathered
         context.user_data['pnl_step']    = 'pnl_pick_match'
-        lines = [f"🔎 Found {len(gathered)} calls for \"{arg0.upper()}\" (first call per direction).\nPick one:\n"]
+        lines = [f"🔎 Found {len(gathered)} scans for \"{arg0.upper()}\".\nPick one:\n"]
         for i, r in enumerate(gathered[:20], 1):
             emoji = "🟢" if str(r.get('bias')) == "LONG" else "🔴"
             lev   = r.get('leverage')
@@ -6650,7 +6507,7 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /tg — TOP GAINS
-# ─────────────────���───────────────────────────
+# ─────────────────────────────────────────────
 async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     ph = db_load_price_history() if not state.price_history else state.price_history
@@ -7663,7 +7520,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔄 The dynamic new-listing scanner was attempted but also\n"
                 f"couldn't produce a signal (not enough candles on any timeframe yet).\n\n"
                 f"💡 Options:\n"
-                f"��� Wait ~1–2 hours and try again — new listings fill up fast\n"
+                f"• Wait ~1–2 hours and try again — new listings fill up fast\n"
                 f"• Try /cscan {sym_base} 15m once more candles accumulate\n"
                 f"• Check the pair exists as a perpetual on MEXC/Bybit futures"
             )
@@ -9087,7 +8944,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"BTC {direction}: {pct_change:+.2f}% in 1 hour\n"
         f"BTC: ${price_1h_ago:.0f} → ${btc_price:.0f}\n\n"
-        f"��� Triggered emergency market scan\n"
+        f"🔄 Triggered emergency market scan\n"
         f"📊 {len(results)} signals | 🟢 {longs}L  🔴 {shorts}S\n\n"
         f"🏆 BEST NOW: {emoji} {best['exchange']} {best['symbol']}\n"
         f"   {best['bias']} | {best['confidence']}/10 | Hold {best['hold']}\n\n"
@@ -9106,7 +8963,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
 # Usage: run in the target channel as admin.
 # /broadcast on   — enable for this chat
 # /broadcast off  — disable for this chat
-# ─────────────────────���─────────���─────────────
+# ─────────────────────────────────────────────
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -9725,7 +9582,7 @@ def snail_full_analyze(symbol):
 
 def format_snail_signal(r, sa, day_num, days_left):
     """Format a full SNAIL TRADE alert message."""
-    bias_e = "���" if r['bias'] == 'LONG' else "🔴"
+    bias_e = "🟢" if r['bias'] == 'LONG' else "🔴"
     lev    = r.get('leverage')
     link   = get_exchange_link(r['exchange'], r['symbol'])
     bar_w  = int(sa['snail_score'] / 10)
@@ -9766,7 +9623,7 @@ def format_snail_signal(r, sa, day_num, days_left):
         ]
 
     lines += [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━���━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📈 TECHNICAL ANALYSIS",
     ]
     for note in sa['ta_reasons'][:6]:
@@ -9950,7 +9807,7 @@ async def _send_snail_final_report(bot, chat_id):
 
     lines = [
         f"🐌  SNAIL WEEK COMPLETE!\n",
-        f"━━━━━��━━━━━━━━━━━━���━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━���━━━━━━━━━━━",
         f"Your 7-day SNAIL session has ended.\n",
         f"📊 SESSION RESULTS",
         f"   Signals fired: {total}",
@@ -10173,7 +10030,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 6. Admin user-count tracking (/admin)
 # ══════════════════════════════════════════════════════════���════
 
-# ─── TIMEFRAME HELPERS ──────────────────────────────────���─────
+# ─── TIMEFRAME HELPERS ────────────────────────────────────────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -12653,7 +12510,7 @@ def render_fgi_card(data):
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ───────────────────────────────────────────��────────────
+    # ── card panel ────────────────────────────────────────────────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
@@ -14128,7 +13985,7 @@ async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "��� Starting Random Forest training...\n"
+        "🌳 Starting Random Forest training...\n"
         "Reads signal outcomes from DB and trains a win-probability model.\n"
         "Usually completes in 10–30 seconds."
     )
@@ -14378,7 +14235,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────���────────────────────��──────────
+# ──────────────────────────────────��──────────
 # MAIN
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
