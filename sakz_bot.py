@@ -396,7 +396,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�����������������������������������������������──────────────────────────────────────────
+# ──�������������������������������������������������──────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -767,7 +767,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
                         f"⚠️ Unstable volume (CV={cv:.2f}) — abnormal participation"
                     )
 
-        # 5-7 — CoinGecko fundamentals (best-effort) ───────────────────���─���─���─���──
+        # 5-7 — CoinGecko fundamentals (best-effort) ───────────────���───���─���─���─���──
         try:
             slug    = symbol.replace("USDT", "").lower()
             cg_resp = http_get(
@@ -1444,7 +1444,7 @@ _scan_cache_lock   = asyncio.Lock()   # prevents cache stampede
 # { 'regime': 'BULL'|'BEAR'|'NEUTRAL', 'time': datetime }
 _btc_regime_cache_ttl = 900  # 15 minutes — same as scan cache
 
-# ── BTC Dominance Cache ───────────────────────────────��───��──���───����������─��─��─��─��
+# ── BTC Dominance Cache ─────────────────────────────��─��───��──���───����������─��─��─��─��
 # BTC.D rising = capital flowing out of alts → penalise altcoin LONGs
 # Fetched from Bybit BTCDOMUSDT or Binance BTCDOMUSDT (may not always be available)
 # { 'btcd': float, 'trend': 'rising'|'falling'|'flat', 'time': datetime }
@@ -6472,8 +6472,8 @@ def render_pnl_card_image(signal, current_price, leverage, capital=None, closes=
     nx = chip(nx, cy, f"{lev}x")
     nx = chip(nx, cy, exch, icon='mexc', icon_col=MEXC_BLUE)
 
-    # ---- My Vault PnL ---------------------------------------------------
-    ax.text(0.080, 0.508, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
+    # ---- Pair symbol (always white) sits directly above the PnL number --
+    ax.text(0.080, 0.508, raw_sym, color="#FFFFFF", fontsize=18, fontweight='bold',
             va='center', ha='left', zorder=5)
     if show_amount:
         _td = ax.text(0.076, 0.410, dollar_str, color=accent, fontsize=44, fontweight='bold',
@@ -6743,8 +6743,8 @@ def render_pnl_card_flat_v2(signal, current_price, leverage, capital=None, close
     nx = chip(nx, cy, f"{lev}x")
     nx = chip(nx, cy, exch, dot=(BYBIT_GOLD if exch == 'BYBIT' else EX_BLUE))
 
-    # ---- MY VAULT PNL ---------------------------------------------------
-    ax.text(0.068, 0.452, "MY VAULT PNL", color=SOFT, fontsize=12, fontweight='bold',
+    # ---- Pair symbol (always white) sits directly above the PnL number --
+    ax.text(0.068, 0.452, raw_sym, color="#FFFFFF", fontsize=17, fontweight='bold',
             va='center', ha='left', zorder=5)
     _td = ax.text(0.064, 0.340, headline, color=accent, fontsize=46, fontweight='bold',
                   va='center', ha='left', zorder=5)
@@ -9425,7 +9425,7 @@ async def cscan_refresh_callback(update: Update, context: ContextTypes.DEFAULT_T
         msg = signal_card + pnl_block
     else:
         msg = (
-            f"📡 CSCAN — {exchange} | {symbol}\n"
+            f"�� CSCAN — {exchange} | {symbol}\n"
             f"{'━'*30}\n"
             f"💰 Current: ${current:.6f}  |  🔄 {now_str}\n\n"
             f"ℹ️ Run /cscan {symbol.replace('USDT','')} again to track PnL from entry."
@@ -12892,7 +12892,7 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 Tips:\n"
             f"• Verify the pair exists as a MEXC perpetual\n"
             f"• Try: /analyse {raw.replace('USDT','')} 4h\n"
-            f"• Some tokens use 1000{raw.replace('USDT','')} format"
+            f"�� Some tokens use 1000{raw.replace('USDT','')} format"
         )
         return
 
@@ -14962,7 +14962,7 @@ async def scalp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{scan_desc}\n"
         f"📡 Checking MEXC perpetuals\n"
-        f"⏳ Please wait ~60 seconds..."
+        f"��� Please wait ~60 seconds..."
     )
 
     loop    = asyncio.get_event_loop()
@@ -15707,7 +15707,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
 # AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
-# ─────────────────────────────────────────────��────────────────────────────────────
+# ──────────────────────────────────────���──────��────────────────────────────────────
 # Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
 # cadence (default 30s) — WITHOUT removing the manual button (users can still
 # tap it whenever they want).
