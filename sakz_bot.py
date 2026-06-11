@@ -6355,6 +6355,269 @@ def _build_card_slab(face, depth_frac=0.05, ux=0.5, uy=1.0):
     return slab
 
 
+def render_pnl_card_tablet_v3(signal, current_price, leverage, capital=None, closes=None,
+                               peak_raw_pct=None, peak_at=None, peak_loss_pct=None, peak_loss_at=None,
+                               username=None, out_scale=1.0):
+    """Render the 'tablet' SAKZ PnL card (PNG bytes) — the third display style.
+
+    Dark glass-panel aesthetic: portrait-leaning layout with a bold header bar,
+    a large avatar circle with initials, pill chips row, the vault PnL headline
+    with inline % badge, a subtle arc/curve decoration on the right, and a
+    clean four-column footer row. Inputs and value semantics mirror the other
+    two card renderers so all three always show identical numbers.
+    """
+    import io
+    import numpy as np
+    from matplotlib.patches import FancyBboxPatch, Polygon, Ellipse, Arc, Circle
+
+    # ── palette (dark glass, silver edge, green/red accent) ──────────────
+    BG        = "#05070A"
+    CARD      = "#090C10"
+    CARD_ED   = "#1A2330"
+    HEADER_BG = "#0D1118"
+    CHIP_BG   = "#0F1520"
+    CHIP_ED   = "#1E2C3A"
+    GREEN     = "#2FD675"
+    GREEN_DK  = "#0D3B22"
+    RED       = "#F0556B"
+    RED_DK    = "#3D1119"
+    WHITE     = "#FFFFFF"
+    SOFT      = "#A8B4C0"
+    GRAY      = "#6A7888"
+    GOLD      = "#F2C744"
+    INK       = "#08090B"
+    SILVER    = "#8A96A4"
+    BTC_ORANGE = "#F7931A"
+    BYBIT_GOLD = "#F7A600"
+    EX_BLUE    = "#2E6BFF"
+
+    # Landscape card — same proportions as the tablet template (≈10.24 × 6.83)
+    ASPECT = 10.24 / 6.83
+    W_IN = 10.24
+    H_IN = 6.83
+    fig = plt.figure(figsize=(W_IN, H_IN), dpi=100, facecolor=BG)
+    ax  = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+
+    def disc(x, y, r, **kw):
+        ax.add_patch(Ellipse((x, y), width=2 * r / ASPECT, height=2 * r, **kw))
+
+    # ── derive values (identical logic to the other two renderers) ────────
+    brand    = os.environ.get("BOT_NAME", "Sakz")
+    entry    = float(signal.get('price') or 0) or float(current_price or 0)
+    bias     = str(signal.get('bias', 'LONG')).upper()
+    is_long  = bias == 'LONG'
+    cur      = float(current_price or 0)
+    lev      = int(leverage or 1)
+
+    if entry > 0 and cur > 0:
+        cur_raw = ((cur - entry) / entry * 100) if is_long else ((entry - cur) / entry * 100)
+    else:
+        cur_raw = 0.0
+    fav_raw  = peak_raw_pct if peak_raw_pct is not None else cur_raw
+    if fav_raw < cur_raw:
+        fav_raw = cur_raw
+    peak_lev = fav_raw * lev
+    if peak_lev < -100.0:
+        peak_lev = -100.0
+
+    up = peak_lev >= 0
+    if not up:
+        GREEN, GREEN_DK = RED, RED_DK
+    accent     = GREEN
+    bias_color = "#2FD675" if is_long else "#F0556B"
+    tri        = "\u25B2" if is_long else "\u25BC"
+
+    raw_sym  = str(signal.get('symbol', '')).upper().replace('/', '').replace('_', '')
+    base_sym = raw_sym[:-4] if raw_sym.endswith('USDT') else raw_sym
+    exch     = (str(signal.get('exchange', '')).upper() or 'MEXC')
+
+    if entry > 0 and fav_raw is not None:
+        exit_price = entry * (1 + fav_raw / 100.0) if is_long else entry * (1 - fav_raw / 100.0)
+    else:
+        exit_price = cur or entry
+
+    def _fmt_price(p):
+        if not p:
+            return "\u2014"
+        p = float(p)
+        if p >= 1000:
+            return f"{p:,.2f}"
+        if p >= 1:
+            return f"{p:,.4f}"
+        return f"{p:.6f}"
+
+    pct_str    = f"{peak_lev:+.2f}%"
+    show_amount = (capital is not None) and (capital > 0)
+    dollar_str  = None
+    if show_amount:
+        dval = capital * peak_lev / 100.0
+        if abs(dval) >= 100:
+            dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.0f}"
+        else:
+            dollar_str = f"{'+' if dval >= 0 else '-'}${abs(dval):,.2f}"
+
+    uname = str(username or signal.get('username') or "Trader").lstrip('@')
+    if len(uname) > 16:
+        uname = uname[:15] + "\u2026"
+
+    def _fmt_dur(a, b):
+        try:
+            if a is None or b is None:
+                return "\u2014"
+            if isinstance(a, str):
+                a = datetime.fromisoformat(a)
+            if isinstance(b, str):
+                b = datetime.fromisoformat(b)
+            if not isinstance(a, datetime) or not isinstance(b, datetime):
+                return "\u2014"
+            a = a.replace(tzinfo=None); b = b.replace(tzinfo=None)
+            secs = max(int((b - a).total_seconds()), 0)
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                return f"{days}d {hours}h {mins}m"
+            if hours > 0:
+                return f"{hours}h {mins}m"
+            return f"{mins}m"
+        except Exception:
+            return "\u2014"
+
+    peak_dur = _fmt_dur(signal.get('scan_time'), peak_at)
+
+    # ── card body + glass edge ────────────────────────────────────────────
+    ax.add_patch(FancyBboxPatch((0.028, 0.040), 0.944, 0.920,
+        boxstyle="round,pad=0,rounding_size=0.048",
+        linewidth=1.6, edgecolor=CARD_ED, facecolor=CARD, zorder=1))
+
+    # Silver rim highlight (top edge only — like the tablet bezel in the image)
+    ax.add_patch(FancyBboxPatch((0.028, 0.040), 0.944, 0.920,
+        boxstyle="round,pad=0,rounding_size=0.048",
+        linewidth=3.2, edgecolor=SILVER, facecolor="none", alpha=0.18, zorder=2))
+
+    # ── subtle right-side arc decorations (echo the curved lines on back card) ──
+    for k, (r, alpha) in enumerate([(0.36, 0.12), (0.28, 0.18), (0.20, 0.22), (0.12, 0.16)]):
+        arc = Arc((1.02, 0.50), width=r * 2 / ASPECT, height=r * 2,
+                  angle=0, theta1=110, theta2=250,
+                  color=accent, lw=2.2 - k * 0.3, alpha=alpha, zorder=2)
+        ax.add_patch(arc)
+
+    # ── soft radial glow behind the headline ─────────────────────────────
+    gx = np.linspace(0, 1, 200); gy = np.linspace(0, 1, 200)
+    GXX, GYY = np.meshgrid(gx, gy)
+    dist = np.sqrt((GXX - 0.38) ** 2 + (GYY - 0.42) ** 2)
+    glow = np.clip(0.22 - dist * 0.55, 0, 0.22)
+    rgba = np.zeros((200, 200, 4))
+    if up:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.18, 0.84, 0.46
+    else:
+        rgba[..., 0], rgba[..., 1], rgba[..., 2] = 0.94, 0.33, 0.42
+    rgba[..., 3] = glow * 1.8
+    ax.imshow(rgba, extent=[0.03, 0.97, 0.03, 0.97], aspect='auto', origin='lower',
+              zorder=1, interpolation='bilinear')
+
+    # ── header bar ───────────────────────────────────────────────────────
+    ax.add_patch(FancyBboxPatch((0.028, 0.820), 0.944, 0.140,
+        boxstyle="round,pad=0,rounding_size=0.030",
+        linewidth=0, facecolor=HEADER_BG, zorder=3))
+    # thin accent underline on header
+    ax.plot([0.028, 0.972], [0.820, 0.820], color=accent, lw=1.4, alpha=0.55, zorder=4)
+
+    # bias triangle + brand wordmark in header
+    hx, hy = 0.072, 0.888
+    if is_long:
+        ax.add_patch(Polygon([(hx - 0.013, hy - 0.016), (hx + 0.013, hy - 0.016), (hx, hy + 0.018)],
+            closed=True, facecolor=bias_color, edgecolor='none', zorder=6))
+    else:
+        ax.add_patch(Polygon([(hx - 0.013, hy + 0.016), (hx + 0.013, hy + 0.016), (hx, hy - 0.018)],
+            closed=True, facecolor=bias_color, edgecolor='none', zorder=6))
+    ax.text(hx + 0.028, hy, brand, color=WHITE, fontsize=22, fontweight='bold',
+            va='center', ha='left', zorder=6, fontstyle='italic')
+
+    # ── avatar circle + username + Trader badge ───────────────────────────
+    av_x, av_y = 0.095, 0.728
+    disc(av_x, av_y, 0.038, facecolor="#182535", edgecolor=CARD_ED, lw=1.4, zorder=4)
+    ax.text(av_x, av_y, (uname[:1].upper() or 'T'), color=WHITE, fontsize=16,
+            fontweight='bold', va='center', ha='center', zorder=5)
+    name_x = av_x + 0.062
+    ax.text(name_x, av_y, uname, color=WHITE, fontsize=15, fontweight='bold',
+            va='center', ha='left', zorder=5)
+    badge_x = name_x + 0.0148 * len(uname) + 0.022
+    badge_w = 0.018 * 2 + 0.0116 * len("Trader")
+    ax.add_patch(FancyBboxPatch((badge_x, av_y - 0.028), badge_w, 0.056,
+        boxstyle="round,pad=0,rounding_size=0.022",
+        linewidth=0, facecolor=GOLD, zorder=4))
+    ax.text(badge_x + badge_w / 2, av_y, "Trader", color=INK, fontsize=11,
+            fontweight='bold', va='center', ha='center', zorder=5)
+
+    # ── chips row ─────────────────────────────────────────────────────────
+    def chip(x, y, label, *, fg=WHITE, border=CHIP_ED, fill=CHIP_BG, dot=None, dot_glyph=None):
+        pad   = 0.018
+        dot_w = 0.032 if dot else 0.0
+        tw    = 0.0138 * len(label)
+        w     = pad * 2 + dot_w + tw
+        h     = 0.054
+        ax.add_patch(FancyBboxPatch((x, y), w, h,
+            boxstyle="round,pad=0,rounding_size=0.020",
+            linewidth=1.3, edgecolor=border, facecolor=fill, zorder=4))
+        tx = x + pad
+        if dot:
+            disc(x + pad + 0.013, y + h / 2, 0.013, facecolor=dot, edgecolor='none', zorder=5)
+            if dot_glyph:
+                ax.text(x + pad + 0.013, y + h / 2, dot_glyph, color=WHITE,
+                        fontsize=8, fontweight='bold', va='center', ha='center', zorder=6)
+            tx = x + pad + 0.032
+        ax.text(tx, y + h / 2, label, color=fg, fontsize=12, fontweight='bold',
+                va='center', ha='left', zorder=6)
+        return x + w + 0.016
+
+    cy = 0.618
+    nx = 0.072
+    nx = chip(nx, cy, f"{tri} {bias}", fg=bias_color, border=bias_color, fill=CHIP_BG)
+    nx = chip(nx, cy, base_sym, dot=BTC_ORANGE, dot_glyph=base_sym[:1])
+    nx = chip(nx, cy, f"{lev}x")
+    nx = chip(nx, cy, exch, dot=(BYBIT_GOLD if exch == 'BYBIT' else EX_BLUE),
+              dot_glyph=exch[:1])
+
+    # ── My Vault PnL headline ─────────────────────────────────────────────
+    ax.text(0.072, 0.540, "My Vault PnL", color=SOFT, fontsize=13, fontweight='bold',
+            va='center', ha='left', zorder=5)
+
+    if show_amount:
+        _td = ax.text(0.068, 0.438, dollar_str, color=accent, fontsize=46, fontweight='bold',
+                      va='center', ha='left', zorder=5)
+        fig.canvas.draw()
+        _bb  = _td.get_window_extent(renderer=fig.canvas.get_renderer())
+        _x_r = ax.transData.inverted().transform((_bb.x1, _bb.y0))[0]
+        ax.text(min(_x_r + 0.022, 0.62), 0.426, pct_str, color=accent, fontsize=20,
+                fontweight='bold', va='center', ha='left', zorder=5)
+    else:
+        ax.text(0.068, 0.438, pct_str, color=accent, fontsize=48, fontweight='bold',
+                va='center', ha='left', zorder=5)
+
+    # ── footer: four price columns ────────────────────────────────────────
+    fy = 0.148
+    _foot = [
+        ("Entry Price",   _fmt_price(entry),      WHITE),
+        ("Exit Price",    _fmt_price(exit_price),  accent),
+        ("Current Price", _fmt_price(cur),         WHITE),
+        ("Duration",      peak_dur,                WHITE),
+    ]
+    _col_x = [0.072, 0.296, 0.520, 0.756]
+    for (_lbl, _val, _col), _fx in zip(_foot, _col_x):
+        ax.text(_fx, fy + 0.042, _lbl, color=GRAY, fontsize=10, fontweight='bold',
+                va='center', ha='left', zorder=5)
+        ax.text(_fx, fy - 0.012, _val, color=_col, fontsize=14, fontweight='bold',
+                va='center', ha='left', zorder=5)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=BG, edgecolor='none', dpi=100 * out_scale)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def compose_3d_card(flat_png, up=True):
     """Turn a flat PnL card PNG into a realistic 3D render: extruded card
     thickness (depth), baked surface patterns, a stacked deck card behind,
@@ -6494,14 +6757,20 @@ async def send_pnl_image_card(update, context):
         fav_raw, fav_at, adv_raw, adv_at = _compute_peak_excursions(signal, current)
         _fav = fav_raw if fav_raw is not None else 0.0
         up_flag = (_fav * (leverage or 1)) >= 0
-        # PnL has two alternating displays. Style 0 = the initial 3D stacked-deck
-        # vault card; style 1 = the flat 'terminal' card. Refresh flips between them.
-        _style = int(context.user_data.get('pnl_card_style', 0)) % 2
+        # PnL has three alternating displays. Style 0 = 3D stacked-deck vault card;
+        # style 1 = flat 'terminal' card; style 2 = glass tablet card.
+        # Refresh cycles through all three.
+        _style = int(context.user_data.get('pnl_card_style', 0)) % 3
         if _style == 1:
             png = render_pnl_card_flat_v2(signal, current, leverage, capital, closes,
                                           peak_raw_pct=fav_raw, peak_at=fav_at,
                                           peak_loss_pct=adv_raw, peak_loss_at=adv_at,
                                           username=username, out_scale=2.0)
+        elif _style == 2:
+            png = render_pnl_card_tablet_v3(signal, current, leverage, capital, closes,
+                                            peak_raw_pct=fav_raw, peak_at=fav_at,
+                                            peak_loss_pct=adv_raw, peak_loss_at=adv_at,
+                                            username=username, out_scale=2.0)
         else:
             flat = render_pnl_card_image(signal, current, leverage, capital, closes,
                                          peak_raw_pct=fav_raw, peak_at=fav_at,
@@ -6519,8 +6788,10 @@ async def send_pnl_image_card(update, context):
 
     raw_sym  = str(signal.get('symbol', '')).replace('_USDT', 'USDT')
     cap_note = f" • capital ${capital:,.0f}" if capital else ""
-    _style_now = int(context.user_data.get('pnl_card_style', 0)) % 2
-    style_note = "🃏 3D deck" if _style_now == 0 else "🟩 Flat card"
+    _style_now = int(context.user_data.get('pnl_card_style', 0)) % 3
+    style_note = ("🃏 3D deck" if _style_now == 0
+                  else "🟩 Flat card" if _style_now == 1
+                  else "💎 Glass card")
     caption  = (f"📈 Live PnL • {signal.get('exchange', '')} {raw_sym} • {leverage}x{cap_note}\n"
                 f"{style_note} • 🔄 Refresh updates the price & flips the card")
 
@@ -6920,7 +7191,7 @@ async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'pnlimg_refresh':
         # Refresh re-fetches the live price AND flips to the other card style,
         # so each tap both updates the numbers and alternates the two displays.
-        context.user_data['pnl_card_style'] = 1 - (int(context.user_data.get('pnl_card_style', 0)) % 2)
+        context.user_data['pnl_card_style'] = (int(context.user_data.get('pnl_card_style', 0)) + 1) % 3
         await send_pnl_image_card(update, context)
     elif data == 'pnlimg_done':
         try:
