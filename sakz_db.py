@@ -505,6 +505,14 @@ def db_init():
         except Exception:
             pass  # column already exists — safe to ignore
 
+    # SIGNAL LIFECYCLE tables (first-signal registry + evictions).
+    try:
+        conn.cursor().executescript(_LIFECYCLE_DDL)
+        conn.commit()
+        logger.info("DB: signal lifecycle tables ready")
+    except Exception as _le:
+        logger.warning("lifecycle table init failed: %s", _le)
+
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -1189,6 +1197,371 @@ def db_autoscan_remove(chat_id: int):
     conn = db_connect()
     conn.execute("DELETE FROM autoscan_subs WHERE chat_id=?", (chat_id,))
     conn.commit(); conn.close()
+
+# ──────────────────────────────────────────────────────────────────
+# SIGNAL LIFECYCLE — first-signal registry + memory evictions
+# Backs: /pnl "oldest signal", SL-loss card, dormancy clear, and the
+# 20%-peak-reversal eviction + "not scanned recently" guard.
+# Pure decision logic lives in sakz_signal_logic.py (unit-tested).
+# ──────────────────────────────────────────────────────────────────
+try:
+    import sakz_signal_logic as _sl
+except Exception as _sl_err:  # pragma: no cover
+    _sl = None
+    logger.warning("sakz_signal_logic import failed: %s", _sl_err)
+
+_LIFECYCLE_DDL = """
+CREATE TABLE IF NOT EXISTS active_signals (
+    exchange         TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    bias             TEXT NOT NULL,
+    entry            REAL NOT NULL,
+    stop_loss        REAL,
+    t1               REAL,
+    t2               REAL,
+    t3               REAL,
+    leverage         REAL,
+    confidence       REAL,
+    first_scan_time  TEXT NOT NULL,
+    peak_price       REAL,
+    last_motion_time TEXT,
+    status           TEXT DEFAULT 'active',
+    signal_json      TEXT,
+    PRIMARY KEY (exchange, symbol)
+);
+CREATE TABLE IF NOT EXISTS signal_evictions (
+    exchange   TEXT NOT NULL,
+    symbol     TEXT NOT NULL,
+    removed_at TEXT NOT NULL,
+    reason     TEXT,
+    PRIMARY KEY (exchange, symbol)
+);
+"""
+
+
+def _lc_f(v):
+    """Coerce to float or None."""
+    try:
+        if v in (None, ""):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _fetch_dicts(cur):
+    """Return cursor rows as plain dicts (works for Row and tuple factories)."""
+    cols = [d[0] for d in cur.description] if cur.description else []
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def lifecycle_init(conn=None):
+    """Create the lifecycle tables. Safe to call repeatedly."""
+    own = conn is None
+    conn = conn or db_connect()
+    try:
+        conn.cursor().executescript(_LIFECYCLE_DDL)
+        conn.commit()
+    except Exception as e:
+        logger.warning("lifecycle_init error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def _row_to_signal(e):
+    """Map an active_signals DB row (dict) to a signal-like dict."""
+    return {
+        "exchange": e.get("exchange"),
+        "symbol": e.get("symbol"),
+        "bias": e.get("bias"),
+        "price": e.get("entry"),
+        "entry": e.get("entry"),
+        "stop_loss": e.get("stop_loss"),
+        "t1": e.get("t1"),
+        "t2": e.get("t2"),
+        "t3": e.get("t3"),
+        "leverage": e.get("leverage"),
+        "confidence": e.get("confidence"),
+        "first_scan_time": e.get("first_scan_time"),
+        "scan_time": e.get("first_scan_time"),
+        "peak_price": e.get("peak_price"),
+        "last_motion_time": e.get("last_motion_time"),
+        "status": e.get("status"),
+    }
+
+
+def db_register_first_signal(signal, conn=None, current_price=None, now=None):
+    """Record/refresh a signal while KEEPING the first call.
+
+    A re-detect of the same pair+direction never overwrites the original entry,
+    stop, targets, confidence or first_scan_time; only the live peak price and
+    last-motion timestamp advance. A direction flip starts a fresh anchor.
+    Re-scanning a pair also clears any prior eviction record for it.
+    """
+    if _sl is None:
+        return
+    own = conn is None
+    conn = conn or db_connect()
+    now = now or datetime.now()
+    try:
+        exch = str(signal.get("exchange", ""))
+        sym = str(signal.get("symbol", ""))
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM active_signals WHERE exchange=? AND symbol=?",
+            (exch, sym),
+        )
+        existing_rows = _fetch_dicts(cur)
+        existing = _row_to_signal(existing_rows[0]) if existing_rows else None
+
+        incoming = dict(signal)
+        incoming.setdefault("scan_time", now)
+        merged = _sl.merge_keep_first(
+            existing, incoming, current_price=current_price, now=now
+        )
+
+        entry = _lc_f(merged.get("price") or merged.get("entry")) or 0.0
+        first_scan = (
+            merged.get("first_scan_time") or merged.get("scan_time") or now
+        )
+        first_scan = (
+            first_scan.isoformat()
+            if hasattr(first_scan, "isoformat")
+            else str(first_scan)
+        )
+        lm = merged.get("last_motion_time") or now
+        lm = lm.isoformat() if hasattr(lm, "isoformat") else str(lm)
+
+        cur.execute(
+            "INSERT OR REPLACE INTO active_signals "
+            "(exchange,symbol,bias,entry,stop_loss,t1,t2,t3,leverage,confidence,"
+            "first_scan_time,peak_price,last_motion_time,status,signal_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                exch,
+                sym,
+                str(merged.get("bias", "")),
+                entry,
+                _lc_f(merged.get("stop_loss")),
+                _lc_f(merged.get("t1")),
+                _lc_f(merged.get("t2")),
+                _lc_f(merged.get("t3")),
+                _lc_f(merged.get("leverage")),
+                _lc_f(merged.get("confidence")),
+                first_scan,
+                _lc_f(merged.get("peak_price")),
+                lm,
+                str(merged.get("status") or "active"),
+                json.dumps(
+                    {k: v for k, v in merged.items() if not callable(v)},
+                    default=str,
+                ),
+            ),
+        )
+        # Re-scan clears any earlier eviction for this pair.
+        try:
+            cur.execute(
+                "DELETE FROM signal_evictions WHERE exchange=? AND symbol=?",
+                (exch, sym),
+            )
+        except Exception:
+            pass
+        conn.commit()
+    except Exception as e:
+        logger.warning("db_register_first_signal error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def db_get_active_signal(exchange, symbol, conn=None):
+    """Return the stored active signal dict for a pair, or None."""
+    own = conn is None
+    conn = conn or db_connect()
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM active_signals WHERE exchange=? AND symbol=?",
+            (exchange, symbol),
+        )
+        rows = _fetch_dicts(cur)
+    except Exception as e:
+        logger.warning("db_get_active_signal error: %s", e)
+    finally:
+        if own:
+            conn.close()
+    if not rows:
+        return None
+    r = rows[0]
+    r["price"] = r.get("entry")
+    return r
+
+
+def db_find_active_by_symbol(norm_query, conn=None):
+    """Return active signals whose symbol matches a normalised base/full symbol."""
+    own = conn is None
+    conn = conn or db_connect()
+    rows = []
+    try:
+        cur = conn.cursor()
+        pattern = (norm_query or "").upper() + "%"
+        cur.execute(
+            "SELECT * FROM active_signals "
+            "WHERE REPLACE(REPLACE(UPPER(symbol),'/',''),'_','') LIKE ?",
+            (pattern,),
+        )
+        rows = _fetch_dicts(cur)
+    except Exception as e:
+        logger.warning("db_find_active_by_symbol error: %s", e)
+    finally:
+        if own:
+            conn.close()
+    for r in rows:
+        r["price"] = r.get("entry")
+    return rows
+
+
+def db_all_active_signals(conn=None):
+    """Return all active signals (used by the maintenance job)."""
+    own = conn is None
+    conn = conn or db_connect()
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM active_signals")
+        rows = _fetch_dicts(cur)
+    except Exception as e:
+        logger.warning("db_all_active_signals error: %s", e)
+    finally:
+        if own:
+            conn.close()
+    for r in rows:
+        r["price"] = r.get("entry")
+    return rows
+
+
+def db_mark_signal_status(exchange, symbol, status, conn=None):
+    """Update the lifecycle status of a stored signal (e.g. 'sl_hit')."""
+    own = conn is None
+    conn = conn or db_connect()
+    try:
+        conn.cursor().execute(
+            "UPDATE active_signals SET status=? WHERE exchange=? AND symbol=?",
+            (str(status), exchange, symbol),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("db_mark_signal_status error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def db_update_signal_peak(exchange, symbol, peak_price, last_motion_time, conn=None):
+    """Advance the tracked peak price + motion timestamp for a stored signal."""
+    own = conn is None
+    conn = conn or db_connect()
+    lm = (
+        last_motion_time.isoformat()
+        if hasattr(last_motion_time, "isoformat")
+        else str(last_motion_time)
+    )
+    try:
+        conn.cursor().execute(
+            "UPDATE active_signals SET peak_price=?, last_motion_time=? "
+            "WHERE exchange=? AND symbol=?",
+            (_lc_f(peak_price), lm, exchange, symbol),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("db_update_signal_peak error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def db_evict_signal(exchange, symbol, removed_at=None, reason="", conn=None):
+    """Delete a pair from memory and record WHEN it was removed.
+
+    Removes the active signal and any persisted scan rows, then stores an
+    eviction stamp so a later /pnl can tell whether the pair has been scanned
+    again since removal.
+    """
+    own = conn is None
+    conn = conn or db_connect()
+    removed_at = removed_at or datetime.now().isoformat()
+    if hasattr(removed_at, "isoformat"):
+        removed_at = removed_at.isoformat()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM active_signals WHERE exchange=? AND symbol=?",
+            (exchange, symbol),
+        )
+        try:
+            cur.execute(
+                "DELETE FROM scan_results WHERE exchange=? AND symbol=?",
+                (exchange, symbol),
+            )
+        except Exception:
+            pass
+        cur.execute(
+            "INSERT OR REPLACE INTO signal_evictions "
+            "(exchange,symbol,removed_at,reason) VALUES (?,?,?,?)",
+            (exchange, symbol, removed_at, str(reason)),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("db_evict_signal error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def db_get_eviction(exchange, symbol, conn=None):
+    """Return the eviction record {removed_at, reason} for a pair, or None."""
+    own = conn is None
+    conn = conn or db_connect()
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM signal_evictions WHERE exchange=? AND symbol=?",
+            (exchange, symbol),
+        )
+        rows = _fetch_dicts(cur)
+    except Exception as e:
+        logger.warning("db_get_eviction error: %s", e)
+    finally:
+        if own:
+            conn.close()
+    return rows[0] if rows else None
+
+
+def db_find_eviction_by_symbol(norm_query, conn=None):
+    """Return the most recent eviction for a normalised base/full symbol."""
+    own = conn is None
+    conn = conn or db_connect()
+    rows = []
+    try:
+        cur = conn.cursor()
+        pattern = (norm_query or "").upper() + "%"
+        cur.execute(
+            "SELECT * FROM signal_evictions "
+            "WHERE REPLACE(REPLACE(UPPER(symbol),'/',''),'_','') LIKE ? "
+            "ORDER BY removed_at DESC LIMIT 1",
+            (pattern,),
+        )
+        rows = _fetch_dicts(cur)
+    except Exception as e:
+        logger.warning("db_find_eviction_by_symbol error: %s", e)
+    finally:
+        if own:
+            conn.close()
+    return rows[0] if rows else None
+
 
 def db_snail_unlock(chat_id):
     conn = db_connect()

@@ -824,10 +824,19 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                Displayed in signal card details. Purely additive — never penalises.
     """
     try:
+        # ── CRYPTO-ONLY GATE ── reject tokenised stocks/metals/oil/FX outright
+        # so crypto indicators and the BTC-regime gate are never applied to
+        # non-crypto instruments. (/analyse uses a separate raw path and is
+        # intentionally unaffected.)
+        if not sakz_exchanges.is_crypto_symbol(symbol):
+            logger.debug("NON-CRYPTO skipped at scoring: %s", symbol)
+            return None
         # Warning tags — set below if signal passes with caveats.
         # Always initialized so score_pair always attaches them to result.
         low_conf_warning = None
         regime_warning   = None
+        regime_blocked   = False
+        regime_block_detail = None
         btc_regime       = 'UNKNOWN'
 
         L   = df4h.iloc[-1]   # current closed 4H candle
@@ -1320,9 +1329,12 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         is_extreme_vol = (((atr / price) * 100) >= 5.5)
 
         # regime_warning is set when the signal is below the recommended floor
-        # for the current BTC regime.  Signal is NOT hard-blocked — it passes
-        # through with a warning so /scan always shows the full analysis.
+        # for the current BTC regime.  When regime_blocked is also set, the
+        # signal is HARD-BLOCKED (user directive): autoscan / /scan drop it and
+        # single-pair /scan redirects the user to /analyse.
         regime_warning = None
+        regime_blocked = False
+        regime_block_detail = None
 
         # ���─ FIX #BTCD — BTC Dominance Filter ──────────────────────────
         # BTC.D rising = capital rotating from alts to BTC → alt LONGs face headwind.
@@ -1349,7 +1361,9 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                 if is_extreme_vol: floor = max(floor - 1, 7)
                 if confidence < floor:
                     regime_warning = f"Counter-regime SHORT: conf={confidence} below {btc_regime} floor ({floor})"
-                    logger.debug("REGIME WARN: %s SHORT conf=%d below floor=%d (%s)",
+                    regime_blocked = True
+                    regime_block_detail = regime_warning
+                    logger.debug("REGIME BLOCK: %s SHORT conf=%d below floor=%d (%s)",
                                  symbol, confidence, floor, btc_regime)
                 else:
                     reasons.append(f"⚠️ Counter-regime SHORT in BTC {btc_regime} — high-conf only ({confidence}/10)")
@@ -1359,7 +1373,9 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                 if is_extreme_vol: floor = max(floor - 1, 7)
                 if confidence < floor:
                     regime_warning = f"Counter-regime LONG: conf={confidence} below {btc_regime} floor ({floor})"
-                    logger.debug("REGIME WARN: %s LONG conf=%d below floor=%d (%s)",
+                    regime_blocked = True
+                    regime_block_detail = regime_warning
+                    logger.debug("REGIME BLOCK: %s LONG conf=%d below floor=%d (%s)",
                                  symbol, confidence, floor, btc_regime)
                 else:
                     reasons.append(f"⚠️ Counter-regime LONG in BTC {btc_regime} — high-conf only ({confidence}/10)")
@@ -1368,7 +1384,9 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                 neutral_floor = 7 if is_extreme_vol else 8
                 if confidence < neutral_floor:
                     regime_warning = f"{bias} conf={confidence} below NEUTRAL floor ({neutral_floor})"
-                    logger.debug("REGIME WARN: %s %s conf=%d below neutral floor=%d",
+                    regime_blocked = True
+                    regime_block_detail = regime_warning
+                    logger.debug("REGIME BLOCK: %s %s conf=%d below neutral floor=%d",
                                  symbol, bias, confidence, neutral_floor)
                 else:
                     reasons.append(f"ℹ️ BTC NEUTRAL regime — only high-conf signals pass ({confidence}/10)")
@@ -1428,6 +1446,15 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             sl_mult                   = 2.0
             entry_w_lo, entry_w_hi    = 0.80, 0.42   # was 0.55 / 0.28
 
+        # ── REALISTIC TARGET / STOP CAPS (per vol regime) ──────────────────
+        # Raw ATR multiples produce fantasy targets on high-ATR coins (T3 at
+        # +39%) and suicidal stops (SL at -27%). Cap the absolute move from
+        # entry as a % of price, scaled by vol regime, so T2/T3 are realistic
+        # for the swing horizon and SL stays survivable at the leverage used.
+        _T2_PCT_CAP = {'RANGING':0.04,'LOW':0.06,'MEDIUM':0.09,'HIGH':0.12,'EXTREME':0.15}[vol_regime]
+        _T3_PCT_CAP = {'RANGING':0.07,'LOW':0.10,'MEDIUM':0.15,'HIGH':0.20,'EXTREME':0.25}[vol_regime]
+        _SL_PCT_CAP = {'RANGING':0.025,'LOW':0.04,'MEDIUM':0.06,'HIGH':0.08,'EXTREME':0.10}[vol_regime]
+
         if bias == "LONG":
             # ── FIX #TL (Timing Lag) — Pullback-anchored entry zone ────────
             # The 4H signal fires at candle CLOSE, meaning price has already
@@ -1470,12 +1497,16 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             else:
                 t1 = t1_raw
 
-            # Step 3: T2 must be strictly above T1 — use raw if it already is,
-            # otherwise step it up by the gap between t1_mult and t2_mult
-            t2 = max(t2_raw, t1 + atr * (t2_mult - t1_mult))
-
-            # Step 4: T3 must be strictly above T2 — same pattern
-            t3 = max(t3_raw, t2 + atr * (t3_mult - t2_mult))
+            # Step 3+4: REALISTIC T2/T3 — proportional to the T1 move (so they
+            # scale with structure), then hard-capped as a % of entry so
+            # high-ATR coins don't get fantasy targets. Ordering is preserved.
+            _d1      = abs(t1 - price)
+            _t2_dist = min(max(_d1 * 1.7, atr * (t2_mult - t1_mult)), price * _T2_PCT_CAP)
+            _t2_dist = max(_t2_dist, _d1 * 1.25)            # strict ordering T2 > T1
+            _t3_dist = min(max(_d1 * 2.6, _t2_dist * 1.3),   price * _T3_PCT_CAP)
+            _t3_dist = max(_t3_dist, _t2_dist * 1.25)        # strict ordering T3 > T2
+            t2 = price + _t2_dist
+            t3 = price + _t3_dist
 
         else:
             # ── FIX #TL — SHORT pullback-anchored entry zone ──────��─────
@@ -1504,11 +1535,14 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             else:
                 t1 = t1_raw
 
-            # T2 must be strictly below T1
-            t2 = min(t2_raw, t1 - atr * (t2_mult - t1_mult))
-
-            # T3 must be strictly below T2
-            t3 = min(t3_raw, t2 - atr * (t3_mult - t2_mult))
+            # REALISTIC T2/T3 (SHORT) — R-multiples of the T1 move, %-capped.
+            _d1      = abs(price - t1)
+            _t2_dist = min(max(_d1 * 1.7, atr * (t2_mult - t1_mult)), price * _T2_PCT_CAP)
+            _t2_dist = max(_t2_dist, _d1 * 1.25)
+            _t3_dist = min(max(_d1 * 2.6, _t2_dist * 1.3),   price * _T3_PCT_CAP)
+            _t3_dist = max(_t3_dist, _t2_dist * 1.25)
+            t2 = price - _t2_dist
+            t3 = price - _t3_dist
 
         # ── DURATION ENGINE ─────────────────────────────────────────────
         # FIX #3 applied throughout — daily EMA/MACD from closed candle.
@@ -1531,6 +1565,23 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                 reasons.append(f"⚠️ SL widened to {_atr_sl_min_mult}× ATR — original was {(_sl_distance/atr):.2f}× ATR (noise-stop risk)")
             logger.debug("ATR-SL FIX: %s %s SL widened from %.6f to %.6f (ATR=%.6f)",
                          symbol, bias, _old_sl, stop_loss, atr)
+
+        # ── SL ABSOLUTE-DISTANCE CAP ───────────────────────────────────────
+        # A stop further than the vol-regime cap from entry is a wipeout at the
+        # leverage the bot uses (e.g. -22% SL at L8 = liquidation). Pull it in
+        # so the worst-case loss stays survivable. Keeps R:R honest too.
+        _sl_cap_dist = price * _SL_PCT_CAP
+        if _sl_cap_dist > 0 and abs(price - stop_loss) > _sl_cap_dist:
+            _old_sl_cap = stop_loss
+            if bias == 'LONG':
+                stop_loss = price - _sl_cap_dist
+            else:
+                stop_loss = price + _sl_cap_dist
+            reasons.append(
+                f"⚠️ SL capped to {_SL_PCT_CAP*100:.1f}% of entry "
+                f"(was {abs(price-_old_sl_cap)/price*100:.1f}%) — survivable at leverage")
+            logger.debug("SL-CAP: %s %s SL tightened from %.6f to %.6f (cap %.1f%%)",
+                         symbol, bias, _old_sl_cap, stop_loss, _SL_PCT_CAP*100)
 
         dur_score = 0
         dur_notes = []
@@ -1743,10 +1794,12 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                 return None
 
         # Attach warning tags so display layer can rate the risk
-        result['regime_warning']   = regime_warning    # set above if regime floor missed
-        result['low_conf_warning'] = low_conf_warning  # set above if conf < 4
-        result['btc_regime']       = btc_regime
-        result['confidence']       = confidence        # may have been ML-nudged / downgraded
+        result['regime_warning']      = regime_warning    # set above if regime floor missed
+        result['regime_blocked']      = regime_blocked    # HARD block: drop from autoscan/scan
+        result['regime_block_detail'] = regime_block_detail
+        result['low_conf_warning']    = low_conf_warning  # set above if conf < 4
+        result['btc_regime']          = btc_regime
+        result['confidence']          = confidence        # may have been ML-nudged / downgraded
 
         return result
     except Exception as e:

@@ -19,10 +19,25 @@ ACTIVE_WINDOW_MIN = 30
 
 # --- HTTP / exchange tuning ---
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept': 'application/json',
+    'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Cache-Control': 'no-cache',
 }
 HTTP_TIMEOUT = 15  # default request timeout (seconds)
+
+# MEXC contract (futures) base hosts. Tried in order so a single blocked/slow
+# host can't take scanning down. First reachable host wins for that call.
+MEXC_CONTRACT_HOSTS = [
+    "https://contract.mexc.com",
+    "https://futures.mexc.com",
+]
+# HTTP retry tuning for the shared session (handles transient 403/429/5xx blocks).
+HTTP_MAX_RETRIES = 3
+HTTP_BACKOFF = 0.6
 
 # Mid-tier (rank 51-200) minimum 24h volume per venue.
 BYBIT_MID_MIN_VOL   = 500_000

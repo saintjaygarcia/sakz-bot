@@ -334,7 +334,7 @@ def paper_mark_all(db_connect: Callable,
                                       pos['t2'], pos['t3'])
             if outcome:
                 _write_close(conn, pos['id'], price, outcome,
-                             pos['entry_price'], pos['bias'])
+                             pos['entry_price'], pos['bias'], pos['stop_loss'])
                 closed.append({**pos, 'exit_price': price, 'outcome': outcome})
 
         conn.commit()
@@ -365,7 +365,7 @@ def paper_close_expired(db_connect: Callable,
             pos   = dict(zip(cols, row))
             price = price_fn(pos['exchange'], pos['symbol']) or pos['entry_price']
             _write_close(conn, pos['id'], price, 'EXPIRED',
-                         pos['entry_price'], pos['bias'])
+                         pos['entry_price'], pos['bias'], pos['stop_loss'])
             expired.append({**pos, 'exit_price': price, 'outcome': 'EXPIRED'})
 
         conn.commit()
@@ -394,13 +394,22 @@ def _check_targets(price: float, bias: str,
 
 
 def _write_close(conn, pos_id: int, exit_price: float, outcome: str,
-                 entry: float, bias: str):
-    """Calculate PnL + R:R and write the close record."""
+                 entry: float, bias: str, sl: float = 0.0):
+    """Calculate PnL + R:R and write the close record.
+
+    R:R is realised-reward / planned-risk, where planned-risk is the distance
+    from entry to the stop-loss (NOT the exit distance). Using the exit
+    distance made every trade look like ~1R and corrupted the paper stats."""
     direction = 1.0 if bias == 'LONG' else -1.0
     gross_pct = (exit_price - entry) / entry * direction * 100
     net_pct   = gross_pct - PAPER_FEE_PCT * 2 * 100   # round-trip
 
-    risk_pct  = abs(exit_price - entry) / entry * 100
+    # Planned risk = entry → stop-loss distance. Fall back to exit distance
+    # only if SL is missing, to avoid divide-by-zero.
+    if sl and entry:
+        risk_pct = abs(entry - sl) / entry * 100
+    else:
+        risk_pct = abs(exit_price - entry) / entry * 100
     rr        = net_pct / risk_pct if risk_pct else 0.0
 
     conn.execute(

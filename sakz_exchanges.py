@@ -8,15 +8,83 @@ to see live updates. Behaviour identical to the original in-line code.
 import os
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:  # pragma: no cover - very old urllib3
+    from requests.packages.urllib3.util.retry import Retry
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-from config import HEADERS, HTTP_TIMEOUT  # centralised configuration
+from config import (
+    HEADERS,
+    HTTP_TIMEOUT,
+    MEXC_CONTRACT_HOSTS,
+    HTTP_MAX_RETRIES,
+    HTTP_BACKOFF,
+)  # centralised configuration
 
 # Single source of truth for the default request timeout. Lightweight ticker/
 # price endpoints below intentionally keep their own shorter timeouts (8/10s).
 _TIMEOUT = HTTP_TIMEOUT
+
+
+# ── CRYPTO-ONLY UNIVERSE FILTER ──────────────────────────────────────────────
+# The bot trades crypto perpetuals only. Some venues (notably MEXC) also list
+# tokenised equities, metals, oil and FX/index synthetics (e.g. *STOCK*, gold/
+# silver, oil, indices). These do NOT behave like crypto, so crypto indicators
+# and the BTC-regime gate are meaningless for them. They must never enter the
+# scanner. /analyse stays unrestricted and can still inspect them on request.
+NON_CRYPTO_SYMBOLS = {
+    "XAUTUSDT", "XAUUSDT", "XAGUSDT", "XPTUSDT", "XPDUSDT",
+    "UKOILUSDT", "USOILUSDT", "WTIUSDT", "BRENTUSDT", "XBRUSDT", "XTIUSDT", "NGASUSDT",
+    "SPXUSDT", "US500USDT", "US30USDT", "US100USDT", "NAS100USDT", "NDXUSDT",
+    "GER40USDT", "UK100USDT", "JP225USDT", "HK50USDT", "EU50USDT",
+    "EURUSDT", "GBPUSDT", "JPYUSDT", "AUDUSDT", "CHFUSDT", "CADUSDT", "NZDUSDT",
+}
+NON_CRYPTO_SUBSTRINGS = ("STOCK", "EQUITY")
+
+def is_crypto_symbol(symbol) -> bool:
+    """True only for genuine crypto perp symbols.
+
+    Filters tokenised stocks (e.g. MRVLSTOCKUSDT), metals (XAUT/XAG), oil
+    (UK/USOIL) and FX/index synthetics so they never reach the crypto scorer."""
+    if not symbol:
+        return False
+    s = str(symbol).upper().replace('_USDT', 'USDT').replace('/', '').strip()
+    if s in NON_CRYPTO_SYMBOLS:
+        return False
+    for pat in NON_CRYPTO_SUBSTRINGS:
+        if pat in s:
+            return False
+    return True
+
+
+# ── Shared HTTP session with automatic retry/backoff ─────────────────────────
+# A single pooled Session is reused for every exchange request. Connection reuse
+# (keep-alive) makes repeated scans noticeably faster, and the mounted Retry
+# transparently re-attempts transient blocks (403/429) and 5xx errors with
+# exponential backoff instead of failing the whole scan on the first hiccup.
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(
+        total=HTTP_MAX_RETRIES,
+        connect=HTTP_MAX_RETRIES,
+        read=HTTP_MAX_RETRIES,
+        backoff_factor=HTTP_BACKOFF,
+        status_forcelist=(403, 408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=64)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+SESSION = _build_session()
 
 
 
@@ -48,7 +116,7 @@ def bybit_get_top_symbols(limit=50):
     if MEXC_ONLY:
         return []
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/tickers?category=linear",
+        r    = SESSION.get("https://api.bybit.com/v5/market/tickers?category=linear",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         if data.get('retCode') != 0:
@@ -81,7 +149,7 @@ def bybit_get_mid_symbols(rank_from=51, rank_to=200, min_vol=500_000):
     if MEXC_ONLY:
         return []
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/tickers?category=linear",
+        r    = SESSION.get("https://api.bybit.com/v5/market/tickers?category=linear",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         if data.get('retCode') != 0:
@@ -111,7 +179,7 @@ def bybit_check_available():
         BYBIT_AVAILABLE = False
         return False
     try:
-        r = requests.get("https://api.bybit.com/v5/market/time",
+        r = SESSION.get("https://api.bybit.com/v5/market/time",
                          headers=HEADERS, timeout=8)
         if r.status_code == 200 and r.json().get('retCode') == 0:
             BYBIT_AVAILABLE = True
@@ -128,7 +196,7 @@ def bybit_fetch_ohlcv(symbol, interval='240', limit=100):
     if BYBIT_AVAILABLE is False:
         return None
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/kline",
+        r    = SESSION.get("https://api.bybit.com/v5/market/kline",
                             params={'category': 'linear', 'symbol': symbol,
                                     'interval': interval, 'limit': limit},
                             headers=HEADERS, timeout=_TIMEOUT)
@@ -153,7 +221,7 @@ def bybit_fetch_funding(symbol):
     if MEXC_ONLY:
         return 0
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/funding/history",
+        r    = SESSION.get("https://api.bybit.com/v5/market/funding/history",
                             params={'category': 'linear', 'symbol': symbol, 'limit': 1},
                             headers=HEADERS, timeout=10)
         data = r.json()
@@ -169,7 +237,7 @@ def bybit_get_current_price(symbol):
     if MEXC_ONLY:
         return 0
     try:
-        r    = requests.get("https://api.bybit.com/v5/market/tickers",
+        r    = SESSION.get("https://api.bybit.com/v5/market/tickers",
                             params={'category': 'linear', 'symbol': symbol},
                             headers=HEADERS, timeout=10)
         data = r.json()
@@ -183,7 +251,7 @@ def bybit_get_current_price(symbol):
 
 def mexc_get_top_symbols(limit=50):
     try:
-        r    = requests.get("https://contract.mexc.com/api/v1/contract/ticker",
+        r    = SESSION.get("https://contract.mexc.com/api/v1/contract/ticker",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         vol_list = []
@@ -203,7 +271,7 @@ def mexc_get_top_symbols(limit=50):
                     continue
         else:
             # Spot fallback — already in BTCUSDT format
-            r2 = requests.get("https://api.mexc.com/api/v3/ticker/24hr",
+            r2 = SESSION.get("https://api.mexc.com/api/v3/ticker/24hr",
                               headers=HEADERS, timeout=_TIMEOUT)
             for t in r2.json():
                 sym = t.get('symbol', '')
@@ -228,7 +296,7 @@ def mexc_get_mid_symbols(rank_from=51, rank_to=200, min_vol=250_000):
     Uses the same futures ticker endpoint as mexc_get_top_symbols.
     """
     try:
-        r    = requests.get("https://contract.mexc.com/api/v1/contract/ticker",
+        r    = SESSION.get("https://contract.mexc.com/api/v1/contract/ticker",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         vol_list = []
@@ -246,7 +314,7 @@ def mexc_get_mid_symbols(rank_from=51, rank_to=200, min_vol=250_000):
                 except Exception:
                     continue
         else:
-            r2 = requests.get("https://api.mexc.com/api/v3/ticker/24hr",
+            r2 = SESSION.get("https://api.mexc.com/api/v3/ticker/24hr",
                               headers=HEADERS, timeout=_TIMEOUT)
             for t in r2.json():
                 sym = t.get('symbol', '')
@@ -280,17 +348,40 @@ def mexc_fetch_ohlcv(symbol, interval='4h', limit=100):
         interval_map = {'4h': 'Hour4', '1d': 'Day1', '1h': 'Min60', '15m': 'Min15'}
         mexc_interval = interval_map.get(interval, 'Hour4')
 
-        r = requests.get(
-            f"https://contract.mexc.com/api/v1/contract/kline/{futures_sym}",
-            params={'interval': mexc_interval, 'limit': limit},
-            headers=HEADERS, timeout=_TIMEOUT
-        )
-        if r.status_code != 200:
-            logger.warning("MEXC %s futures kline HTTP %d", futures_sym, r.status_code)
-            return None
-        data = r.json()
-        if not data.get('success') or not data.get('data'):
-            logger.debug("MEXC %s futures kline empty response", futures_sym)
+        # FIX #MEXC-URL -- the kline URL was previously wrapped in literal
+        # braces (an f-string brace-escape bug), producing the malformed URL
+        # "{https://contract.mexc.com/...}". Every MEXC candle fetch raised
+        # MissingSchema and was swallowed, which looked exactly like MEXC
+        # being "blocked from scanning". The path is now built correctly and
+        # we try each configured contract host so one blocked endpoint can't
+        # stop scanning.
+        data = None
+        last_status = None
+        for base in MEXC_CONTRACT_HOSTS:
+            url = f"{base}/api/v1/contract/kline/{futures_sym}"
+            try:
+                r = SESSION.get(
+                    url,
+                    params={'interval': mexc_interval, 'limit': limit},
+                    timeout=_TIMEOUT,
+                )
+            except Exception as e:
+                logger.debug("MEXC %s kline host %s error: %s", futures_sym, base, e)
+                continue
+            last_status = r.status_code
+            if r.status_code != 200:
+                logger.debug("MEXC %s kline host %s HTTP %d", futures_sym, base, r.status_code)
+                continue
+            try:
+                payload = r.json()
+            except Exception:
+                continue
+            if payload.get('success') and payload.get('data'):
+                data = payload
+                break
+        if data is None:
+            logger.warning("MEXC %s futures kline unavailable (last HTTP %s)",
+                           futures_sym, last_status)
             return None
 
         d = data['data']
@@ -317,7 +408,7 @@ def mexc_fetch_ohlcv(symbol, interval='4h', limit=100):
 def mexc_get_current_price(symbol):
     try:
         clean = symbol.replace('_USDT', 'USDT').replace('/', '')
-        r     = requests.get("https://api.mexc.com/api/v3/ticker/price",
+        r     = SESSION.get("https://api.mexc.com/api/v3/ticker/price",
                              params={'symbol': clean}, headers=HEADERS, timeout=10)
         data  = r.json()
         return float(data.get('price', 0) or 0)
@@ -331,7 +422,7 @@ def binance_check_available():
         BINANCE_AVAILABLE = False
         return False
     try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/ping",
+        r = SESSION.get("https://fapi.binance.com/fapi/v1/ping",
                          headers=HEADERS, timeout=8)
         if r.status_code == 200:
             BINANCE_AVAILABLE = True
@@ -348,7 +439,7 @@ def binance_get_top_symbols(limit=50):
     if not BINANCE_AVAILABLE:
         return []
     try:
-        r    = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
+        r    = SESSION.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         if not isinstance(data, list):
@@ -378,7 +469,7 @@ def binance_get_mid_symbols(rank_from=51, rank_to=200, min_vol=2_000_000):
     if not BINANCE_AVAILABLE:
         return []
     try:
-        r    = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
+        r    = SESSION.get("https://fapi.binance.com/fapi/v1/ticker/24hr",
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
         if not isinstance(data, list):
@@ -405,7 +496,7 @@ def binance_fetch_ohlcv(symbol, interval='4h', limit=100):
     if not BINANCE_AVAILABLE:
         return None
     try:
-        r    = requests.get("https://fapi.binance.com/fapi/v1/klines",
+        r    = SESSION.get("https://fapi.binance.com/fapi/v1/klines",
                             params={'symbol': symbol, 'interval': interval, 'limit': limit},
                             headers=HEADERS, timeout=_TIMEOUT)
         data = r.json()
@@ -426,7 +517,7 @@ def binance_fetch_funding(symbol):
     if not BINANCE_AVAILABLE:
         return 0
     try:
-        r    = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
+        r    = SESSION.get("https://fapi.binance.com/fapi/v1/fundingRate",
                             params={'symbol': symbol, 'limit': 1},
                             headers=HEADERS, timeout=10)
         data = r.json()
@@ -440,7 +531,7 @@ def binance_get_current_price(symbol):
     if not BINANCE_AVAILABLE:
         return 0
     try:
-        r    = requests.get("https://fapi.binance.com/fapi/v1/ticker/price",
+        r    = SESSION.get("https://fapi.binance.com/fapi/v1/ticker/price",
                             params={'symbol': symbol}, headers=HEADERS, timeout=10)
         data = r.json()
         return float(data.get('price', 0) or 0)
