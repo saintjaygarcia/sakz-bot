@@ -351,6 +351,18 @@ def db_init():
             ts          TEXT NOT NULL
         );
 
+        -- BTC regime-shift market alert: single-row persistent state so the
+        -- watcher only fires on genuine direction changes and survives restarts.
+        CREATE TABLE IF NOT EXISTS btc_regime_alert_state (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            last_regime     TEXT,
+            pending_regime  TEXT,
+            pending_since   TEXT,
+            pending_price   REAL,
+            last_alert_ts   TEXT,
+            last_price      REAL
+        );
+
         CREATE TABLE IF NOT EXISTS snail_unlocked (
             chat_id     INTEGER PRIMARY KEY,
             unlocked_at TEXT NOT NULL
@@ -885,6 +897,39 @@ def db_get_btc_price_1h_ago():
               (cutoff, floor))
     row = c.fetchone(); conn.close()
     return row['price'] if row else None
+
+# ── BTC regime-shift alert: persistent watcher state (single row, id=1) ──────
+def db_btc_alert_get_state():
+    """Return the BTC regime-shift watcher state, or empty defaults if unset."""
+    conn = db_connect()
+    c    = conn.cursor()
+    c.execute("SELECT last_regime, pending_regime, pending_since, pending_price, "
+              "last_alert_ts, last_price FROM btc_regime_alert_state WHERE id=1")
+    row = c.fetchone(); conn.close()
+    if not row:
+        return {"last_regime": None, "pending_regime": None, "pending_since": None,
+                "pending_price": None, "last_alert_ts": None, "last_price": None}
+    return {
+        "last_regime":    row["last_regime"],
+        "pending_regime": row["pending_regime"],
+        "pending_since":  row["pending_since"],
+        "pending_price":  row["pending_price"],
+        "last_alert_ts":  row["last_alert_ts"],
+        "last_price":     row["last_price"],
+    }
+
+def db_btc_alert_save_state(last_regime=None, pending_regime=None, pending_since=None,
+                            pending_price=None, last_alert_ts=None, last_price=None):
+    """Upsert the single-row BTC regime-shift watcher state."""
+    conn = db_connect()
+    c    = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO btc_regime_alert_state "
+        "(id, last_regime, pending_regime, pending_since, pending_price, last_alert_ts, last_price) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?)",
+        (last_regime, pending_regime, pending_since, pending_price, last_alert_ts, last_price)
+    )
+    conn.commit(); conn.close()
 
 def db_save_tracking(chat_id, signal, entry_price, start_time, interval_min):
     conn = db_connect()

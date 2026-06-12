@@ -224,6 +224,8 @@ from sakz_db import (  # noqa: F401  re-exported; existing call sites unchanged
     db_get_broadcast_channels,
     db_save_btc_price,
     db_get_btc_price_1h_ago,
+    db_btc_alert_get_state,
+    db_btc_alert_save_state,
     db_save_tracking,
     db_remove_tracking,
     db_load_all_tracking,
@@ -396,7 +398,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�����������������������������������������������������������������──────────────────────────────────────────
+# ──�������������������������������������������������������������������──────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -1268,7 +1270,7 @@ def _pro_full_command_guide() -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PRIME — secret high-conviction subscription, per-user GMT alerts, 15-min cache
-# ══════════════���════���═══���═══�����══════════════════════════════════════════════
+# ═════════��════���════���═══���═══�����══════════════════════════════════════════════
 import sakz_prime as prime
 import json as _json
 import sakz_signal_logic as _SIGLOGIC   # FIX #SIGLOGIC-UNDEFINED — this module
@@ -1738,6 +1740,14 @@ _scan_cache_lock   = asyncio.Lock()   # prevents cache stampede
 # { 'regime': 'BULL'|'BEAR'|'NEUTRAL', 'time': datetime }
 _btc_regime_cache_ttl = 900  # 15 minutes — same as scan cache
 
+# ── BTC regime-shift market alert (hybrid: regime flip + price confirmation) ──
+# The watcher fires ONLY on a genuine BTC direction change (bullish<->bearish),
+# not on every wiggle. Anti-spam is the state-change itself — no fixed cooldown.
+_BTC_ALERT_HOLD_SECONDS = 600   # new direction must persist 10 min before broadcasting (whipsaw guard)
+_BTC_ALERT_CONFIRM_PCT  = 0.2   # BTC must move >=0.2% in the regime direction over the hold window
+_BTC_BULL_REGIMES = ("STRONG_BULL", "BULL")
+_BTC_BEAR_REGIMES = ("STRONG_BEAR", "BEAR")
+
 # ── BTC Dominance Cache ─────────────────────────��───��─��───��──���───����������─��─��─��─��
 # BTC.D rising = capital flowing out of alts → penalise altcoin LONGs
 # Fetched from Bybit BTCDOMUSDT or Binance BTCDOMUSDT (may not always be available)
@@ -2049,7 +2059,7 @@ _BTC_PRICE_TTL = 60           # refresh every 60 s
 # ────────────────────────���────────────────────
 
 
-# ─────────────────────────────────────────────
+# ────────────────────���────────────────────────
 # FEATURE: FIBONACCI RETRACEMENT CONFLUENCE
 # ─────────────────────────────────────────────
 # Auto-compute 0.382, 0.5, and 0.618 Fibonacci retracement levels between
@@ -2938,7 +2948,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
 # ─────────────────────────────────────────────
-# ═════════════════��════����══��══����══����══����══════════════����═══════════════════════
+# ��════════════════��════����══��══����══����══����══════════════����═══════════════════════
 # LIQUIDITY FILTER
 # ───────────────��──────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
@@ -7912,6 +7922,15 @@ async def prompt_pnl_display_mode(update, context):
         await tgt.reply_text("\u26a0\ufe0f Signal data lost. Run /pnl again.")
         return
 
+    # ALTERNATE the card style on every /pnl query so the two designs rotate
+    # automatically (no Refresh tap needed): query 1 -> 🃏 3D deck (0),
+    # query 2 -> 🟩 flat terminal (1), query 3 -> 3D deck (0), and so on. The
+    # seed persists per-user in user_data and is applied to the normal,
+    # stopped-out, and not-recent render paths alike.
+    _seed = (int(context.user_data.get('pnl_style_seed', -1)) + 1) % 2
+    context.user_data['pnl_style_seed'] = _seed
+    context.user_data['pnl_card_style'] = _seed
+
     # MEMORY-MODEL GUARD — honour evictions + stop-loss before rendering.
     mode, record = _pnl_lifecycle_mode(signal)
     if mode == 'not_recent':
@@ -7955,7 +7974,7 @@ async def prompt_pnl_display_mode(update, context):
     sugg = lev_data['suggested'] if lev_data else 10
     context.user_data.setdefault('pnl_leverage', sugg)
     context.user_data['pnl_capital'] = None
-    context.user_data['pnl_card_style'] = 0   # each new /pnl starts on the initial 3D deck view
+    # pnl_card_style is set above and ALTERNATES on each /pnl query — do not reset it here.
     cur_lev = int(context.user_data.get('pnl_leverage', sugg))
 
     def _lvb(n):
@@ -10938,6 +10957,180 @@ async def funding_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # Checks BTC price every 15 min.
 # If BTC moved >3% in 1 hour → emergency re-scan
 # ─────────────────────────────────────────────
+def _btc_regime_bucket(regime: str) -> str:
+    """Collapse the 5 regime labels into a tradable direction bucket."""
+    if regime in _BTC_BULL_REGIMES:
+        return "BULLISH"
+    if regime in _BTC_BEAR_REGIMES:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _btc_alert_recipients() -> set:
+    """Union of every subscriber surface, deduplicated to one chat per id.
+    Sources: autoscan subs + /pro subs + /prime subs + broadcast channels.
+    A user subscribed to several still receives exactly one alert."""
+    ids: set = set()
+    try:
+        ids.update(int(c) for c in auto_scan_subscribers.keys())
+    except Exception as e:
+        logger.warning("BTC alert: autoscan recipients failed: %s", e)
+    for label, fetch in (
+        ("pro",       lambda: db_pro_get_all_subscribers()),
+        ("prime",     lambda: [u["chat_id"] for u in db_prime_get_all_users()]),
+        ("broadcast", lambda: db_get_broadcast_channels()),
+    ):
+        try:
+            ids.update(int(c) for c in fetch())
+        except Exception as e:
+            logger.warning("BTC alert: %s recipients failed: %s", label, e)
+    return ids
+
+
+def _btc_alert_message(regime: str, bucket: str, price: float, move_pct: float) -> str:
+    """Build the counter-trend risk advisory for a BTC direction shift."""
+    label = regime.replace("_", " ").title()
+    if bucket == "BULLISH":
+        head   = "🟢 BTC TURNING BULLISH"
+        advice = (
+            "⚠️ Counter-trend risk for SHORTS\n"
+            "BTC is showing bullish strength, and it drives the whole market.\n"
+            "A counter-trend bounce can squeeze short positions.\n\n"
+            "• Minimize risk / tighten stops on SHORT positions\n"
+            "• Consider trimming or holding off on new shorts\n"
+            "• Longs are favored while BTC stays strong"
+        )
+    else:  # BEARISH
+        head   = "🔴 BTC TURNING BEARISH"
+        advice = (
+            "⚠️ Counter-trend risk for LONGS\n"
+            "BTC is showing bearish weakness, and it drives the whole market.\n"
+            "A counter-trend drop can flush long positions.\n\n"
+            "• Minimize risk / tighten stops on LONG positions\n"
+            "• Consider trimming or holding off on new longs\n"
+            "• Shorts are favored while BTC stays weak"
+        )
+    return (
+        "🚨 BTC MARKET SHIFT\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{head}   ({label})\n"
+        f"BTC: ${price:,.0f}   ·   {move_pct:+.2f}% over last ~10m\n\n"
+        f"{advice}\n\n"
+        "ℹ️ Advisory only — not financial advice. Manage your own risk.\n"
+        "Use /scan or /best for fresh setups."
+    )
+
+
+async def _btc_alert_broadcast(bot, regime: str, bucket: str, price: float, move_pct: float) -> int:
+    """Send the advisory to every subscriber, throttled for Telegram limits."""
+    recipients = _btc_alert_recipients()
+    if not recipients:
+        logger.info("BTC regime alert (%s): no subscribers to notify", bucket)
+        return 0
+    msg  = _btc_alert_message(regime, bucket, price, move_pct)
+    sent = 0
+    for i, chat_id in enumerate(recipients, 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg)
+            sent += 1
+        except Exception as e:
+            logger.warning("BTC regime alert failed for %s: %s", chat_id, e)
+        if i % 25 == 0:
+            await asyncio.sleep(1)   # ~25 msgs/sec — under Telegram's ~30/s global cap
+    logger.info("BTC regime alert (%s) delivered to %d/%d chats", bucket, sent, len(recipients))
+    return sent
+
+
+async def btc_regime_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every 60s: detect a genuine BTC regime *direction* shift and broadcast a
+    counter-trend risk advisory to all subscribers (deduplicated to one msg/chat).
+
+    Hybrid fire condition — ALL must hold:
+      1. direction differs from the last alerted direction (real state change)
+      2. direction is not NEUTRAL (skip ambiguous middle states)
+      3. the new direction has held >= _BTC_ALERT_HOLD_SECONDS (whipsaw guard)
+         AND BTC price has moved >= _BTC_ALERT_CONFIRM_PCT in that direction over
+         the hold window (the price-action confirmation half of the hybrid).
+    Anti-spam is the state-change itself: it only fires on a transition, so it
+    won't repeat unless BTC actually reverses direction. State persists in the DB.
+    """
+    btc_price = _get_live_price("BTCUSDT", "BYBIT")
+    if not btc_price:
+        return
+    try:
+        db_save_btc_price(btc_price)
+    except Exception:
+        pass
+
+    bucket = _btc_regime_bucket(get_btc_regime())
+    now    = datetime.now()
+
+    try:
+        st = db_btc_alert_get_state()
+    except Exception as e:
+        logger.warning("BTC alert state read failed: %s", e)
+        return
+
+    last_alerted  = st.get("last_regime")
+    pending       = st.get("pending_regime")
+    pending_since = st.get("pending_since")
+    pending_price = st.get("pending_price")
+
+    def _save(**kw):
+        base = {
+            "last_regime":    last_alerted,
+            "pending_regime": pending,
+            "pending_since":  pending_since,
+            "pending_price":  pending_price,
+            "last_alert_ts":  st.get("last_alert_ts"),
+            "last_price":     btc_price,
+        }
+        base.update(kw)
+        try:
+            db_btc_alert_save_state(**base)
+        except Exception as e:
+            logger.warning("BTC alert state save failed: %s", e)
+
+    # Ambiguous middle state — never alert; drop any pending candidate.
+    if bucket == "NEUTRAL":
+        if pending is not None:
+            _save(pending_regime=None, pending_since=None, pending_price=None)
+        return
+
+    # Same direction we already alerted on — nothing new to say.
+    if bucket == last_alerted:
+        if pending is not None:
+            _save(pending_regime=None, pending_since=None, pending_price=None)
+        return
+
+    # New direction — (re)start the 10-minute hold timer and anchor the price.
+    if pending != bucket:
+        _save(pending_regime=bucket, pending_since=now.isoformat(), pending_price=btc_price)
+        return
+
+    # Candidate direction is holding — has it held long enough?
+    try:
+        since = datetime.fromisoformat(pending_since) if pending_since else now
+    except Exception:
+        since = now
+    if (now - since).total_seconds() < _BTC_ALERT_HOLD_SECONDS:
+        return
+
+    # Hybrid price-action confirmation over the hold window.
+    move_pct = ((btc_price - pending_price) / pending_price * 100.0) if pending_price else 0.0
+    if bucket == "BULLISH" and move_pct < _BTC_ALERT_CONFIRM_PCT:
+        return
+    if bucket == "BEARISH" and move_pct > -_BTC_ALERT_CONFIRM_PCT:
+        return
+
+    # All conditions met — broadcast, then lock in the new alerted direction.
+    regime_label = get_btc_regime()
+    await _btc_alert_broadcast(context.bot, regime_label, bucket, btc_price, move_pct)
+    last_alerted = bucket
+    _save(last_regime=bucket, pending_regime=None, pending_since=None,
+          pending_price=None, last_alert_ts=now.isoformat())
+
+
 async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
     """Every 15 min: snapshot BTC price & check for >3% 1h move."""
     # Get current BTC price
@@ -13583,7 +13776,7 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tf_label = TF_CONFIGS[tf_key]['label']
 
-    # ── HOT-GROUND WARNING — sent before the analysis ─────��──────────────────
+    # ── HOT-GROUND WARNING — sent before the analysis ─────��────────────��─────
     warning_msg = (
         "⚠️⚠️ HOT GROUND — READ BEFORE PROCEEDING ⚠️⚠️\n\n"
         "You are using /analyse — the unfiltered analysis mode.\n\n"
@@ -14977,7 +15170,7 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 MID-TIER SCAN — ranks {rank_from}–{rank_to}\n\n"
         f"Scanning ~{span} coins per exchange (Bybit + MEXC + Binance)…\n"
         f"These are the less-watched, higher-inefficiency pairs.\n"
-        f"⏳ Please wait 60���90 seconds…"
+        f"⏳ Please wait 60����90 seconds…"
     )
 
     loop = asyncio.get_event_loop()
@@ -15513,7 +15706,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif wide_ev > cur_ev + 0.05:
         recs.append(
-            f"📈 WIDER T1 (×1.25) has higher EV ({wide_ev:+.3f} vs {cur_ev:+.3f}) — "
+            f"��� WIDER T1 (×1.25) has higher EV ({wide_ev:+.3f} vs {cur_ev:+.3f}) — "
             f"current T1 multipliers are leaving money on the table. Consider increasing by ~15–20%."
         )
     else:
@@ -16882,6 +17075,16 @@ def main():
         interval=900,
         first=120,
         name="btc_volatility"
+    )
+
+    # NEW — BTC regime-shift market alert every 60 seconds
+    # Broadcasts a counter-trend risk advisory to all subscribers when BTC
+    # genuinely flips bullish<->bearish (hybrid: regime + 10-min hold + price move).
+    app.job_queue.run_repeating(
+        btc_regime_alert_job,
+        interval=60,
+        first=90,
+        name="btc_regime_alert"
     )
 
     # NEW — Trend-dying monitor every 30 minutes
