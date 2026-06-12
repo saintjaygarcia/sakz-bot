@@ -396,7 +396,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�����������������������������������������������������──────────────────────────────────────────
+# ──�������������������������������������������������������──────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -1268,7 +1268,7 @@ def _pro_full_command_guide() -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PRIME — secret high-conviction subscription, per-user GMT alerts, 15-min cache
-# ════════════════════════════��══════════════════════════════════════════════
+# ═══════════════════════════�����══════════════════════════════════════════════
 import sakz_prime as prime
 import json as _json
 from sakz_db import (
@@ -1804,7 +1804,7 @@ except ImportError:
 
 # ─────────────────────────────────────────────
 # AUTO PAPER TRADING — sakz_paper.py
-# ─────────────────────────────────────────────
+# ─────────────────────────────���───────────────
 try:
     from sakz_paper import (
         paper_init_db, paper_maybe_open, paper_mark_all,
@@ -4942,6 +4942,70 @@ def _autoscan_recently_stopped(exch: str, sym: str, bias: str) -> bool:
         return False
 
 
+async def autoscandiag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unlisted diagnostic — explains exactly why autoscan is (or isn't) pushing."""
+    _track(update)
+    chat_id = update.effective_chat.id
+
+    lines = ["\U0001F50E *Autoscan diagnostics*", ""]
+
+    # 1. Subscribers
+    n_subs = len(auto_scan_subscribers)
+    mine = chat_id in auto_scan_subscribers
+    my_tf = auto_scan_subscribers.get(chat_id)
+    my_tf_label = (_tf_display(my_tf) if my_tf else "All timeframes") if mine else "\u2014"
+    lines.append(f"\u2022 Subscribers: *{n_subs}*")
+    lines.append(f"\u2022 You subscribed: *{'YES' if mine else 'NO'}* ({my_tf_label})")
+    if not mine:
+        lines.append("  \u21B3 Run /autoscan to subscribe.")
+
+    # 2. Boot / grace status
+    since_boot = (datetime.now() - _BOT_START_TS).total_seconds()
+    in_grace = since_boot < _AUTOSCAN_STARTUP_GRACE_SECS
+    lines.append(f"\u2022 Uptime: *{int(since_boot // 60)}m {int(since_boot % 60)}s*")
+    if in_grace:
+        remaining = int(_AUTOSCAN_STARTUP_GRACE_SECS - since_boot)
+        lines.append(f"\u2022 Startup grace: *ACTIVE* \u2014 no pushes for ~{remaining // 60}m {remaining % 60}s more")
+    else:
+        lines.append("\u2022 Startup grace: *cleared* (pushes allowed)")
+
+    # 3. Scan cache
+    cache = getattr(state, "_scan_cache", None)
+    passing = []
+    have_cache = bool(cache and cache.get('results') is not None)
+    if have_cache:
+        age = (datetime.now() - cache['time']).total_seconds()
+        results = cache['results'] or []
+        passing = [r for r in results if passes_display_floor(r, AUTOSCAN_DISPLAY_CONF_MIN)]
+        lines.append(f"\u2022 Last scan: *{len(results)}* signals, *{age / 60:.1f}m* old")
+        lines.append(f"\u2022 Pass conf floor (\u2265{AUTOSCAN_DISPLAY_CONF_MIN:.0f}): *{len(passing)}*")
+        top = sorted(results, key=lambda r: float(r.get('confidence') or 0), reverse=True)[:5]
+        if top:
+            lines.append("\u2022 Top by confidence:")
+            for r in top:
+                lines.append(
+                    f"   \u2013 {r.get('symbol', '?')} {r.get('bias', '?')} "
+                    f"{float(r.get('confidence') or 0):.0f}/10"
+                )
+    else:
+        lines.append("\u2022 Last scan: *no cache yet* (scanner hasn't produced results)")
+
+    # 4. Verdict
+    lines.append("")
+    if not mine:
+        lines.append("\u27A1\uFE0F Not subscribed \u2014 that's why you get nothing. Run /autoscan.")
+    elif in_grace:
+        lines.append("\u27A1\uFE0F In startup grace \u2014 pushes resume after the grace window.")
+    elif not have_cache:
+        lines.append("\u27A1\uFE0F Scanner has no results yet \u2014 wait for the next scan, or check exchange access on the host.")
+    elif len(passing) == 0:
+        lines.append("\u27A1\uFE0F No signal currently clears the confidence floor \u2014 nothing to push right now.")
+    else:
+        lines.append("\u27A1\uFE0F Conditions look OK \u2014 qualifying signals should push on the next tick.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
 async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Runs every 10 minutes.
@@ -4980,6 +5044,19 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         # original call even when the coin keeps running and gets re-detected.
         _register_lifecycle_signal(r)
 
+        # FIX #RESTART-FLOOD — within the post-restart grace window we skip the
+        # push so a restart doesn't re-blast every currently-live signal.
+        #
+        # FIX #DEAD-AUTOSCAN — this skip MUST happen BEFORE seeding the dedup
+        # high-water mark below. Previously the mark was seeded first and then
+        # the push was skipped, so every signal seen during the 15-min grace was
+        # permanently marked "already sent" without ever being delivered. In a
+        # stable market (or a bot that restarts periodically and re-enters the
+        # grace each time) this made autoscan go completely silent. By skipping
+        # before seeding, these signals are delivered once the grace elapses.
+        if (datetime.now() - _BOT_START_TS).total_seconds() < _AUTOSCAN_STARTUP_GRACE_SECS:
+            continue
+
         # CONFIDENCE-AWARE DEDUP ("always" subscribers):
         # The same call is not repeated consecutively unless its confidence has
         # risen above the last value we pushed. Genuinely newer/stronger calls
@@ -4989,12 +5066,6 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         if should_send_always:
             _autoscan_sent[dedup_key] = new_rec
             _autoscan_prune()
-
-        # FIX #RESTART-FLOOD — within the post-restart grace window, the dedup
-        # high-water mark above is seeded, but we skip the actual push so a
-        # restart doesn't re-blast every currently-live signal.
-        if (datetime.now() - _BOT_START_TS).total_seconds() < _AUTOSCAN_STARTUP_GRACE_SECS:
-            continue
 
         trade_type, tt_emoji = _autoscan_trade_type(r)
         conf       = r['confidence']
@@ -9730,7 +9801,7 @@ async def cscan_refresh_callback(update: Update, context: ContextTypes.DEFAULT_T
 # SCAN FEED REFRESH — for /scan and /top results
 # Refreshes live prices of all signals in the
 # last scan feed, shown as a PnL table.
-# ─────────────────────────────────────────────
+# ───────────────────────────────��─────────────
 async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Refresh handler for /scan, /scalp, /swing, and single-pair scan feeds.
@@ -16488,6 +16559,8 @@ def main():
 
     # ── PRIME — secret high-conviction subscription ───────────────
     app.add_handler(CommandHandler("prime", prime_command))
+    # Unlisted autoscan diagnostic — explains why autoscan is/ isn't pushing
+    app.add_handler(CommandHandler("autoscandiag", autoscandiag_command))
     # 15-minute live cache refresh of the ranked Top picks
     app.job_queue.run_repeating(
         prime_refresh_job,

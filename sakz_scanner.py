@@ -72,6 +72,15 @@ AUTOSCAN_DISPLAY_CONF_MIN = max(
     float(os.getenv("AUTOSCAN_DISPLAY_CONF_MIN", str(SCAN_DISPLAY_CONF_MIN))),
 )
 
+# ---- AUTOSCAN structural gating switch ----------------------------------------
+# When OFF (default), the structural gates added during the accuracy pass
+# (BTC-regime gate, score-gap, direction-flip, counter-trend) behave as SOFT
+# WARNINGS on background autoscan/scan instead of HARD-dropping the signal —
+# i.e. autoscan surfaces signals like it did before. The confidence/R:R math,
+# candle-quality scoring and display floor are unaffected.
+# Set AUTOSCAN_STRICT_GATE=1 to re-enable the hard structural blocks.
+AUTOSCAN_STRICT_GATE = os.getenv("AUTOSCAN_STRICT_GATE", "0").strip().lower() in ("1", "true", "yes", "on")
+
 _SCAN_SHOW_ALL_FLAGS = {"all", "low", "everything", "full"}
 _btc_regime_cache_ttl = 900
 _BTCD_TTL = 1800
@@ -1167,8 +1176,8 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         # When user_requested=True, convert to soft warning so analysis shows.
         if (winning - losing) < 2:
             gap_detail = f"gap={winning-losing} (winning={winning} losing={losing})"
-            if user_requested:
-                logger.debug("GAP SOFT-WARN (user_requested): %s %s %s", symbol, bias, gap_detail)
+            if user_requested or not AUTOSCAN_STRICT_GATE:
+                logger.debug("GAP SOFT-WARN: %s %s %s", symbol, bias, gap_detail)
                 ig_l.append(f"⚠️ Narrow gap: {gap_detail} — choppy market, trade carefully")
             else:
                 logger.debug("GAP BLOCK: %s %s gap=%d (winning=%d losing=%d) — too close",
@@ -1197,10 +1206,10 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                         f"tried {last['bias']}→{bias} after {hours_since:.1f}h, "
                         f"conf≈{round(tentative_ratio)} (need {_FLIP_MIN_CONF} to auto-flip)"
                     )
-                    if user_requested:
+                    if user_requested or not AUTOSCAN_STRICT_GATE:
                         # ── SOFT WARN: show analysis anyway for manual queries ──
                         # The user explicitly asked — they want the current picture.
-                        logger.debug("FLIP SOFT-WARN (user_requested): %s %s", symbol, flip_detail)
+                        logger.debug("FLIP SOFT-WARN: %s %s", symbol, flip_detail)
                         ig_l.append(f"⚠️ Flip cooldown: {flip_detail} — showing analysis anyway")
                     else:
                         # ── HARD BLOCK: auto-scan / background jobs ────────────
@@ -1222,8 +1231,8 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
 
         if winning < min_score_req:
             ct_detail = f"winning={winning} < min_score_req={min_score_req} ({bias} vs daily EMA)"
-            if user_requested:
-                logger.debug("COUNTER_TREND SOFT-WARN (user_requested): %s %s", symbol, ct_detail)
+            if user_requested or not AUTOSCAN_STRICT_GATE:
+                logger.debug("COUNTER_TREND SOFT-WARN: %s %s", symbol, ct_detail)
                 ig_l.append(f"⚠️ Counter-trend: {ct_detail} — signal opposes daily EMA, higher risk")
             else:
                 return ScanFailure(REASON_COUNTER_TREND, detail=ct_detail)
@@ -1799,6 +1808,11 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
 
         # Attach warning tags so display layer can rate the risk
         result['regime_warning']      = regime_warning    # set above if regime floor missed
+        # AUTOSCAN_STRICT_GATE (default OFF): when off, the BTC-regime gate is a
+        # soft warning only — the signal still surfaces in autoscan/scan as it
+        # did before. regime_warning is preserved on the result either way.
+        if not AUTOSCAN_STRICT_GATE:
+            regime_blocked = False
         result['regime_blocked']      = regime_blocked    # HARD block: drop from autoscan/scan
         result['regime_block_detail'] = regime_block_detail
         result['low_conf_warning']    = low_conf_warning  # set above if conf < 4
