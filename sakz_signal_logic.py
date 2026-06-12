@@ -97,6 +97,7 @@ def autoscan_decide_send(
     prev: Optional[Dict[str, Any]],
     confidence: float,
     now: Optional[datetime] = None,
+    reminder_secs: Optional[float] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Decide whether to push a call to an "always" subscriber.
 
@@ -127,8 +128,61 @@ def autoscan_decide_send(
     if conf > prev_conf:
         return True, {"confidence": conf, "sent_at": now}
 
+    # REMINDER: re-surface a still-valid call after the reminder window has
+    # elapsed, even when its confidence has not risen. The high-water mark is
+    # preserved (max of prev/current) so a future genuine upgrade is still
+    # detected, while sent_at is reset to restart the reminder clock.
+    if reminder_secs and reminder_secs > 0:
+        last = _as_dt(prev.get("sent_at"))
+        if last is not None and (now - last).total_seconds() >= reminder_secs:
+            return True, {"confidence": max(prev_conf, conf), "sent_at": now}
+
     # Same call, not stronger -> do not repeat consecutively.
     return False, dict(prev)
+
+
+def lifecycle_milestones(bias, price, stop_loss, t1, t2, t3, already):
+    """Given a live price, return the list of NEWLY-reached milestones for a
+    tracked autoscan signal.
+
+    Tags returned (a subset of): 't1', 't2', 't3', 'sl'.
+
+    - LONG: a target is hit when price >= target; SL when price <= stop_loss.
+    - SHORT: a target is hit when price <= target; SL when price >= stop_loss.
+    - SL is terminal and mutually exclusive with targets for any single price
+      snapshot, so when SL is newly hit only ['sl'] is returned.
+    - `already` is a mapping with truthy values for milestones already alerted
+      (keys 't1','t2','t3','sl'); those are never returned again.
+    """
+    out = []
+    try:
+        price = float(price or 0)
+    except Exception:
+        price = 0.0
+    if price <= 0:
+        return out
+    b = str(bias or "").upper()
+    already = already or {}
+
+    def _f(v):
+        try:
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    sl = _f(stop_loss)
+    if sl > 0 and not already.get('sl'):
+        sl_hit = (price <= sl) if b == 'LONG' else (price >= sl)
+        if sl_hit:
+            return ['sl']
+
+    for tag, lvl in (('t1', _f(t1)), ('t2', _f(t2)), ('t3', _f(t3))):
+        if lvl <= 0 or already.get(tag):
+            continue
+        hit = (price >= lvl) if b == 'LONG' else (price <= lvl)
+        if hit:
+            out.append(tag)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -352,7 +406,7 @@ def should_clear_dormant(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Peak-reversal eviction
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────���──────────────
 
 def peak_favorable_pct(bias: str, entry: float, peak_price: float) -> float:
     """Favourable % the peak reached vs entry (positive when in profit)."""

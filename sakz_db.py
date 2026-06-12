@@ -1379,6 +1379,26 @@ CREATE TABLE IF NOT EXISTS signal_evictions (
     reason     TEXT,
     PRIMARY KEY (exchange, symbol)
 );
+CREATE TABLE IF NOT EXISTS autoscan_lifecycle (
+    key         TEXT PRIMARY KEY,
+    exchange    TEXT,
+    symbol      TEXT,
+    bias        TEXT,
+    sig_tf      TEXT,
+    entry       REAL,
+    stop_loss   REAL,
+    t1          REAL,
+    t2          REAL,
+    t3          REAL,
+    recipients  TEXT NOT NULL DEFAULT '[]',
+    t1_alerted  INTEGER NOT NULL DEFAULT 0,
+    t2_alerted  INTEGER NOT NULL DEFAULT 0,
+    t3_alerted  INTEGER NOT NULL DEFAULT 0,
+    sl_alerted  INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT,
+    updated_at  TEXT
+);
 """
 
 
@@ -1432,6 +1452,102 @@ def _row_to_signal(e):
         "last_motion_time": e.get("last_motion_time"),
         "status": e.get("status"),
     }
+
+
+def db_lifecycle_track(key, exchange, symbol, bias, sig_tf,
+                       entry, stop_loss, t1, t2, t3, chat_id):
+    """Track an autoscan signal for T1/T2/T3/SL milestone alerts and record a
+    recipient. Re-detection refreshes the recipient list; a previously-closed
+    key is reopened with its alert flags reset (a genuinely new run of the
+    setup). libsql-safe: SELECT-then-UPDATE/INSERT (no ON CONFLICT/rowcount).
+    """
+    try:
+        conn = db_connect(); c = conn.cursor()
+        now = datetime.now().isoformat()
+        c.execute("SELECT recipients, active FROM autoscan_lifecycle WHERE key=?", (key,))
+        row = c.fetchone()
+        if row is not None:
+            if isinstance(row, dict):
+                recips_raw = row.get('recipients'); active = row.get('active')
+            else:
+                recips_raw = row[0]; active = row[1]
+            try:
+                recips = json.loads(recips_raw or '[]')
+            except Exception:
+                recips = []
+            if chat_id not in recips:
+                recips.append(chat_id)
+            if active == 0:
+                c.execute(
+                    "UPDATE autoscan_lifecycle SET recipients=?, exchange=?, symbol=?, "
+                    "bias=?, sig_tf=?, entry=?, stop_loss=?, t1=?, t2=?, t3=?, "
+                    "t1_alerted=0, t2_alerted=0, t3_alerted=0, sl_alerted=0, "
+                    "active=1, updated_at=? WHERE key=?",
+                    (json.dumps(recips), exchange, symbol, bias, sig_tf,
+                     entry, stop_loss, t1, t2, t3, now, key))
+            else:
+                c.execute(
+                    "UPDATE autoscan_lifecycle SET recipients=?, updated_at=? WHERE key=?",
+                    (json.dumps(recips), now, key))
+        else:
+            c.execute(
+                "INSERT INTO autoscan_lifecycle "
+                "(key,exchange,symbol,bias,sig_tf,entry,stop_loss,t1,t2,t3,"
+                "recipients,t1_alerted,t2_alerted,t3_alerted,sl_alerted,active,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,0,0,0,1,?,?)",
+                (key, exchange, symbol, bias, sig_tf, entry, stop_loss, t1, t2, t3,
+                 json.dumps([chat_id]), now, now))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logger.warning("db_lifecycle_track error: %s", e)
+
+
+def db_lifecycle_active():
+    """Return all active tracked autoscan signals as plain dicts."""
+    try:
+        conn = db_connect(); c = conn.cursor()
+        c.execute("SELECT * FROM autoscan_lifecycle WHERE active=1")
+        rows = _fetch_dicts(c)
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning("db_lifecycle_active error: %s", e)
+        return []
+
+
+def db_lifecycle_mark(key, field):
+    """Mark a milestone (t1_alerted/t2_alerted/t3_alerted/sl_alerted) as alerted."""
+    if field not in ('t1_alerted', 't2_alerted', 't3_alerted', 'sl_alerted'):
+        return
+    try:
+        conn = db_connect()
+        conn.execute(f"UPDATE autoscan_lifecycle SET {field}=1, updated_at=? WHERE key=?",
+                     (datetime.now().isoformat(), key))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logger.warning("db_lifecycle_mark error: %s", e)
+
+
+def db_lifecycle_close(key):
+    """Deactivate a tracked signal (final target or SL reached)."""
+    try:
+        conn = db_connect()
+        conn.execute("UPDATE autoscan_lifecycle SET active=0, updated_at=? WHERE key=?",
+                     (datetime.now().isoformat(), key))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logger.warning("db_lifecycle_close error: %s", e)
+
+
+def db_lifecycle_prune(max_age_h=72):
+    """Delete tracked rows older than max_age_h (closed or stale)."""
+    try:
+        cutoff = (datetime.now() - timedelta(hours=max_age_h)).isoformat()
+        conn = db_connect()
+        conn.execute("DELETE FROM autoscan_lifecycle WHERE created_at < ?", (cutoff,))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logger.warning("db_lifecycle_prune error: %s", e)
 
 
 def db_register_first_signal(signal, conn=None, current_price=None, now=None):

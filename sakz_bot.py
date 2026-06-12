@@ -396,7 +396,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�������������������������������������������������������──────────────────────────────────────────
+# ──�����������������������������������������������������������������──────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -767,7 +767,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
                         f"⚠️ Unstable volume (CV={cv:.2f}) — abnormal participation"
                     )
 
-        # 5-7 — CoinGecko fundamentals (best-effort) ──────────��────���───���─���─���─���──
+        # 5-7 — CoinGecko fundamentals (best-effort) ��─────────��────���───���─���─���─���──
         try:
             slug    = symbol.replace("USDT", "").lower()
             cg_resp = http_get(
@@ -941,7 +941,7 @@ def _pro_format_manip_card(manip: dict, rank: int = 1) -> str:
     )
 
 
-# ── /pro In-memory dedup ─────────────────────────────────────���──���──────────────────
+# ── /pro In-memory dedup ───────────────────────────────���─────���──���──────────────────
 
 _pro_alerted_uptrend: set = set()
 _pro_alerted_gainers: set = set()
@@ -1268,15 +1268,23 @@ def _pro_full_command_guide() -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PRIME — secret high-conviction subscription, per-user GMT alerts, 15-min cache
-# ═══════════════════════════�����══════════════════════════════════════════════
+# ══════════════���════���═══���═══�����══════════════════════════════════════════════
 import sakz_prime as prime
 import json as _json
+import sakz_signal_logic as _SIGLOGIC   # FIX #SIGLOGIC-UNDEFINED — this module
+# was referenced as _SIGLOGIC in the autoscan push loop (continuous_scan_job),
+# the lifecycle maintenance job and the /pnl card path, but was never actually
+# imported. Every one of those calls raised NameError at runtime, which (caught
+# by the job/error handlers) silently killed autoscan delivery and lifecycle
+# upkeep. Importing it here restores all three.
 from sakz_db import (
     db_prime_subscribe, db_prime_unsubscribe, db_prime_is_subscribed,
     db_prime_set_offset, db_prime_get_user, db_prime_get_all_users,
     db_prime_set_slots, db_prime_get_slots, db_prime_toggle_slot,
     db_prime_cache_put, db_prime_cache_get,
     db_prime_alert_already_sent, db_prime_mark_alert_sent, db_prime_cleanup_alert_sent,
+    db_lifecycle_track, db_lifecycle_active, db_lifecycle_mark,
+    db_lifecycle_close, db_lifecycle_prune,
 )
 
 PRIME_UNLOCK_CODE = os.environ.get("PRIME_UNLOCK_CODE", "").strip()
@@ -1804,7 +1812,7 @@ except ImportError:
 
 # ─────────────────────────────────────────────
 # AUTO PAPER TRADING — sakz_paper.py
-# ─────────────────────────────���───────────────
+# ─────��───────────────────────���───────────────
 try:
     from sakz_paper import (
         paper_init_db, paper_maybe_open, paper_mark_all,
@@ -1876,7 +1884,7 @@ def _load_best_params():
 
 
 # ───────���─────��������──────────────────────────────
-# ─────────────────────────────────────────────
+# ───────────────────────────────────���─────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
 # ─────────────────────────────────────────────
@@ -2059,7 +2067,7 @@ _FIB_RATIOS = (0.236, 0.382, 0.500, 0.618, 0.786)
 
 # ─────────────────────────────────────────────
 # SCORING ENGINE
-# ─────────────────────────────────────────────
+# ───────────────────────────────────��─────────
 
 
 # ── FIX #RR-GATE — Minimum entry Risk:Reward enforcement ──────────────────
@@ -3951,6 +3959,15 @@ async def _stats_live(update_or_query, label: str, minutes: int, *, is_callback=
     bar      = "█" * int(win_rate / 10) + "░" * (10 - int(win_rate / 10))
     avg_emoji = "🟢" if avg_pct >= 0 else "🔴"
 
+    # Quick-filter keyboard for the data path (the empty-rows branch above
+    # defines its own kb; this path previously referenced an undefined `kb`).
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("30M",  callback_data="stats_time|m30"),
+        InlineKeyboardButton("1H",   callback_data="stats_time|m60"),
+        InlineKeyboardButton("24H",  callback_data="stats_time|24"),
+        InlineKeyboardButton("All",  callback_data="stats_time|0"),
+    ]])
+
     now_str = datetime.now().strftime("%H:%M:%S")
 
     warning = ""
@@ -4079,13 +4096,23 @@ def _collect_best_signals(minutes: int):
         sig_price = d.get('price', 0) or 0
         if not sig_price:
             continue
+        # leverage is stored as a dict (e.g. {'suggested': 4}) by
+        # calculate_leverage; normalise to a numeric multiplier so the
+        # leverage-adjusted return math (raw_pct * lev) never blows up.
+        lev_raw = d.get('leverage', 1) or 1
+        if isinstance(lev_raw, dict):
+            lev_raw = lev_raw.get('suggested', 1) or 1
+        try:
+            lev_num = float(lev_raw)
+        except (TypeError, ValueError):
+            lev_num = 1.0
         out.append({
             "symbol":       r['symbol'],
             "exchange":     r['exchange'],
             "bias":         r['bias'],
             "confidence":   r['confidence'],
             "signal_price": sig_price,
-            "leverage":     d.get('leverage', 1) or 1,
+            "leverage":     lev_num,
         })
         if len(out) >= _STATS_MAX_SYMBOLS:
             break
@@ -4210,7 +4237,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # is accepted. Detailed win-rate stats remain reachable via the
     # "🎯 Win rate" button on the card (stats_time|0).
     if not args:
-        await _stats_best_card(update, 15, _fmt_window_label(15), is_callback=False)
+        # Default to a 24h window. A 15-minute default made /stats look broken:
+        # most users have not scanned in the last 15 min, so the leaderboard was
+        # almost always empty. 24h gives a useful default; buttons still allow
+        # 4H/12H/1W/2W and minute windows.
+        await _stats_best_card(update, 1440, _fmt_window_label(1440), is_callback=False)
         return
 
     try:
@@ -4320,7 +4351,7 @@ async def _stats_winrate_command(update: Update, context: ContextTypes.DEFAULT_T
 
     bar_filled = int(win_rate / 10)
     bar_empty  = 10 - bar_filled
-    bar        = "█" * bar_filled + "░" * bar_empty
+    bar        = "█" * bar_filled + "���" * bar_empty
 
     longs      = [r for r in confirmed_rows if r['bias'] == 'LONG']
     shorts     = [r for r in confirmed_rows if r['bias'] == 'SHORT']
@@ -4847,6 +4878,9 @@ _autoscan_user_last: dict = {}
 _AUTOSCAN_COOLDOWN_H = 4    # hours before the same signal can fire again
 _AUTOSCAN_MIN_CONF   = 8    # minimum confidence to push a signal
 _AUTOSCAN_SL_SUPPRESS_H = 24   # don't re-push a setup that hit SL within this window
+# REMINDER cadence — re-surface a still-valid call (already pushed, confidence
+# not risen) as a REMINDER once this many hours have elapsed since the last push.
+_AUTOSCAN_REMINDER_H = float(os.environ.get("AUTOSCAN_REMINDER_H", "6") or 6)
 
 # FIX #RESTART-FLOOD — _autoscan_sent lives in memory and is wiped on every
 # restart.  Without a guard, the first continuous_scan_job tick after a restart
@@ -5062,7 +5096,13 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         # risen above the last value we pushed. Genuinely newer/stronger calls
         # still flow through.
         prev = _autoscan_sent.get(dedup_key)
-        should_send_always, new_rec = _SIGLOGIC.autoscan_decide_send(prev, conf)
+        prev_conf = float(prev.get('confidence', 0) or 0) if isinstance(prev, dict) else 0.0
+        should_send_always, new_rec = _SIGLOGIC.autoscan_decide_send(
+            prev, conf, reminder_secs=_AUTOSCAN_REMINDER_H * 3600)
+        # A send where confidence did NOT rise above the prior push is a REMINDER
+        # (the reminder window elapsed for a still-valid call). New/stronger
+        # calls keep the normal AUTOSCAN heading.
+        is_reminder = bool(prev) and should_send_always and float(conf or 0) <= prev_conf
         if should_send_always:
             _autoscan_sent[dedup_key] = new_rec
             _autoscan_prune()
@@ -5073,8 +5113,15 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         bias_emoji = "🟢" if bias == 'LONG' else "🔴"
         now_str    = datetime.now().strftime('%H:%M')
 
+        # Entry edge used for lifecycle (T1/T2/T3/SL) milestone tracking.
+        if bias == 'LONG':
+            _track_entry = r.get('entry_high', r.get('price', 0))
+        else:
+            _track_entry = r.get('entry_low', r.get('price', 0))
+
+        _title = "🔁 AUTOSCAN REMINDER" if is_reminder else f"{tt_emoji} AUTOSCAN"
         header = (
-            f"{tt_emoji} AUTOSCAN — {trade_type.upper()}\n"
+            f"{_title} — {trade_type.upper()}\n"
             f"{'━'*30}\n"
             f"{bias_emoji} {sym}  ·  {exch}  ·  {conf}/10 {conf_bar}\n"
             f"🕐 {now_str}  ·  Hold: {r.get('hold', '?')}\n"
@@ -5110,6 +5157,12 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 _safemode_store_signals(chat_id, [r])
                 _autoscan_user_last[(chat_id, dedup_key)] = datetime.now()
+                # Track this delivered signal so the lifecycle monitor can alert
+                # this subscriber when T1/T2/T3 or SL is reached.
+                db_lifecycle_track(
+                    dedup_key, exch, sym, bias, sig_tf,
+                    _track_entry, r.get('stop_loss'), r.get('t1'), r.get('t2'), r.get('t3'),
+                    chat_id)
                 await asyncio.sleep(0.15)
             except Exception as e:
                 logger.warning("Autoscan push failed for %s: %s", chat_id, e)
@@ -5258,6 +5311,126 @@ async def signal_maintenance_job(context: ContextTypes.DEFAULT_TYPE):
         await loop.run_in_executor(SCAN_EXECUTOR, _maintenance_apply, actives, prices, now)
     except Exception as e:
         logger.warning("signal_maintenance_job: apply failed: %s", e)
+
+
+def _lifecycle_alert_text(tag, rec, price):
+    """Build the milestone / stop-loss alert card for a tracked autoscan signal."""
+    sym  = rec.get('symbol', '?')
+    bias = str(rec.get('bias', '')).upper()
+    bias_emoji = "🟢" if bias == 'LONG' else "🔴"
+    try:
+        price = float(price or 0)
+    except Exception:
+        price = 0.0
+    if tag == 'sl':
+        sl = float(rec.get('stop_loss') or 0)
+        return (
+            f"🛑 STOP-LOSS HIT — {sym}\n"
+            f"{'━'*28}\n"
+            f"{bias_emoji} {bias}  ·  SL {sl:g}\n"
+            f"📍 Price: {price:g}\n"
+            f"This setup is now closed."
+        )
+    labels = {'t1': "Target 1", 't2': "Target 2", 't3': "Target 3"}
+    lvl = float(rec.get(tag) or 0)
+    tail = "  —  final target reached, setup closed." if tag == 't3' else ""
+    return (
+        f"🎯 {labels.get(tag, tag.upper())} REACHED — {sym}\n"
+        f"{'━'*28}\n"
+        f"{bias_emoji} {bias}  ·  {labels.get(tag, tag)} {lvl:g}\n"
+        f"📍 Price: {price:g}{tail}"
+    )
+
+
+def _lifecycle_alerts_apply(rows, prices, now):
+    """Blocking tail of autoscan_lifecycle_job — detects newly-reached
+    milestones, marks them in the DB, closes finished setups, and returns a
+    list of (chat_id, text) alerts for the async wrapper to send.
+
+    Runs in SCAN_EXECUTOR so the event loop is never blocked by DB writes.
+    """
+    out = []
+    for rec, price in zip(rows, prices):
+        try:
+            key = rec.get('key')
+            already = {
+                't1': bool(rec.get('t1_alerted')),
+                't2': bool(rec.get('t2_alerted')),
+                't3': bool(rec.get('t3_alerted')),
+                'sl': bool(rec.get('sl_alerted')),
+            }
+            hits = _SIGLOGIC.lifecycle_milestones(
+                rec.get('bias'), price, rec.get('stop_loss'),
+                rec.get('t1'), rec.get('t2'), rec.get('t3'), already)
+            if not hits:
+                continue
+            try:
+                recips = _json.loads(rec.get('recipients') or '[]')
+            except Exception:
+                recips = []
+            for tag in hits:
+                text = _lifecycle_alert_text(tag, rec, price)
+                for chat_id in recips:
+                    out.append((chat_id, text))
+                db_lifecycle_mark(key, f"{tag}_alerted")
+            if 'sl' in hits or 't3' in hits:
+                db_lifecycle_close(key)
+        except Exception as e:
+            logger.debug("lifecycle alert apply error for %s: %s", rec.get('symbol', '?'), e)
+    return out
+
+
+async def autoscan_lifecycle_job(context: ContextTypes.DEFAULT_TYPE):
+    """Every ~5 min: for each tracked autoscan signal, fetch the live price and
+    alert its recipients when a profit target (T1/T2/T3) is reached or the
+    stop-loss is hit. Mirrors signal_maintenance_job's off-loop price-prefetch
+    pattern so the event loop stays responsive throughout.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        rows = await loop.run_in_executor(SCAN_EXECUTOR, db_lifecycle_active)
+    except Exception as e:
+        logger.warning("autoscan_lifecycle_job: load failed: %s", e)
+        return
+    if not rows:
+        return
+
+    sem = asyncio.Semaphore(12)
+
+    async def _price(rec):
+        async with sem:
+            try:
+                p = await loop.run_in_executor(
+                    SCAN_EXECUTOR, _get_live_price,
+                    rec.get('symbol', ''), rec.get('exchange', ''))
+                return float(p) if p else 0.0
+            except Exception:
+                return 0.0
+
+    try:
+        prices = await asyncio.gather(*[_price(r) for r in rows])
+    except Exception as e:
+        logger.warning("autoscan_lifecycle_job: price prefetch failed: %s", e)
+        return
+
+    now = datetime.now()
+    try:
+        alerts = await loop.run_in_executor(SCAN_EXECUTOR, _lifecycle_alerts_apply, rows, prices, now)
+    except Exception as e:
+        logger.warning("autoscan_lifecycle_job: apply failed: %s", e)
+        return
+
+    for chat_id, text in alerts:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.warning("lifecycle alert send failed for %s: %s", chat_id, e)
+
+    try:
+        await loop.run_in_executor(SCAN_EXECUTOR, db_lifecycle_prune, 72)
+    except Exception:
+        pass
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -5683,6 +5856,42 @@ def format_signal_primary(r, rank):
     # counter-trend warning prefix
     ct_line = "⚠️ COUNTER-TREND — Higher risk\n" if r.get('counter_trend') else ""
 
+    # ── TP/SL hit ticks ─────────────────────────────────────────────────────
+    # Once price reaches a target (or the stop), tick that line. We track the
+    # high-water extremes of the live price since this card first rendered so a
+    # tick STAYS even if price later retraces. `r` is the cached card object,
+    # so these high-water marks persist across the 30s auto-refresh.
+    _bias = r['bias']
+    _lp = c.get('live_price') or 0
+    if _lp > 0:
+        _hw_hi = r.get('_hw_high'); _hw_lo = r.get('_hw_low')
+        r['_hw_high'] = _lp if _hw_hi is None else max(_hw_hi, _lp)
+        r['_hw_low']  = _lp if _hw_lo is None else min(_hw_lo, _lp)
+    _hw_high = r.get('_hw_high'); _hw_low = r.get('_hw_low')
+
+    def _tp_hit(level):
+        if level is None or _hw_high is None or _hw_low is None:
+            return False
+        try:
+            level = float(level)
+        except Exception:
+            return False
+        return (_hw_high >= level) if _bias == 'LONG' else (_hw_low <= level)
+
+    def _sl_hit(level):
+        if level is None or _hw_high is None or _hw_low is None:
+            return False
+        try:
+            level = float(level)
+        except Exception:
+            return False
+        return (_hw_low <= level) if _bias == 'LONG' else (_hw_high >= level)
+
+    _t1_tick = "  ✅ HIT" if _tp_hit(r.get('t1')) else ""
+    _t2_tick = "  ✅ HIT" if _tp_hit(r.get('t2')) else ""
+    _t3_tick = "  ✅ HIT" if _tp_hit(r.get('t3')) else ""
+    _sl_tick = "  ❌ SL HIT" if _sl_hit(r.get('stop_loss')) else ""
+
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"  ⚡️ {panel_type} | SIGNAL",
@@ -5708,10 +5917,10 @@ def format_signal_primary(r, rank):
         f"⚡️ Leverage: {lev_str}",
         f"📐 R:R: {rr_str}",
         "",
-        f"🎯 TP1: ${r['t1']:.4f}  (+{t1_pct:.1f}% profit) 💰",
-        f"🎯 TP2: ${r['t2']:.4f}  (+{t2_pct:.1f}%)",
-        f"🎯 TP3: ${r['t3']:.4f}  (+{t3_pct:.1f}%)",
-        f"🛑 Stop Loss: ${r['stop_loss']:.4f}",
+        f"🎯 TP1: ${r['t1']:.4f}  (+{t1_pct:.1f}% profit) 💰{_t1_tick}",
+        f"🎯 TP2: ${r['t2']:.4f}  (+{t2_pct:.1f}%){_t2_tick}",
+        f"🎯 TP3: ${r['t3']:.4f}  (+{t3_pct:.1f}%){_t3_tick}",
+        f"🛑 Stop Loss: ${r['stop_loss']:.4f}{_sl_tick}",
     ]
 
     # ML line if available
@@ -8823,7 +9032,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /scan
-# ─────────────────────────────────────────────
+# ──────────────────────────────────���──────────
 # ─────────────────────────────────────────────
 # COMPACT SIGNAL CARDS — inline button display
 # ────────────────��────────────────────────────
@@ -9481,6 +9690,11 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Store for this user so refresh works
     cscan_results[chat_id] = results
+    # Persist so /stats leaderboard includes this scan.
+    try:
+        db_save_scan(results)
+    except Exception as _e_save:
+        logger.debug("db_save_scan (cscan) failed: %s", _e_save)
     _chat_scan_ctx[chat_id] = {
         'source':   'custom',
         'results':  results,
@@ -9589,6 +9803,11 @@ async def cscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best['signal_tf'] = tf_key
 
     cscan_results[chat_id]    = results
+    # Persist so /stats leaderboard includes this scan.
+    try:
+        db_save_scan(results)
+    except Exception as _e_save:
+        logger.debug("db_save_scan (cscan tf) failed: %s", _e_save)
     _chat_scan_ctx[chat_id] = {
         'source':   'custom',
         'results':  results,
@@ -9930,7 +10149,7 @@ async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
 #   • Milestone (T1/T2/T3/SL hit indicator)
 #   • Age of signal
 #   • Refresh button (live, one-tap)
-# ─────────────��───────────────────────────────
+# ─────────────��─────────────────────���─────────
 def _compare_fetch_swing(exchange, symbol, since: datetime):
     """
     Fetch 1H OHLC candles since `since` and return (high, low, candle_count).
@@ -10495,7 +10714,7 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
 
 
 # Filters out signals older than their hold_hours
-# ───────────────����────��────────────────────────
+# ───────────────����────��───────────────────��────
 def filter_live_signals(results):
     """Return signals that have not yet exceeded their recommended hold duration."""
     now = datetime.now()
@@ -10854,7 +11073,7 @@ async def post_broadcast(results, bot):
             logger.warning("Broadcast failed for chat %s: %s", chat_id, e)
 
 
-# ──────────��──────────────────────���───────────
+# ──────────��──────────────────────���─────���─────
 # /leaderboard [hours] — Best performing pairs
 # Usage: /leaderboard          → all time
 #        /leaderboard 24       → last 24 hours
@@ -11037,7 +11256,7 @@ async def leaderboard_time_callback(update: Update, context: ContextTypes.DEFAUL
 
 # ═════════════════════════════════════════════��═════════════════
 # 🐌  S N A I L   M O D E  — HIDDEN PREMIUM FEATURE
-# ═══════════════���═════════════════════════════���═══���═════════════
+# ═══════════════���═════════════════════════════���═══���════════════��
 # Access gate: user must first type the secret passphrase
 #   /scan1234JP$$
 # That unlocks the /snail command for that chat permanently.
@@ -11706,7 +11925,7 @@ async def snail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🐌  S N A I L   M O D E\n"
-        f"━━━━━━━━━━���━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━�����━━━━━━━━━━━━━━━━━━━\n\n"
         f"Status: {status_str}\n\n"
         f"Goal: 2x per day | Criteria: 10/10 + Snail Score ≥ 80\n"
         f"Use /snailvault to view your signal log.\n",
@@ -12199,16 +12418,22 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"and get the full breakdown — that command has no gates (information only)."
                 )
             else:
-                # NEUTRAL or unknown — market has no clear directional bias
+                # NEUTRAL — no gated directional signal. Point the user to
+                # /analyse, which runs ungated and may still surface a
+                # directional read with a confidence score (4–7/10).
                 msg = (
-                    f"😐 *{symbol}* — Market too neutral on {tf_label}\n\n"
-                    f"Indicators are balanced — no clear LONG or SHORT edge right now.\n"
-                    f"This is normal in sideways / consolidating markets.\n\n"
-                    f"💡 Try:\n"
+                    f"😐 *{symbol}* — No gated signal on {tf_label}\n\n"
+                    f"The scan's strict scoring found no clear LONG/SHORT edge that "
+                    f"passes the signal gates right now.\n\n"
+                    f"💡 Use `/analyse {sym_arg}` for the full ungated read — it shows "
+                    f"the bullish/bearish indicators and, when there's a directional "
+                    f"lean, a confidence score (4–7/10) plus trade levels. A truly "
+                    f"balanced market shows no confidence; a 4–7/10 read means there's "
+                    f"a moderate setup the gates filtered out.\n\n"
+                    f"Other options:\n"
                     f"• `/scan {sym_arg} 1h` — shorter TF may be trending\n"
                     f"• `/chart {sym_arg} {actual_tf}` — read the chart yourself\n"
-                    f"• `/scan` — find other pairs with active momentum\n"
-                    f"• Check back after the next candle close"
+                    f"• `/scan` — find other pairs with active momentum"
                 )
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
@@ -12248,6 +12473,12 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Store for refresh / compare
         cscan_results[chat_id] = results
+        # Persist to scan_results so /stats (best-signal leaderboard) reflects
+        # single-pair scans, not just full market scans.
+        try:
+            db_save_scan(results)
+        except Exception as _e_save:
+            logger.debug("db_save_scan (single-pair) failed: %s", _e_save)
         if chat_id not in _chat_scan_ctx:
             _chat_scan_ctx[chat_id] = {}
         _chat_scan_ctx[chat_id]['custom'] = {
@@ -12687,6 +12918,11 @@ async def cscan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results.sort(key=lambda x: (x['confidence'], x['score']), reverse=True)
     best = results[0]
     cscan_results[chat_id] = results
+    # Persist so /stats leaderboard includes this scan.
+    try:
+        db_save_scan(results)
+    except Exception as _e_save:
+        logger.debug("db_save_scan (custom scan) failed: %s", _e_save)
     _chat_scan_ctx[chat_id] = {
         'source':   'custom',
         'results':  results,
@@ -13087,8 +13323,141 @@ def _analyse_kb(symbol: str, tf_key: str, chat_id, n_bull: int, n_bear: int,
     return InlineKeyboardMarkup(rows)
 
 
+def _analyse_build_signal(data: dict):
+    """Convert a raw /analyse indicator snapshot into a scan-style signal dict,
+    or return None when the market is genuinely neutral (no directional edge).
+
+    Confidence is derived from how strongly the bullish/bearish indicators
+    diverge, deliberately capped in the 4–7 band because /analyse is ungated
+    (information only) and must never masquerade as a high-conviction signal."""
+    try:
+        lean = data.get('lean')
+        if lean == 'BULLISH':
+            bias = 'LONG'
+        elif lean == 'BEARISH':
+            bias = 'SHORT'
+        else:
+            return None   # FLAT / MIXED → neutral, no confidence
+
+        price = float(data.get('price') or 0)
+        if price <= 0:
+            return None
+        atr = float(data.get('atr') or 0) or price * 0.01
+
+        nb = len(data.get('bull_signals', []))
+        ns = len(data.get('bear_signals', []))
+        diff = abs(nb - ns)
+        conf = max(4, min(7, 3 + diff))   # 2-net→5, 3→6, 4+→7
+
+        band = max(atr * 0.25, price * 0.002)
+        entry_low  = price - band
+        entry_high = price + band
+        if bias == 'LONG':
+            t1, t2, t3 = price + atr * 1.0, price + atr * 1.8, price + atr * 3.0
+            stop_loss  = price - atr * 1.5
+        else:
+            t1, t2, t3 = price - atr * 1.0, price - atr * 1.8, price - atr * 3.0
+            stop_loss  = price + atr * 1.5
+
+        try:
+            lev = calculate_leverage(price, entry_low, entry_high, stop_loss, atr, conf, bias)
+        except Exception:
+            lev = None
+
+        reasons = (data.get('bull_signals') if bias == 'LONG' else data.get('bear_signals')) or []
+        return {
+            'symbol': data['symbol'], 'exchange': 'MEXC', 'bias': bias,
+            'confidence': conf, 'price': price,
+            'entry_low': entry_low, 'entry_high': entry_high,
+            't1': t1, 't2': t2, 't3': t3, 'stop_loss': stop_loss,
+            'leverage': lev, 'signal_tf_label': data.get('tf_label', '4H'),
+            'reasons': reasons, 'scan_time': datetime.now(),
+        }
+    except Exception as e:
+        logger.debug("_analyse_build_signal failed: %s", e)
+        return None
+
+
+def _format_analyse_signal_card(r: dict) -> str:
+    """Scan-style card for /analyse when a directional lean exists. Mirrors the
+    /scan primary card layout so the two feel identical, but is clearly badged
+    as an ungated ANALYSE read and shown without the live auto-refresh footer."""
+    conf = r['confidence']
+    bias = r['bias']
+    bias_emoji = "🟢" if bias == 'LONG' else "🔴"
+    panel = _panel_type(r.get('signal_tf_label', '4H'))
+    rr = _rr_ratio(r)
+    price = r['price'] if r['price'] > 0 else 1
+
+    def _pct(tp):
+        raw = (tp - price) / price * 100
+        return raw if bias == 'LONG' else -raw
+
+    lev = r.get('leverage')
+    lev_str = f"{lev['suggested']}x" if lev else "1x"
+    rr_str = f"1:{rr:.1f}" if rr is not None else "N/A"
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"  🔬 {panel} | ANALYSE",
+        f"  CONFIDENCE: {_conf_bar_emoji(conf)} {conf}/10",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📊 Token: {r['symbol']}",
+        f"{bias_emoji} Direction: {bias}",
+        f"💰 Entry: ${r['entry_low']:.4f} - ${r['entry_high']:.4f}",
+        f"⚡️ Leverage: {lev_str}",
+        f"📐 R:R: {rr_str}",
+        "",
+        f"🎯 TP1: ${r['t1']:.4f}  (+{_pct(r['t1']):.1f}% profit) 💰",
+        f"🎯 TP2: ${r['t2']:.4f}  (+{_pct(r['t2']):.1f}%)",
+        f"🎯 TP3: ${r['t3']:.4f}  (+{_pct(r['t3']):.1f}%)",
+        f"🛑 Stop Loss: ${r['stop_loss']:.4f}",
+        "",
+        "🔬 Ungated /analyse read — derived from raw indicators, not a gated",
+        "   signal. Levels are ATR-based estimates. Tap below for detail.",
+    ]
+    return "\n".join(lines)
+
+
+def _format_analyse_neutral_card(data: dict) -> str:
+    """Neutral /analyse card — NO confidence shown, because the indicators are
+    balanced and there is no directional edge to score."""
+    lean = data.get('lean', 'MIXED')
+    le   = data.get('lean_emoji', '⚪')
+    nb   = len(data.get('bull_signals', []))
+    ns   = len(data.get('bear_signals', []))
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"  🔬 ANALYSE | {data.get('tf_label', '')}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📊 Token: {data['symbol']}",
+        f"💰 Price: ${data['price']:.6g}",
+        f"📈 Support: ${data['support']:.6g}    📉 Resistance: ${data['resistance']:.6g}",
+        "",
+        f"{le} No directional edge — {lean} ({nb} bull / {ns} bear)",
+        "   Confidence is withheld: the bullish/bearish signals are balanced.",
+        f"{_an_regime_emoji(data['btc_regime'])} BTC Regime: {data['btc_regime']}",
+        f"   {data['vol_note']}",
+        "",
+        "Tap below for indicators, bullish/bearish detail, or the chart.",
+    ]
+    return "\n".join(lines)
+
+
 def _format_analyse_card(data: dict, requested_tf_raw: str | None) -> str:
-    """Brief /analyse summary: price, S/R, lean, regime. Detail lives behind buttons."""
+    """Unified /analyse summary — scan-style card. Shows a confidence-scored
+    signal card when there's a directional lean, or a no-confidence neutral
+    card when indicators are balanced. Detail lives behind the buttons."""
+    _sig = _analyse_build_signal(data)
+    if _sig is not None:
+        return _format_analyse_signal_card(_sig)
+    return _format_analyse_neutral_card(data)
+
+
+def _format_analyse_card_legacy(data: dict, requested_tf_raw: str | None) -> str:
+    """Legacy brief summary (kept for reference / fallback)."""
     sym        = data['symbol']
     tf_label   = data['tf_label']
     price      = data['price']
@@ -13827,15 +14196,13 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer("Refreshing chart…")
 
-    try:
-        _, symbol, tf = query.data.split('|')
-    except ValueError:
-        await query.message.reply_text("⚠️ Could not parse chart refresh data.")
+    parts = query.data.split('|')
+    if len(parts) < 3:
+        await query.answer("⚠️ Could not parse chart refresh data.", show_alert=True)
         return
-
-    await query.message.reply_text(
-        f"📊 Refreshing {symbol} chart on {_tf_display(tf)}...\n⏳ Please wait..."
-    )
+    symbol, tf = parts[1], parts[2]
+    # No intermediate "Refreshing..." message — the toast above is enough, and a
+    # new message would defeat in-place refresh.
 
     # Delegate to the main chart logic by simulating context for chart_command
     # Instead, run the fetch inline to avoid circular context faking
@@ -13955,7 +14322,21 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
             InlineKeyboardButton("🔗 Trade", url=get_exchange_link(
                 sig.get('exchange','BYBIT') if sig else 'BYBIT', symbol))
         ]])
-        await query.message.reply_photo(photo=buf, caption=caption, reply_markup=kb)
+        # Refresh in place: if this card is already a photo message, edit the
+        # image instead of posting a new one. Only fall back to a new message
+        # when we can't edit (e.g. the button lives on a text card).
+        if getattr(query.message, 'photo', None):
+            from telegram import InputMediaPhoto
+            try:
+                await query.edit_message_media(
+                    media=InputMediaPhoto(media=buf, caption=caption),
+                    reply_markup=kb)
+            except Exception as e_edit:
+                logger.debug("chart refresh edit_media failed, sending new: %s", e_edit)
+                buf.seek(0)
+                await query.message.reply_photo(photo=buf, caption=caption, reply_markup=kb)
+        else:
+            await query.message.reply_photo(photo=buf, caption=caption, reply_markup=kb)
 
     except Exception as e:
         logger.error("chart_tf_refresh_callback %s %s: %s", symbol, tf, e)
@@ -14596,7 +14977,7 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 MID-TIER SCAN — ranks {rank_from}–{rank_to}\n\n"
         f"Scanning ~{span} coins per exchange (Bybit + MEXC + Binance)…\n"
         f"These are the less-watched, higher-inefficiency pairs.\n"
-        f"⏳ Please wait 60–90 seconds…"
+        f"⏳ Please wait 60���90 seconds…"
     )
 
     loop = asyncio.get_event_loop()
@@ -16064,7 +16445,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # ────────────────────────────────────────────────────────────────────────���─────────
 # AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
-# ──────────────────────────────────────���──────��────────────────────────────────────
+# ────────────────────────���─────────────���──────��────────────────────────────────────
 # Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
 # cadence (default 30s) — WITHOUT removing the manual button (users can still
 # tap it whenever they want).
@@ -16450,6 +16831,15 @@ def main():
         interval=300,
         first=180,
         name="signal_maintenance"
+    )
+
+    # AUTOSCAN LIFECYCLE ALERTS — every 5 min: notify subscribers when a pushed
+    # signal reaches a profit target (T1/T2/T3) or hits its stop-loss.
+    app.job_queue.run_repeating(
+        autoscan_lifecycle_job,
+        interval=300,
+        first=240,
+        name="autoscan_lifecycle"
     )
 
     # FIX #MID-JOB — Mid-tier rotation (ranks 51-200) every 4h, offset 2h from
