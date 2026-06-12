@@ -396,7 +396,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�������������������������������������������������──────────────────────────────────────────
+# ──�����������������������������������������������������──────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -767,7 +767,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
                         f"⚠️ Unstable volume (CV={cv:.2f}) — abnormal participation"
                     )
 
-        # 5-7 — CoinGecko fundamentals (best-effort) ───────────────���───���─���─���─���──
+        # 5-7 — CoinGecko fundamentals (best-effort) ──────────��────���───���─���─���─���──
         try:
             slug    = symbol.replace("USDT", "").lower()
             cg_resp = http_get(
@@ -941,7 +941,7 @@ def _pro_format_manip_card(manip: dict, rank: int = 1) -> str:
     )
 
 
-# ── /pro In-memory dedup ───────────────────────────────────────────────────────────
+# ── /pro In-memory dedup ─────────────────────────────────────���──���──────────────────
 
 _pro_alerted_uptrend: set = set()
 _pro_alerted_gainers: set = set()
@@ -1266,6 +1266,292 @@ def _pro_full_command_guide() -> str:
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PRIME — secret high-conviction subscription, per-user GMT alerts, 15-min cache
+# ════════════════════════════��══════════════════════════════════════════════
+import sakz_prime as prime
+import json as _json
+from sakz_db import (
+    db_prime_subscribe, db_prime_unsubscribe, db_prime_is_subscribed,
+    db_prime_set_offset, db_prime_get_user, db_prime_get_all_users,
+    db_prime_set_slots, db_prime_get_slots, db_prime_toggle_slot,
+    db_prime_cache_put, db_prime_cache_get,
+    db_prime_alert_already_sent, db_prime_mark_alert_sent, db_prime_cleanup_alert_sent,
+)
+
+PRIME_UNLOCK_CODE = os.environ.get("PRIME_UNLOCK_CODE", "").strip()
+
+# Alert slots are LOCAL hours (the user's GMT offset is applied by the scheduler)
+_PRIME_SLOTS = [8, 14, 20]
+_PRIME_SLOT_EMOJI = {8: "\U0001F305", 14: "\u2600\ufe0f", 20: "\U0001F319"}  # morning/afternoon/evening
+_PRIME_SLOT_LABEL = {8: "08:00", 14: "14:00", 20: "20:00"}
+
+# Timezone picker (label, GMT offset in hours; fractional allowed)
+_PRIME_TZ_CHOICES = [
+    ("GMT-8", -8), ("GMT-5", -5), ("GMT-3", -3),
+    ("GMT+0", 0), ("GMT+1", 1), ("GMT+2", 2),
+    ("GMT+3", 3), ("GMT+5:30", 5.5), ("GMT+8", 8),
+    ("GMT+9", 9),
+]
+
+
+def _prime_signal_to_payload(r, score):
+    """JSON-safe dict for caching/rendering one Prime pick (no datetime objects)."""
+    return {
+        "symbol": r.get("symbol"),
+        "bias": r.get("bias"),
+        "exchange": r.get("exchange", ""),
+        "price": r.get("price"),
+        "entry_low": r.get("entry_low"),
+        "entry_high": r.get("entry_high"),
+        "t1": r.get("t1"), "t2": r.get("t2"), "t3": r.get("t3"),
+        "confidence": r.get("confidence"),
+        "confidence_precise": r.get("confidence_precise"),
+        "winning_score": r.get("winning_score"),
+        "score": score,
+    }
+
+
+async def prime_refresh_job(context):
+    """Every 15 min: rank the latest scan cache into the Prime top-picks cache.
+
+    Two-pass so entry-distance decay uses LIVE prices without hammering the
+    network: rank-without-decay -> shortlist -> fetch live prices for the
+    shortlist only -> final rank with decay.
+    """
+    try:
+        cache = getattr(state, "_scan_cache", None)
+        results = (cache or {}).get("results") if cache else None
+        if not results:
+            results = getattr(state, "last_scan_results", None) or []
+        if not results:
+            db_prime_cache_put(_json_dumps_safe([]))
+            return
+        # Pass 1 — composite without decay to find the shortlist.
+        shortlist = prime.rank_prime(results, current_prices=None,
+                                     bar=prime.PRIME_BAR, top_n=8)
+        live_prices = {}
+        for entry in shortlist:
+            sig = entry["signal"]; sym = sig.get("symbol")
+            if not sym:
+                continue
+            try:
+                px = await asyncio.to_thread(_get_live_price, sym, sig.get("exchange", ""))
+                if px and px > 0:
+                    live_prices[sym] = px
+            except Exception:
+                pass
+        # Pass 2 — final ranking with entry-distance decay applied.
+        ranked = prime.rank_prime(results, current_prices=live_prices,
+                                  bar=prime.PRIME_BAR, top_n=prime.PRIME_TOP_N)
+        picks = [_prime_signal_to_payload(x["signal"], x["score"]) for x in ranked]
+        db_prime_cache_put(_json.dumps(picks))
+        logger.info("PRIME refresh: %d picks cached (scanned %d signals)",
+                    len(picks), len(results))
+    except Exception as e:
+        logger.warning("prime_refresh_job error: %s", e)
+
+
+def _json_dumps_safe(obj):
+    try:
+        return _json.dumps(obj)
+    except Exception:
+        return "[]"
+
+
+def _prime_get_cached_picks():
+    row = db_prime_cache_get()
+    if not row:
+        return [], None
+    try:
+        picks = _json.loads(row["payload"])
+    except Exception:
+        picks = []
+    return picks, row.get("refreshed_at")
+
+
+def _prime_render_dashboard(picks, refreshed_at=None):
+    if not picks:
+        return ("\U0001F531 PRIME \u2014 Top Calls\n\n"
+                f"{prime.PRIME_EMPTY_MESSAGE}\n\n{prime.PRIME_DISCLAIMER}")
+    lines = ["\U0001F531 PRIME \u2014 Highest-Conviction Calls", ""]
+    medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
+    for i, p in enumerate(picks):
+        medal = medals[i] if i < len(medals) else f"#{i+1}"
+        conf = p.get("confidence_precise")
+        if conf is None:
+            conf = p.get("confidence")
+        try:
+            conf_s = f"{float(conf):.1f}/10"
+        except Exception:
+            conf_s = "\u2014"
+        bias = str(p.get("bias", "")).upper()
+        arrow = "\U0001F7E2" if bias == "LONG" else "\U0001F534"
+        try:
+            entry_s = f"${float(p['entry_low']):.4f} \u2013 ${float(p['entry_high']):.4f}"
+        except Exception:
+            entry_s = "\u2014"
+        lines.append(f"{medal} {arrow} {p.get('symbol','?')} {bias}  \u00b7  conf {conf_s}  \u00b7  Prime {p.get('score','?')}")
+        lines.append(f"     Entry {entry_s}")
+        try:
+            lines.append(f"     \U0001F3AF {float(p['t1']):.4f} / {float(p['t2']):.4f} / {float(p['t3']):.4f}")
+        except Exception:
+            pass
+        lines.append("")
+    if refreshed_at:
+        ts = str(refreshed_at).replace("T", " ")[:16]
+        lines.append(f"\U0001F551 Updated {ts} \u00b7 refreshes every {prime.PRIME_CACHE_TTL_MIN}m")
+    lines.append("")
+    lines.append(prime.PRIME_DISCLAIMER)
+    return "\n".join(lines)
+
+
+def _prime_tz_keyboard():
+    rows, cur = [], []
+    for label, off in _PRIME_TZ_CHOICES:
+        cur.append(InlineKeyboardButton(label, callback_data=f"prime_tz|{off}"))
+        if len(cur) == 3:
+            rows.append(cur); cur = []
+    if cur:
+        rows.append(cur)
+    return InlineKeyboardMarkup(rows)
+
+
+def _prime_main_keyboard(chat_id):
+    slots = set(db_prime_get_slots(chat_id))
+    slot_row = []
+    for h in _PRIME_SLOTS:
+        mark = "\u2705" if h in slots else "\u2B1C"
+        slot_row.append(InlineKeyboardButton(
+            f"{mark}{_PRIME_SLOT_EMOJI[h]}", callback_data=f"prime_slot|{h}"))
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F504 Refresh", callback_data="prime_show|1"),
+         InlineKeyboardButton("\U0001F30D Timezone", callback_data="prime_tzmenu|1")],
+        slot_row,
+        [InlineKeyboardButton("\U0001F515 Unsubscribe", callback_data="prime_off|1")],
+    ])
+
+
+async def prime_command(update, context):
+    """/prime — secret subscription. Subscribe + timezone buttons + live dashboard."""
+    chat_id = update.effective_chat.id
+    args = list(getattr(context, "args", []) or [])
+    # Secret unlock gate (only enforced if PRIME_UNLOCK_CODE is configured)
+    if PRIME_UNLOCK_CODE and not db_prime_is_subscribed(chat_id):
+        supplied = args[0].strip() if args else ""
+        if supplied != PRIME_UNLOCK_CODE:
+            await update.message.reply_text(
+                "\U0001F531 PRIME is invite-only.\nEnter the access code:  /prime <code>")
+            return
+    newly = not db_prime_is_subscribed(chat_id)
+    db_prime_subscribe(chat_id)
+    if newly:
+        await update.message.reply_text(
+            "\U0001F531 Welcome to PRIME \u2014 you'll receive only the highest-conviction calls.\n\n"
+            "First, choose your timezone so alerts arrive at the right local time:",
+            reply_markup=_prime_tz_keyboard())
+        return
+    picks, refreshed = _prime_get_cached_picks()
+    await update.message.reply_text(
+        _prime_render_dashboard(picks, refreshed),
+        reply_markup=_prime_main_keyboard(chat_id))
+
+
+async def prime_tz_callback(update, context):
+    query = update.callback_query
+    chat_id = query.from_user.id
+    off = float(query.data.split("|", 1)[1])
+    db_prime_set_offset(chat_id, off)
+    if not db_prime_get_slots(chat_id):
+        db_prime_set_slots(chat_id, _PRIME_SLOTS)  # enable all 3 by default
+    await query.answer(f"Timezone set to {prime.format_offset(off)}")
+    await query.edit_message_text(
+        f"\u2705 Timezone: {prime.format_offset(off)}\n\n"
+        "Default alert times enabled (\U0001F305 08:00 \u00b7 \u2600\ufe0f 14:00 \u00b7 \U0001F319 20:00 local).\n"
+        "Toggle the times below, or tap Refresh to see live calls.",
+        reply_markup=_prime_main_keyboard(chat_id))
+
+
+async def prime_tzmenu_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("\U0001F30D Choose your timezone:",
+                                  reply_markup=_prime_tz_keyboard())
+
+
+async def prime_slot_callback(update, context):
+    query = update.callback_query
+    chat_id = query.from_user.id
+    h = int(query.data.split("|", 1)[1])
+    new_slots = db_prime_toggle_slot(chat_id, h)
+    label = ", ".join(_PRIME_SLOT_LABEL.get(s, f"{s:02d}:00") for s in new_slots) or "none"
+    await query.answer(f"Alerts: {label}")
+    try:
+        await query.edit_message_reply_markup(reply_markup=_prime_main_keyboard(chat_id))
+    except Exception:
+        pass
+
+
+async def prime_show_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.from_user.id
+    picks, refreshed = _prime_get_cached_picks()
+    try:
+        await query.edit_message_text(_prime_render_dashboard(picks, refreshed),
+                                      reply_markup=_prime_main_keyboard(chat_id))
+    except Exception:
+        pass
+
+
+async def prime_off_callback(update, context):
+    query = update.callback_query
+    await query.answer("Unsubscribed")
+    chat_id = query.from_user.id
+    db_prime_unsubscribe(chat_id)
+    await query.edit_message_text("\U0001F515 You've unsubscribed from PRIME. Use /prime to rejoin anytime.")
+
+
+async def prime_alert_scheduler_job(context):
+    """Runs every 60s. Sends each user their Top-3 at their chosen LOCAL slots."""
+    now_utc = datetime.utcnow()
+    try:
+        users = db_prime_get_all_users()
+    except Exception as e:
+        logger.warning("prime scheduler: user fetch failed: %s", e)
+        return
+    if not users:
+        return
+    picks, refreshed = _prime_get_cached_picks()
+    for u in users:
+        chat_id = u["chat_id"]
+        off = u.get("gmt_offset", 0) or 0
+        try:
+            slots = db_prime_get_slots(chat_id)
+        except Exception:
+            continue
+        if not slots:
+            continue
+        for slot in prime.due_slots(now_utc, off, slots):
+            key = prime.slot_dedup_key(chat_id, now_utc, off, slot)
+            if db_prime_alert_already_sent(key):
+                continue
+            db_prime_mark_alert_sent(key)
+            text = ("\U0001F531 PRIME ALERT \u2014 your scheduled call check\n\n"
+                    + _prime_render_dashboard(picks, refreshed))
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception as e:
+                logger.warning("prime alert send failed chat=%s: %s", chat_id, e)
+
+
+async def prime_cleanup_job(context):
+    try:
+        db_prime_cleanup_alert_sent(days=3)
+    except Exception as e:
+        logger.warning("prime cleanup error: %s", e)
+
+
 async def pro_command(update, context):
     """
     /pro           — show the FULL command guide (all public commands + usage)
@@ -1444,7 +1730,7 @@ _scan_cache_lock   = asyncio.Lock()   # prevents cache stampede
 # { 'regime': 'BULL'|'BEAR'|'NEUTRAL', 'time': datetime }
 _btc_regime_cache_ttl = 900  # 15 minutes — same as scan cache
 
-# ── BTC Dominance Cache ─────────────────────────────��─��───��──���───����������─��─��─��─��
+# ── BTC Dominance Cache ─────────────────────────��───��─��───��──���───����������─��─��─��─��
 # BTC.D rising = capital flowing out of alts → penalise altcoin LONGs
 # Fetched from Bybit BTCDOMUSDT or Binance BTCDOMUSDT (may not always be available)
 # { 'btcd': float, 'trend': 'rising'|'falling'|'flat', 'time': datetime }
@@ -1532,7 +1818,7 @@ except ImportError:
     _PAPER_AVAILABLE = False
     logger.warning("sakz_paper.py not found — /paper disabled")
 
-# ─────────────────────────────────────────────
+# ─────────────���───────────────────────────────
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
@@ -1955,7 +2241,7 @@ def _fetch_tf_candles(exchange, symbol, tf_key, role='pri'):
 #   15m → 10 candles (~2.5 hours)
 #   1h  → 6 candles  (~6 hours)
 #   4h  → 4 candles  (~16 hours)
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────���─────────────────────────────────────────────────────────
 
 # Min candles per TF (much lower than normal — new listings have thin history)
 #   5m  → 3 candles  (~15 minutes of data — ultra-early floor)
@@ -2121,7 +2407,7 @@ def analyze_symbol_mtf(symbol, exchange, tf_key=None, funding=0.0, user_requeste
     for tf in tfs_to_try:
         cfg = TF_CONFIGS[tf]
         try:
-            # ── LIQUIDITY FILTER — skip for user-requested scans ──────────────
+            # ── LIQUIDITY FILTER — skip for user-requested scans ─────────��────
             passes_vol, vol_usdt, vol_threshold = _passes_volume_filter(exchange, symbol, tf)
             if not passes_vol and not user_requested:
                 vol_m = vol_usdt / 1_000_000
@@ -4235,7 +4521,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recommendations.append("📈 T2 reached > 50% — targets may be too conservative. Consider expanding T2/T3 multipliers.")
 
     if lr < 40 and len(longs) >= 10:
-        recommendations.append("🔴 LONG win rate < 40% — regime gate may need tightening (lower threshold from conf≥9 to conf≥8 in BEAR).")
+        recommendations.append("🔴 LONG win rate < 40% — regime gate may need tightening (lower threshold from conf��9 to conf≥8 in BEAR).")
     if sr < 40 and len(shorts) >= 10:
         recommendations.append("🔴 SHORT win rate < 40% — consider tightening short qualification bar.")
 
@@ -16200,6 +16486,30 @@ def main():
     )
     app.add_handler(CommandHandler("pro", pro_command))
 
+    # ── PRIME — secret high-conviction subscription ───────────────
+    app.add_handler(CommandHandler("prime", prime_command))
+    # 15-minute live cache refresh of the ranked Top picks
+    app.job_queue.run_repeating(
+        prime_refresh_job,
+        interval=prime.PRIME_CACHE_TTL_MIN * 60,
+        first=150,
+        name="prime_refresh"
+    )
+    # Per-user GMT alert scheduler — minute tick
+    app.job_queue.run_repeating(
+        prime_alert_scheduler_job,
+        interval=60,
+        first=60,
+        name="prime_alert_scheduler"
+    )
+    # Dedup ledger cleanup every 6h
+    app.job_queue.run_repeating(
+        prime_cleanup_job,
+        interval=21600,
+        first=3600,
+        name="prime_cleanup"
+    )
+
     # ── Paper trading — mark-to-market every 15 min ────────────────
     if _PAPER_AVAILABLE:
         app.job_queue.run_repeating(
@@ -16309,6 +16619,12 @@ def main():
     # 📋 MENU interactive button callbacks
     app.add_handler(CallbackQueryHandler(menu_callback_handler,     pattern=r'^menu\|'))
     app.add_handler(CallbackQueryHandler(menu_run_callback,         pattern=r'^menu_run\|'))
+    # ── PRIME callbacks (timezone picker, alert-slot toggles, dashboard) ──
+    app.add_handler(CallbackQueryHandler(prime_tzmenu_callback,     pattern=r'^prime_tzmenu\|'))
+    app.add_handler(CallbackQueryHandler(prime_tz_callback,         pattern=r'^prime_tz\|'))
+    app.add_handler(CallbackQueryHandler(prime_slot_callback,       pattern=r'^prime_slot\|'))
+    app.add_handler(CallbackQueryHandler(prime_show_callback,       pattern=r'^prime_show\|'))
+    app.add_handler(CallbackQueryHandler(prime_off_callback,        pattern=r'^prime_off\|'))
     app.add_handler(MessageHandler(filters.Regex(r'^/top\d+') & filters.TEXT, top_command))
     # 🐌 SNAIL commands — visible only to unlocked users
     app.add_handler(CommandHandler("snail",      snail_command))

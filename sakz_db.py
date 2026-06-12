@@ -451,6 +451,32 @@ def db_init():
             enabled_at  TEXT NOT NULL
         );
 
+        -- PRIME: secret high-conviction subscription + per-user GMT alert times
+        CREATE TABLE IF NOT EXISTS prime_users (
+            chat_id        INTEGER PRIMARY KEY,
+            gmt_offset     REAL NOT NULL DEFAULT 0,
+            subscribed_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS prime_alert_prefs (
+            chat_id     INTEGER PRIMARY KEY,
+            slots       TEXT NOT NULL DEFAULT '',
+            updated_at  TEXT NOT NULL
+        );
+
+        -- PRIME: single-row 15-minute cache of the ranked top picks (JSON payload)
+        CREATE TABLE IF NOT EXISTS prime_cache (
+            id           INTEGER PRIMARY KEY,
+            payload      TEXT NOT NULL,
+            refreshed_at TEXT NOT NULL
+        );
+
+        -- PRIME: dedup ledger so a user is alerted at most once per local slot/day
+        CREATE TABLE IF NOT EXISTS prime_alert_sent (
+            dedup_key  TEXT PRIMARY KEY,
+            sent_at    TEXT NOT NULL
+        );
+
         -- /pro feature: per-token sustained uptrend streak tracking
         CREATE TABLE IF NOT EXISTS pro_uptrend_log (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1035,6 +1061,123 @@ def db_pro_get_all_subscribers() -> list:
     rows = conn.execute("SELECT chat_id FROM pro_subscribers").fetchall()
     conn.close()
     return [r["chat_id"] for r in rows]
+
+# ── PRIME subscription / timezone / alert-slot / cache helpers ───────────────
+def db_prime_subscribe(chat_id: int, gmt_offset: float = 0.0):
+    """Subscribe a user to PRIME (idempotent). Preserves an existing offset."""
+    conn = db_connect()
+    row = conn.execute("SELECT gmt_offset FROM prime_users WHERE chat_id=?", (chat_id,)).fetchone()
+    if row is not None:
+        conn.close()
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO prime_users (chat_id, gmt_offset, subscribed_at) VALUES (?,?,?)",
+        (chat_id, float(gmt_offset), datetime.now().isoformat())
+    )
+    conn.commit(); conn.close()
+
+def db_prime_unsubscribe(chat_id: int):
+    conn = db_connect()
+    conn.execute("DELETE FROM prime_users WHERE chat_id=?", (chat_id,))
+    conn.execute("DELETE FROM prime_alert_prefs WHERE chat_id=?", (chat_id,))
+    conn.commit(); conn.close()
+
+def db_prime_is_subscribed(chat_id: int) -> bool:
+    conn = db_connect()
+    row  = conn.execute("SELECT 1 FROM prime_users WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+def db_prime_set_offset(chat_id: int, gmt_offset: float):
+    """Set the user's GMT offset (hours, may be fractional). Subscribes if new."""
+    conn = db_connect()
+    row = conn.execute("SELECT 1 FROM prime_users WHERE chat_id=?", (chat_id,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT OR REPLACE INTO prime_users (chat_id, gmt_offset, subscribed_at) VALUES (?,?,?)",
+            (chat_id, float(gmt_offset), datetime.now().isoformat())
+        )
+    else:
+        conn.execute("UPDATE prime_users SET gmt_offset=? WHERE chat_id=?", (float(gmt_offset), chat_id))
+    conn.commit(); conn.close()
+
+def db_prime_get_user(chat_id: int):
+    conn = db_connect()
+    row = conn.execute("SELECT chat_id, gmt_offset FROM prime_users WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"chat_id": row["chat_id"], "gmt_offset": row["gmt_offset"]}
+
+def db_prime_get_all_users() -> list:
+    conn = db_connect()
+    rows = conn.execute("SELECT chat_id, gmt_offset FROM prime_users").fetchall()
+    conn.close()
+    return [{"chat_id": r["chat_id"], "gmt_offset": r["gmt_offset"]} for r in rows]
+
+def db_prime_set_slots(chat_id: int, slots: list):
+    s = ",".join(str(int(x)) for x in sorted(set(int(v) for v in slots)))
+    conn = db_connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO prime_alert_prefs (chat_id, slots, updated_at) VALUES (?,?,?)",
+        (chat_id, s, datetime.now().isoformat())
+    )
+    conn.commit(); conn.close()
+
+def db_prime_get_slots(chat_id: int) -> list:
+    conn = db_connect()
+    row = conn.execute("SELECT slots FROM prime_alert_prefs WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    if not row or not row["slots"]:
+        return []
+    return [int(x) for x in str(row["slots"]).split(",") if str(x).strip()]
+
+def db_prime_toggle_slot(chat_id: int, slot: int) -> list:
+    """Toggle one alert-hour slot on/off; returns the new sorted slot list."""
+    cur = db_prime_get_slots(chat_id)
+    slot = int(slot)
+    if slot in cur:
+        cur = [x for x in cur if x != slot]
+    else:
+        cur.append(slot)
+    db_prime_set_slots(chat_id, cur)
+    return sorted(set(cur))
+
+def db_prime_cache_put(payload: str):
+    conn = db_connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO prime_cache (id, payload, refreshed_at) VALUES (1,?,?)",
+        (payload, datetime.now().isoformat())
+    )
+    conn.commit(); conn.close()
+
+def db_prime_cache_get():
+    conn = db_connect()
+    row = conn.execute("SELECT payload, refreshed_at FROM prime_cache WHERE id=1").fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"payload": row["payload"], "refreshed_at": row["refreshed_at"]}
+
+def db_prime_alert_already_sent(dedup_key: str) -> bool:
+    conn = db_connect()
+    row = conn.execute("SELECT 1 FROM prime_alert_sent WHERE dedup_key=?", (dedup_key,)).fetchone()
+    conn.close()
+    return row is not None
+
+def db_prime_mark_alert_sent(dedup_key: str):
+    conn = db_connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO prime_alert_sent (dedup_key, sent_at) VALUES (?,?)",
+        (dedup_key, datetime.now().isoformat())
+    )
+    conn.commit(); conn.close()
+
+def db_prime_cleanup_alert_sent(days: int = 3):
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db_connect()
+    conn.execute("DELETE FROM prime_alert_sent WHERE sent_at < ?", (cutoff,))
+    conn.commit(); conn.close()
 
 def db_pro_upsert_uptrend(symbol: str, exchange: str, daily_gains: list):
     now = datetime.now().isoformat()

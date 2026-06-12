@@ -1094,7 +1094,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
 
         # ── FIX #SESSION — Session awareness ───────────────────────────
         # Session modifier goes into ig (uncapped independent group).
-        # Positive: OVERLAP (+1) and NY (+0.5) — add in the signal direction.
+        # Positive: OVERLAP (+1) and NY (+0.5) �� add in the signal direction.
         # Negative: ASIAN (-0.5) and DEAD (-1) — subtract from the signal direction.
         #   (Penalising the direction bucket reduces winning score, which can widen
         #    or narrow the gap, eventually hitting the GAP_BLOCK or LOW_CONF gates.)
@@ -1742,6 +1742,10 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             'btc_price_at_scan': _get_btc_price_cached(),
             # CONVICTION LAYER — CVD / OI / VWAP payload (empty dict if disabled)
             'conviction': _conv,
+            # PRIME — absolute evidence depth (winning side raw score). Used only
+            # as a light tiebreaker in the Prime composite; no legacy gate reads it.
+            'winning_score': winning,
+            'losing_score': losing,
         }
 
         # ── ML SCORING — inject win-probability scores if models are loaded ──
@@ -1800,6 +1804,21 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         result['low_conf_warning']    = low_conf_warning  # set above if conf < 4
         result['btc_regime']          = btc_regime
         result['confidence']          = confidence        # may have been ML-nudged / downgraded
+
+        # ── PRIME — continuous 1-decimal confidence ───────────────────────────
+        # Recovers the sub-integer margin that min(10, round(...)) throws away,
+        # so a "strong 8" (raw 8.4) is distinguishable from a "weak 8" (raw 7.6).
+        # We take the pre-round base (ratio_conf + quality_bonus) and re-apply the
+        # NET integer delta that landed on `confidence` (candle demotion, BTC.D,
+        # abs-score gate, ML nudge). This never double-counts: conviction is
+        # already inside ratio_conf via the ig group.
+        try:
+            _base_precise = ratio_conf + quality_bonus
+            _init_round   = min(10, round(_base_precise))
+            _conf_precise = _base_precise + (confidence - _init_round)
+            result['confidence_precise'] = round(max(0.0, min(10.0, _conf_precise)), 1)
+        except Exception:
+            result['confidence_precise'] = float(confidence)
 
         return result
     except Exception as e:
