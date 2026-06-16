@@ -5358,8 +5358,15 @@ def _lifecycle_alerts_apply(rows, prices, now):
     list of (chat_id, text) alerts for the async wrapper to send.
 
     Runs in SCAN_EXECUTOR so the event loop is never blocked by DB writes.
+
+    Dedup guarantee: DB is written BEFORE output is built so a crash between
+    mark and send causes an omission (acceptable) rather than a duplicate.
+    An in-memory _fired set guards against the same key firing twice within a
+    single job tick even if a DB write fails silently.
     """
     out = []
+    _fired: set = set()   # (key, tag) pairs already processed this tick
+
     for rec, price in zip(rows, prices):
         try:
             key = rec.get('key')
@@ -5379,10 +5386,15 @@ def _lifecycle_alerts_apply(rows, prices, now):
             except Exception:
                 recips = []
             for tag in hits:
+                fire_key = (key, tag)
+                if fire_key in _fired:
+                    continue
+                # ── Write DB FIRST; only send if the mark succeeds ──────────
+                db_lifecycle_mark(key, f"{tag}_alerted")
+                _fired.add(fire_key)
                 text = _lifecycle_alert_text(tag, rec, price)
                 for chat_id in recips:
                     out.append((chat_id, text))
-                db_lifecycle_mark(key, f"{tag}_alerted")
             if 'sl' in hits or 't3' in hits:
                 db_lifecycle_close(key)
         except Exception as e:
