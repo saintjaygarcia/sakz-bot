@@ -44,8 +44,12 @@ except ImportError:
     RESOLVED_OUTCOMES = WIN_OUTCOMES + ("sl_hit",)
 
     def _load_outcomes(db_path):
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        try:
+            from sakz_db import db_connect
+            conn = db_connect()
+        except Exception:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
         placeholders = ",".join("?" for _ in RESOLVED_OUTCOMES)
         rows = conn.execute(
             f"SELECT * FROM signal_outcomes WHERE outcome IN ({placeholders})",

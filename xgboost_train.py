@@ -166,15 +166,25 @@ def _load_outcomes(db_path: str) -> tuple:
         X  — numpy float32 array (n_samples, n_features)
         y  — numpy int array, 1=win (target hit) 0=loss (stop hit)
     Only resolved target/stop outcomes are used; 'pending'/'expired' are skipped.
+    Uses db_connect() so Turso is used when TURSO_URL/TURSO_TOKEN are set,
+    falling back to local SQLite otherwise.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    try:
+        from sakz_db import db_connect
+        conn = db_connect()
+        _close = True
+    except Exception:
+        # fallback to raw sqlite if sakz_db unavailable
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        _close = True
     placeholders = ",".join("?" for _ in RESOLVED_OUTCOMES)
     rows = conn.execute(
         f"SELECT * FROM signal_outcomes WHERE outcome IN ({placeholders})",
         RESOLVED_OUTCOMES,
     ).fetchall()
-    conn.close()
+    if _close:
+        conn.close()
 
     X, y = [], []
     for row in rows:
