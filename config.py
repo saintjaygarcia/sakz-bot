@@ -14,7 +14,7 @@ load_dotenv()
 TURSO_URL   = os.environ.get("TURSO_URL", "")   or os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "") or os.environ.get("TURSO_AUTH_TOKEN", "")
 _USE_TURSO  = bool(TURSO_URL and TURSO_TOKEN)
-DB_PATH = os.environ.get("SAKZ_DB_PATH", "sakz_data.db")
+DB_PATH = os.path.abspath(os.environ.get("SAKZ_DB_PATH", "sakz_data.db"))
 ACTIVE_WINDOW_MIN = 30
 
 # --- HTTP / exchange tuning ---
