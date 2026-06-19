@@ -41,6 +41,21 @@ _BASE_PROD    = "https://api.bybit.com"
 BYBIT_BASE    = _BASE_TESTNET if BYBIT_TESTNET else _BASE_PROD
 RECV_WINDOW   = "5000"
 
+# Server-time offset (ms) applied to every signed timestamp to avoid
+# recv_window drift. Set via sakz_orders.sync_server_time().
+_TIME_OFFSET_MS = 0
+
+def set_time_offset_ms(offset):
+    """Record the local<->server clock offset (ms) for signed requests."""
+    global _TIME_OFFSET_MS
+    try:
+        _TIME_OFFSET_MS = int(offset)
+    except (TypeError, ValueError):
+        _TIME_OFFSET_MS = 0
+
+def get_time_offset_ms():
+    return _TIME_OFFSET_MS
+
 
 def _base_url(testnet=None):
     if testnet is None:
@@ -103,7 +118,7 @@ def bybit_signed_request(api_key, api_secret, method, path, params=None, testnet
     """
     base   = _base_url(testnet)
     params = params or {}
-    ts     = str(int(time.time() * 1000))
+    ts     = str(int(time.time() * 1000) + _TIME_OFFSET_MS)
     method = method.upper()
 
     if method == "GET":

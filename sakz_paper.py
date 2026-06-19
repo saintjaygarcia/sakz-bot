@@ -93,7 +93,7 @@ STEP 5 — Add commands (in handler registration block):
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 

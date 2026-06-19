@@ -8,7 +8,6 @@ Exposes three names imported by sakz_bot_main.py:
 """
 
 import os
-import json
 import pickle
 import sqlite3
 import logging
@@ -206,7 +205,6 @@ def train(db_path: str = "sakz_data.db") -> dict:
     try:
         from xgboost import XGBClassifier
         from sklearn.model_selection import StratifiedKFold, cross_val_score
-        from sklearn.metrics import roc_auc_score
     except ImportError as e:
         raise RuntimeError(f"Missing dependency: {e}. Run: pip install xgboost scikit-learn")
 

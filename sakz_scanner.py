@@ -10,10 +10,23 @@ stays acyclic:  sakz_bot -> sakz_scanner -> (state / satellites).
 """
 import os
 import logging
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import Optional
-import ta
+from datetime import datetime
+from dataclasses import dataclass
+try:
+    import ta
+except ModuleNotFoundError:  # pragma: no cover - offline/test envs without `ta`
+    # `ta` supplies the technical-indicator implementations and is required in
+    # production (it is installed there). Pure-logic tests (e.g. test_phase0)
+    # import this module without `ta` present, so degrade gracefully: the module
+    # imports fine, and any path that actually needs an indicator raises a clear
+    # ImportError instead of a confusing AttributeError on None.
+    class _MissingTA:
+        def __getattr__(self, name):
+            raise ImportError(
+                "The 'ta' package is required for technical-indicator "
+                "computation but is not installed. Run: pip install ta"
+            )
+    ta = _MissingTA()  # type: ignore[assignment]
 
 import sakz_state as state
 import sakz_exchanges
@@ -143,6 +156,7 @@ def _get_btc_dominance() -> dict:
                     logger.debug("BTC.D: %.2f%% trend=%s (delta=%.3f)", current, trend, delta)
                     break
             except Exception:
+                logger.debug("suppressed exception in _get_btc_dominance", exc_info=True)
                 continue
     except Exception as e:
         logger.debug("BTC.D fetch error: %s", e)
@@ -189,6 +203,7 @@ def calculate_leverage(price, entry_low, entry_high, stop_loss, atr, confidence,
                 'sl_dist': sl_dist, 'liq_dist': liq_dist,
                 'fluct': fluct, 'atr_pct': atr_pct, 'vol_label': vl}
     except Exception:
+        logger.debug("suppressed exception in calculate_leverage", exc_info=True)
         return None
 
 
@@ -289,7 +304,7 @@ def add_indicators(df, timeframe='4h'):
         df['clv']    = ((2 * c - h - l) / hl_range).fillna(0)
         df['clv_ma'] = df['clv'].rolling(5).mean().shift(1)   # shift: exclude current bar
 
-        # FIX #9 �� use window=5 for 4H (crypto moves fast); daily stays at 14
+        # FIX #9 — use window=5 for 4H (crypto moves fast); daily stays at 14
         stoch_window = 5 if timeframe == '4h' else 14
         stoch        = ta.momentum.StochasticOscillator(h, l, c, window=stoch_window, smooth_window=3)
         df['stoch_k'] = stoch.stoch()
@@ -608,7 +623,7 @@ def fib_confluence_score(df, price: float, support: float, resistance: float,
 
         swing_range = sh_price - sl_price
         if swing_range < atr * 0.5:
-            # Swing range too small to be meaningful �� skip
+            # Swing range too small to be meaningful — skip
             return 0, [], ""
 
         # Compute Fibonacci levels (retracement from the swing extremes)
@@ -653,7 +668,7 @@ def fib_confluence_score(df, price: float, support: float, resistance: float,
 def candle_quality_score(candle, bias: str) -> tuple:
     """
     FIX #CQ — Candle Quality Scoring
-    ───��─────────────────────────────
+    ──────────────────────────────────
     Scores the signal candle on three independent structural properties.
     A doji and a full-body engulfing candle are NOT the same signal —
     this function quantifies that difference and feeds it into confidence.
@@ -664,7 +679,7 @@ def candle_quality_score(candle, bias: str) -> tuple:
     score < 0.0  → quality penalty (min -1.0 applied as confidence demotion)
     score = 0.0  → neutral / indeterminate candle
 
-    Three sub-scores (each ���1 to +1), averaged then clamped to [–1, +1]:
+    Three sub-scores (each −1 to +1), averaged then clamped to [–1, +1]:
 
     1. BODY RATIO  — body / total range
        A candle whose body fills > 60 % of its range committed to a direction.
@@ -965,12 +980,16 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             cross_g_l+=3; lr.append("MACD confirmed bullish crossover Daily ⚡ [closed candle]")
         elif macd_cross_bear_1d:
             cross_g_s+=3; sr.append("MACD confirmed bearish crossover Daily ⚡ [closed candle]")
-        elif macd_d > 0:
-            cross_g_l+=1; lr.append("MACD bullish Daily [closed candle]")
-        elif macd_d < 0:
-            cross_g_s+=1; sr.append("MACD bearish Daily [closed candle]")
+        elif macd_d > 0 and macd_diff > 0:
+            # FIX #4 — daily MACD double-count: sustained daily momentum (no fresh
+            # cross) only counts when the 4H histogram confirms the SAME direction.
+            # Previously a bearish daily mid-correction added +1 SHORT even while 4H
+            # was reversing bullish, quietly tilting signals the wrong way.
+            cross_g_l+=1; lr.append("MACD bullish Daily [closed candle] (4H-confirmed)")
+        elif macd_d < 0 and macd_diff < 0:
+            cross_g_s+=1; sr.append("MACD bearish Daily [closed candle] (4H-confirmed)")
 
-        # ── EMA → position bucket ─────────────────────────────��─��───��───
+        # ── EMA → position bucket ──────────────────────────────────────────
         if price > ema20 > ema50:   pos_g_l+=2; lr.append("Bullish EMA stack 4H")
         elif price < ema20 < ema50: pos_g_s+=2; sr.append("Bearish EMA stack 4H")
         elif price > ema20:         pos_g_l+=1; lr.append("Price above EMA20 4H")
@@ -984,14 +1003,22 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         if price <= bb_lower:   vg_l+=2; lr.append("Price at/below lower Bollinger Band")
         elif price >= bb_upper: vg_s+=2; sr.append("Price at/above upper Bollinger Band")
 
-        # FIX #BB — BB squeeze breakout
+        # FIX #3 — BB squeeze breakout DIRECTION from real range break, not candle colour.
         bb_bw     = L.get('bb_bw',     None) if hasattr(L, 'get') else L['bb_bw']     if 'bb_bw'     in L.index else None
         bb_bw_min = L.get('bb_bw_min', None) if hasattr(L, 'get') else L['bb_bw_min'] if 'bb_bw_min' in L.index else None
         if bb_bw is not None and bb_bw_min is not None and bb_bw_min > 0:
             squeeze_expanding = (bb_bw > bb_bw_min * 1.05)
             if squeeze_expanding:
-                if price > P['close']:  vg_l+=2; lr.append(f"BB squeeze breakout BULLISH (bw expanding from floor)")
-                else:                   vg_s+=2; sr.append(f"BB squeeze breakout BEARISH (bw expanding from floor)")
+                # Candle colour (price > prev close) misfires on inside bars and
+                # indecision candles. A squeeze only means something when price is
+                # actually breaking the range it was coiling inside, so score the
+                # direction off resistance/support breakout with a small ATR tolerance.
+                _brk_tol = atr * 0.1 if (atr and atr > 0) else 0.0
+                if price >= (resistance - _brk_tol):
+                    vg_l+=2; lr.append(f"BB squeeze breakout BULLISH (price breaking resistance ${resistance:.4f})")
+                elif price <= (support + _brk_tol):
+                    vg_s+=2; sr.append(f"BB squeeze breakout BEARISH (price breaking support ${support:.4f})")
+                # else: squeeze expanding but price still inside the range — no directional edge
 
         # ── Stochastic → oscillator bucket (same osc_g as RSI 4H) ────────
         # Stochastic and RSI both measure price momentum on the 4H timeframe.
@@ -1082,28 +1109,17 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         # Called AFTER bias is decided (CVD/OI/VWAP scoring is directional).
         # Called BEFORE the final ig sum so the points are included in ls/ss.
         #
-        # At this point `bias` is already determined from the ls/ss comparison
-        # above, but ig_l and ig_s are still being accumulated — the final
-        # sum happens below at "Apply group caps, then sum".
+        # FIX #7 — DEFERRED: conviction scoring is DIRECTIONAL, so it must run
+        # AFTER bias is determined. It used to be called here with `bias` still
+        # undefined, raising NameError on every call which was silently swallowed
+        # by the except below — so the entire CVD/OI/VWAP layer never applied, and
+        # when it didn't crash it scored against an unset/wrong direction.
+        # The real call now lives immediately after the `ls >= ss` decision.
         _conv = {}
-        if _CONVICTION_AVAILABLE:
-            try:
-                _binance_ok = sakz_exchanges.BINANCE_AVAILABLE if sakz_exchanges.BINANCE_AVAILABLE is not None else False
-                _conv = conviction_scores(symbol, df4h, bias, _binance_ok)
-                ig_l += _conv.get('ig_long_bonus',  0)
-                ig_s += _conv.get('ig_short_bonus', 0)
-                # Surface conviction notes in the relevant reason list
-                for _cn in _conv.get('display_lines', []):
-                    if bias == 'LONG':
-                        lr.append(_cn)
-                    else:
-                        sr.append(_cn)
-            except Exception as _conv_e:
-                logger.debug("conviction_scores error for %s: %s", symbol, _conv_e)
 
         # ── FIX #SESSION — Session awareness ───────────────────────────
         # Session modifier goes into ig (uncapped independent group).
-        # Positive: OVERLAP (+1) and NY (+0.5) �� add in the signal direction.
+        # Positive: OVERLAP (+1) and NY (+0.5) — add in the signal direction.
         # Negative: ASIAN (-0.5) and DEAD (-1) — subtract from the signal direction.
         #   (Penalising the direction bucket reduces winning score, which can widen
         #    or narrow the gap, eventually hitting the GAP_BLOCK or LOW_CONF gates.)
@@ -1169,6 +1185,27 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             bias, score, reasons = "SHORT", ss, sr
             winning, losing      = ss, ls
 
+        # ── FIX #7 — CONVICTION LAYER (CVD / OI / VWAP), applied AFTER bias ──
+        # Now that `bias` is definitively set, apply the directional conviction
+        # bonus to the winning side so it flows into confidence and the gap check.
+        if _CONVICTION_AVAILABLE:
+            try:
+                _binance_ok = sakz_exchanges.BINANCE_AVAILABLE if sakz_exchanges.BINANCE_AVAILABLE is not None else False
+                _conv = conviction_scores(symbol, df4h, bias, _binance_ok)
+                _conv_bonus = (_conv.get('ig_long_bonus', 0) if bias == 'LONG'
+                               else _conv.get('ig_short_bonus', 0))
+                if _conv_bonus:
+                    winning += _conv_bonus
+                    score    = winning
+                    if bias == 'LONG':
+                        ls += _conv_bonus
+                    else:
+                        ss += _conv_bonus
+                for _cn in _conv.get('display_lines', []):
+                    reasons.append(_cn)
+            except Exception as _conv_e:
+                logger.debug("conviction_scores error for %s: %s", symbol, _conv_e)
+
         # ── FIX #GAP — Minimum score gap ───────────────────────────────
         # Winning side must beat losing side by at least 2 points.
         # A 1-point edge (e.g. 5 vs 4) in a ranging market is noise —
@@ -1178,7 +1215,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             gap_detail = f"gap={winning-losing} (winning={winning} losing={losing})"
             if user_requested or not AUTOSCAN_STRICT_GATE:
                 logger.debug("GAP SOFT-WARN: %s %s %s", symbol, bias, gap_detail)
-                ig_l.append(f"⚠️ Narrow gap: {gap_detail} — choppy market, trade carefully")
+                reasons.append(f"⚠️ Narrow gap: {gap_detail} — choppy market, trade carefully")  # FIX #6: ig_l is an int — append to reasons
             else:
                 logger.debug("GAP BLOCK: %s %s gap=%d (winning=%d losing=%d) — too close",
                              symbol, bias, winning - losing, winning, losing)
@@ -1210,7 +1247,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
                         # ── SOFT WARN: show analysis anyway for manual queries ──
                         # The user explicitly asked — they want the current picture.
                         logger.debug("FLIP SOFT-WARN: %s %s", symbol, flip_detail)
-                        ig_l.append(f"⚠️ Flip cooldown: {flip_detail} — showing analysis anyway")
+                        reasons.append(f"⚠️ Flip cooldown: {flip_detail} — showing analysis anyway")  # FIX #6: ig_l is an int — append to reasons
                     else:
                         # ── HARD BLOCK: auto-scan / background jobs ────────────
                         logger.debug(
@@ -1233,7 +1270,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             ct_detail = f"winning={winning} < min_score_req={min_score_req} ({bias} vs daily EMA)"
             if user_requested or not AUTOSCAN_STRICT_GATE:
                 logger.debug("COUNTER_TREND SOFT-WARN: %s %s", symbol, ct_detail)
-                ig_l.append(f"⚠️ Counter-trend: {ct_detail} — signal opposes daily EMA, higher risk")
+                reasons.append(f"⚠️ Counter-trend: {ct_detail} — signal opposes daily EMA, higher risk")  # FIX #6: ig_l is an int — append to reasons
             else:
                 return ScanFailure(REASON_COUNTER_TREND, detail=ct_detail)
 
@@ -1345,7 +1382,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
         regime_blocked = False
         regime_block_detail = None
 
-        # ���─ FIX #BTCD — BTC Dominance Filter ──────────────────────────
+        # ──── FIX #BTCD — BTC Dominance Filter ──────────────────────────
         # BTC.D rising = capital rotating from alts to BTC → alt LONGs face headwind.
         # Apply a confidence penalty of −1 for altcoin LONGs when BTC.D is rising.
         # Attach a warning note; never hard-block (user may know why they're trading).
@@ -1518,7 +1555,7 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             t3 = price + _t3_dist
 
         else:
-            # ── FIX #TL — SHORT pullback-anchored entry zone ──────��─────
+            # ── FIX #TL — SHORT pullback-anchored entry zone ─────────────
             # Mirror of the LONG fix: price fell to create the SHORT signal,
             # so entering at the close or below it is chasing the dump.
             # Set the zone to a realistic dead-cat bounce level:
@@ -1751,6 +1788,16 @@ def score_pair(df4h, df1d, funding, symbol, user_requested: bool = False):
             'btc_price_at_scan': _get_btc_price_cached(),
             # CONVICTION LAYER — CVD / OI / VWAP payload (empty dict if disabled)
             'conviction': _conv,
+            # EXPLAIN LAYER - winning-side capped score buckets (display only)
+            'score_buckets': ({
+                'osc_g':   min(osc_g_l, OSC_CAP),    'mtf_g': min(mtf_g_l, MTF_CAP),
+                'cross_g': min(cross_g_l, CROSS_CAP),'pos_g': min(pos_g_l, POS_CAP),
+                'vg':      min(vg_l, STRUCTURE_CAP), 'ig':    ig_l,
+            } if bias == 'LONG' else {
+                'osc_g':   min(osc_g_s, OSC_CAP),    'mtf_g': min(mtf_g_s, MTF_CAP),
+                'cross_g': min(cross_g_s, CROSS_CAP),'pos_g': min(pos_g_s, POS_CAP),
+                'vg':      min(vg_s, STRUCTURE_CAP), 'ig':    ig_s,
+            }),
             # PRIME — absolute evidence depth (winning side raw score). Used only
             # as a light tiebreaker in the Prime composite; no legacy gate reads it.
             'winning_score': winning,
@@ -1876,7 +1923,7 @@ def _rr_ratio(r):
         if risk > 0:
             return reward / risk
     except Exception:
-        pass
+        logger.debug("suppressed exception in _rr_ratio", exc_info=True)
     return None
 
 
@@ -1911,7 +1958,7 @@ def risk_reasons(r) -> list:
         if rr is not None and rr < _MIN_SIGNAL_RR:
             reasons.append(f"Reward:risk {rr:.2f} is below the {_MIN_SIGNAL_RR:.1f} minimum")
     except Exception:
-        pass
+        logger.debug("suppressed exception in risk_reasons", exc_info=True)
     try:
         entry = r.get("entry_low") or r.get("price")
         sl = r.get("stop_loss")
@@ -1922,7 +1969,7 @@ def risk_reasons(r) -> list:
             elif dist > 12:
                 reasons.append(f"Stop very wide ({dist:.1f}%) — outsized risk")
     except Exception:
-        pass
+        logger.debug("suppressed exception in risk_reasons", exc_info=True)
     vol = r.get("quote_volume") or r.get("volume_usd") or r.get("volume")
     try:
         if vol is not None and float(vol) < 1_000_000:

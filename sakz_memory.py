@@ -70,7 +70,6 @@ if _USE_TURSO:
         libsql     = None
         _USE_TURSO = False
 import logging
-import asyncio
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -96,7 +95,6 @@ def _db():
         return conn
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
     return conn
 
 

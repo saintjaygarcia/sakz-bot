@@ -358,7 +358,6 @@ def binance_check_available() -> bool:
 
 # ── Smoke-test ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    import sys
     print("sakz_ccxt smoke test\n" + "─" * 40)
 
     sym = 'BTCUSDT'

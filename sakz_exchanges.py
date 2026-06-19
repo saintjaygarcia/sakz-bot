@@ -132,6 +132,7 @@ def bybit_get_top_symbols(limit=50):
                 if vol > 1_000_000 and price > 0:
                     vol_list.append({'symbol': sym, 'volume': vol, 'price': price})
             except Exception:
+                logger.debug("suppressed exception in bybit_get_top_symbols", exc_info=True)
                 continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         return [i['symbol'] for i in vol_list[:limit]]
@@ -165,6 +166,7 @@ def bybit_get_mid_symbols(rank_from=51, rank_to=200, min_vol=500_000):
                 if vol >= min_vol and price > 0:
                     vol_list.append({'symbol': sym, 'volume': vol})
             except Exception:
+                logger.debug("suppressed exception in bybit_get_mid_symbols", exc_info=True)
                 continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         # Slice to the requested rank window (1-indexed)
@@ -268,6 +270,7 @@ def mexc_get_top_symbols(limit=50):
                         clean_sym = sym.replace('_USDT', 'USDT')
                         vol_list.append({'symbol': clean_sym, 'volume': vol})
                 except Exception:
+                    logger.debug("suppressed exception in mexc_get_top_symbols", exc_info=True)
                     continue
         else:
             # Spot fallback — already in BTCUSDT format
@@ -283,6 +286,7 @@ def mexc_get_top_symbols(limit=50):
                     if vol > 500_000 and price > 0:
                         vol_list.append({'symbol': sym, 'volume': vol})
                 except Exception:
+                    logger.debug("suppressed exception in mexc_get_top_symbols", exc_info=True)
                     continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         return [i['symbol'] for i in vol_list[:limit]]
@@ -312,6 +316,7 @@ def mexc_get_mid_symbols(rank_from=51, rank_to=200, min_vol=250_000):
                         clean_sym = sym.replace('_USDT', 'USDT')
                         vol_list.append({'symbol': clean_sym, 'volume': vol})
                 except Exception:
+                    logger.debug("suppressed exception in mexc_get_mid_symbols", exc_info=True)
                     continue
         else:
             r2 = SESSION.get("https://api.mexc.com/api/v3/ticker/24hr",
@@ -326,6 +331,7 @@ def mexc_get_mid_symbols(rank_from=51, rank_to=200, min_vol=250_000):
                     if vol >= min_vol and price > 0:
                         vol_list.append({'symbol': sym, 'volume': vol})
                 except Exception:
+                    logger.debug("suppressed exception in mexc_get_mid_symbols", exc_info=True)
                     continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         mid_slice = vol_list[rank_from - 1 : rank_to]
@@ -375,6 +381,7 @@ def mexc_fetch_ohlcv(symbol, interval='4h', limit=100):
             try:
                 payload = r.json()
             except Exception:
+                logger.debug("suppressed exception in mexc_fetch_ohlcv", exc_info=True)
                 continue
             if payload.get('success') and payload.get('data'):
                 data = payload
@@ -455,6 +462,7 @@ def binance_get_top_symbols(limit=50):
                 if vol > 5_000_000 and price > 0:
                     vol_list.append({'symbol': sym, 'volume': vol})
             except Exception:
+                logger.debug("suppressed exception in binance_get_top_symbols", exc_info=True)
                 continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         return [i['symbol'] for i in vol_list[:limit]]
@@ -485,6 +493,7 @@ def binance_get_mid_symbols(rank_from=51, rank_to=200, min_vol=2_000_000):
                 if vol >= min_vol and price > 0:
                     vol_list.append({'symbol': sym, 'volume': vol})
             except Exception:
+                logger.debug("suppressed exception in binance_get_mid_symbols", exc_info=True)
                 continue
         vol_list.sort(key=lambda x: x['volume'], reverse=True)
         mid_slice = vol_list[rank_from - 1 : rank_to]
@@ -511,6 +520,7 @@ def binance_fetch_ohlcv(symbol, interval='4h', limit=100):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df[['timestamp','open','high','low','close','volume']].dropna()
     except Exception:
+        logger.debug("suppressed exception in binance_fetch_ohlcv", exc_info=True)
         return None
 
 def binance_fetch_funding(symbol):

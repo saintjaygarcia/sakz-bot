@@ -41,6 +41,13 @@ _DB_LOCK         = threading.RLock()
 _DB_MAX_ATTEMPTS = 4      # 1 initial try + 3 retries
 _DB_RETRY_SLEEP  = 0.4    # base seconds; grows linearly per attempt
 
+# Local-SQLite concurrency budget. How long a contending connection waits for a
+# lock before giving up. Env-tunable so a busy host can be given more slack.
+try:
+    SQLITE_BUSY_TIMEOUT_S = float(os.environ.get("SAKZ_SQLITE_BUSY_TIMEOUT", "30"))
+except (TypeError, ValueError):
+    SQLITE_BUSY_TIMEOUT_S = 30.0
+
 _TRANSIENT_DB_MARKERS = (
     "stream not found",
     "stream expired",
@@ -249,10 +256,29 @@ def db_connect():
             try:
                 conn.row_factory = sqlite3.Row  # harmless if libsql ever honors it
             except Exception:
-                pass
+                logger.debug("suppressed exception in db_connect", exc_info=True)
             return _ConnWrapper(conn)   # FIX M1 — dict-row adapter for Turso path
-        conn = sqlite3.connect(DB_PATH)
+        # SCALE HARDENING - local SQLite tuned for many concurrent users.
+        # Default rollback-journal SQLite locks the WHOLE db on every write,
+        # so with ~100 users the telegram handlers + scan executor + job-queue
+        # collide and raise "database is locked". WAL lets readers run
+        # concurrently with a writer; busy_timeout makes a contending
+        # connection WAIT (up to N ms) instead of failing instantly;
+        # synchronous=NORMAL is the safe+fast pairing for WAL. check_same_thread
+        # is off because db_* helpers may run on the scan executor / job-queue
+        # threads (all serialised by _DB_LOCK, so this stays safe).
+        conn = sqlite3.connect(
+            DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_S, check_same_thread=False,
+        )
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_S * 1000)}")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        except Exception as _pe:  # pragma tuning is best-effort, never fatal
+            logger.warning("sqlite pragma tuning failed (continuing): %s", _pe)
         return conn
     except SakzDBError:
         raise
@@ -541,7 +567,7 @@ def db_init():
             conn.commit()
             logger.info("DB migration: added column signal_outcomes.%s", _col)
         except Exception:
-            pass  # column already exists — safe to ignore
+            logger.debug("suppressed exception in db_init", exc_info=True)
 
     # SIGNAL LIFECYCLE tables (first-signal registry + evictions).
     try:
@@ -550,6 +576,36 @@ def db_init():
         logger.info("DB: signal lifecycle tables ready")
     except Exception as _le:
         logger.warning("lifecycle table init failed: %s", _le)
+
+    # SCALE HARDENING - indexes on the append-only / growing tables. They
+    # use an autoincrement id PK but are queried by other columns; without an
+    # index every lookup is a full scan, which degrades under ~100 users.
+    # CREATE INDEX IF NOT EXISTS is idempotent and safe on every boot.
+    _INDEXES = [
+        "CREATE INDEX IF NOT EXISTS idx_so_outcome        ON signal_outcomes(outcome)",
+        "CREATE INDEX IF NOT EXISTS idx_so_sym_exch_bias  ON signal_outcomes(exchange, symbol, bias)",
+        "CREATE INDEX IF NOT EXISTS idx_so_symbol         ON signal_outcomes(symbol)",
+        "CREATE INDEX IF NOT EXISTS idx_so_scan_time      ON signal_outcomes(scan_time)",
+        "CREATE INDEX IF NOT EXISTS idx_so_signal_id      ON signal_outcomes(signal_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ph_key_ts         ON price_history(key, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_ph_ts             ON price_history(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_sr_scan_time      ON scan_results(scan_time)",
+        "CREATE INDEX IF NOT EXISTS idx_sr_exch_sym       ON scan_results(exchange, symbol)",
+        "CREATE INDEX IF NOT EXISTS idx_sns_chat_outcome  ON snail_signals(chat_id, outcome)",
+        "CREATE INDEX IF NOT EXISTS idx_btc_snap_ts        ON btc_price_snapshots(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_pro_up_sym_exch   ON pro_uptrend_log(symbol, exchange)",
+        "CREATE INDEX IF NOT EXISTS idx_pro_gain_symbol   ON pro_gainers_log(symbol)",
+        "CREATE INDEX IF NOT EXISTS idx_pro_manip_sym_exch ON pro_manip_log(symbol, exchange)",
+    ]
+    _idx_ok = 0
+    for _stmt in _INDEXES:
+        try:
+            conn.execute(_stmt)
+            _idx_ok += 1
+        except Exception as _ie:
+            logger.warning("index init skipped (%s): %s", _stmt.split()[5], _ie)
+    conn.commit()
+    logger.info("DB: %d/%d performance indexes ready", _idx_ok, len(_INDEXES))
 
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
@@ -1440,6 +1496,10 @@ CREATE TABLE IF NOT EXISTS autoscan_lifecycle (
     t2_alerted  INTEGER NOT NULL DEFAULT 0,
     t3_alerted  INTEGER NOT NULL DEFAULT 0,
     sl_alerted  INTEGER NOT NULL DEFAULT 0,
+    t1_at       TEXT,
+    t2_at       TEXT,
+    t3_at       TEXT,
+    sl_at       TEXT,
     active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT,
     updated_at  TEXT
@@ -1454,6 +1514,7 @@ def _lc_f(v):
             return None
         return float(v)
     except Exception:
+        logger.debug("suppressed exception in _lc_f", exc_info=True)
         return None
 
 
@@ -1470,8 +1531,30 @@ def lifecycle_init(conn=None):
     try:
         conn.cursor().executescript(_LIFECYCLE_DDL)
         conn.commit()
+        _lifecycle_migrate_columns(conn)   # FIX #8: add time-to-target columns to old DBs
     except Exception as e:
         logger.warning("lifecycle_init error: %s", e)
+    finally:
+        if own:
+            conn.close()
+
+
+def _lifecycle_migrate_columns(conn=None):
+    """FIX #8 — add the time-to-target columns (t1_at/t2_at/t3_at/sl_at) to an
+    autoscan_lifecycle table created before this fix. Idempotent: each ALTER is
+    independent and silently ignored if the column already exists.
+    """
+    own = conn is None
+    conn = conn or db_connect()
+    try:
+        for col in ('t1_at', 't2_at', 't3_at', 'sl_at'):
+            try:
+                conn.execute(f"ALTER TABLE autoscan_lifecycle ADD COLUMN {col} TEXT")
+                conn.commit()
+            except Exception:
+                logger.debug("suppressed exception in _lifecycle_migrate_columns", exc_info=True)
+    except Exception as e:
+        logger.warning("_lifecycle_migrate_columns error: %s", e)
     finally:
         if own:
             conn.close()
@@ -1560,17 +1643,58 @@ def db_lifecycle_active():
         return []
 
 
+# FIX #1 — in-process dedup guard for milestone alerts. A single (key, field)
+# can only be claimed once per process lifetime, so concurrent job ticks /
+# parallel scans can never both send the same T1/T2/T3/SL alert.
+_lifecycle_lock = threading.Lock()
+_lifecycle_sent: set = set()   # {(key, field)} already claimed in this process
+
+
 def db_lifecycle_mark(key, field):
-    """Mark a milestone (t1_alerted/t2_alerted/t3_alerted/sl_alerted) as alerted."""
+    """FIX #1 — atomically claim a milestone (t1_alerted/t2_alerted/t3_alerted/
+    sl_alerted) and report whether THIS call is the one that flipped it.
+
+    Returns:
+        True  — this call flipped the flag 0→1; the caller SHOULD send the alert.
+        False — already alerted (in this process or in the DB); caller must NOT
+                send — this is the SL/TP duplicate-alert guard.
+
+    Also stamps the matching time-to-target column (FIX #8) at claim time using
+    COALESCE so the first timestamp is preserved.
+    """
     if field not in ('t1_alerted', 't2_alerted', 't3_alerted', 'sl_alerted'):
-        return
-    try:
-        conn = db_connect()
-        conn.execute(f"UPDATE autoscan_lifecycle SET {field}=1, updated_at=? WHERE key=?",
-                     (datetime.now().isoformat(), key))
-        conn.commit(); conn.close()
-    except Exception as e:
-        logger.warning("db_lifecycle_mark error: %s", e)
+        return False
+    guard = (key, field)
+    with _lifecycle_lock:
+        if guard in _lifecycle_sent:
+            return False   # already claimed in this process
+        try:
+            now = datetime.now().isoformat()
+            at_col = field.replace('_alerted', '_at')   # t1_alerted -> t1_at
+            conn = db_connect(); c = conn.cursor()
+            c.execute(f"SELECT {field} FROM autoscan_lifecycle WHERE key=?", (key,))
+            row = c.fetchone()
+            if row is None:
+                conn.close()
+                return False
+            cur_val = row.get(field) if isinstance(row, dict) else row[0]
+            if cur_val:
+                # Already marked in the DB (e.g. after a restart). Record the
+                # in-process guard so we never re-evaluate it, and suppress.
+                _lifecycle_sent.add(guard)
+                conn.close()
+                return False
+            c.execute(
+                f"UPDATE autoscan_lifecycle SET {field}=1, "
+                f"{at_col}=COALESCE({at_col}, ?), updated_at=? "
+                f"WHERE key=? AND {field}=0",
+                (now, now, key))
+            conn.commit(); conn.close()
+            _lifecycle_sent.add(guard)
+            return True
+        except Exception as e:
+            logger.warning("db_lifecycle_mark error: %s", e)
+            return False
 
 
 def db_lifecycle_close(key):
@@ -1593,6 +1717,77 @@ def db_lifecycle_prune(max_age_h=72):
         conn.commit(); conn.close()
     except Exception as e:
         logger.warning("db_lifecycle_prune error: %s", e)
+
+
+def lifecycle_dur_label(secs):
+    """FIX #8 — human-readable time-to-target label, e.g. '2h 15m' or '1d 3h'."""
+    if secs is None:
+        return "—"
+    try:
+        secs = int(secs)
+    except Exception:
+        return "—"
+    if secs < 0:
+        return "—"
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _   = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m and not d: parts.append(f"{m}m")
+    return " ".join(parts) if parts else "<1m"
+
+
+def db_lifecycle_timing_stats():
+    """FIX #8 — aggregate time-to-target stats across tracked autoscan signals.
+
+    For every row that recorded a milestone timestamp (t1_at/t2_at/t3_at/sl_at),
+    measure seconds from created_at to that milestone and return per-milestone
+    count / average / median. Powers the /holdstats command.
+    """
+    import statistics
+    buckets = {'t1': [], 't2': [], 't3': [], 'sl': []}
+    tracked = 0
+    try:
+        conn = db_connect(); c = conn.cursor()
+        c.execute("SELECT created_at, t1_at, t2_at, t3_at, sl_at "
+                  "FROM autoscan_lifecycle")
+        rows = _fetch_dicts(c)
+        conn.close()
+        for r in rows:
+            ca = r.get('created_at')
+            if not ca:
+                continue
+            try:
+                t0 = datetime.fromisoformat(ca)
+            except Exception:
+                logger.debug("suppressed exception in db_lifecycle_timing_stats", exc_info=True)
+                continue
+            tracked += 1
+            for k, col in (('t1', 't1_at'), ('t2', 't2_at'),
+                           ('t3', 't3_at'), ('sl', 'sl_at')):
+                v = r.get(col)
+                if not v:
+                    continue
+                try:
+                    dt = (datetime.fromisoformat(v) - t0).total_seconds()
+                except Exception:
+                    logger.debug("suppressed exception in db_lifecycle_timing_stats", exc_info=True)
+                    continue
+                if dt >= 0:
+                    buckets[k].append(dt)
+    except Exception as e:
+        logger.warning("db_lifecycle_timing_stats error: %s", e)
+    summary = {'tracked': tracked}
+    for k in ('t1', 't2', 't3', 'sl'):
+        vals = buckets[k]
+        summary[k] = {
+            'count':       len(vals),
+            'avg_secs':    (statistics.mean(vals)   if vals else None),
+            'median_secs': (statistics.median(vals) if vals else None),
+        }
+    return summary
 
 
 def db_register_first_signal(signal, conn=None, current_price=None, now=None):
@@ -1670,7 +1865,7 @@ def db_register_first_signal(signal, conn=None, current_price=None, now=None):
                 (exch, sym),
             )
         except Exception:
-            pass
+            logger.debug("suppressed exception in db_register_first_signal", exc_info=True)
         conn.commit()
     except Exception as e:
         logger.warning("db_register_first_signal error: %s", e)
@@ -1810,7 +2005,7 @@ def db_evict_signal(exchange, symbol, removed_at=None, reason="", conn=None):
                 (exchange, symbol),
             )
         except Exception:
-            pass
+            logger.debug("suppressed exception in db_evict_signal", exc_info=True)
         cur.execute(
             "INSERT OR REPLACE INTO signal_evictions "
             "(exchange,symbol,removed_at,reason) VALUES (?,?,?,?)",
@@ -2014,12 +2209,35 @@ def db_track_user(chat_id, username, first_name):
         logger.error("db_track_user FAILED for chat_id=%s: %s", chat_id, e)
 
 def db_admin_is_authed(chat_id):
+    """Authed only if a session row exists AND is within the TTL window.
+
+    SECURITY: previously any past auth counted forever. TTL is env-tunable via
+    SAKZ_ADMIN_SESSION_TTL_HOURS (default 12h); a stale session no longer
+    counts as authenticated, so admins must re-auth.
+    """
     conn = db_connect()
     c    = conn.cursor()
     c.execute("SELECT authenticated_at FROM admin_sessions WHERE chat_id=?", (chat_id,))
     row  = c.fetchone()
     conn.close()
-    return row is not None
+    if row is None:
+        return False
+    try:
+        raw = row["authenticated_at"]
+    except (TypeError, KeyError, IndexError):
+        try:
+            raw = row[0]
+        except Exception:
+            return False
+    try:
+        ts = datetime.fromisoformat(raw)
+    except Exception:
+        return False
+    try:
+        ttl_h = float(os.environ.get("SAKZ_ADMIN_SESSION_TTL_HOURS", "12"))
+    except (TypeError, ValueError):
+        ttl_h = 12.0
+    return (datetime.now() - ts) <= timedelta(hours=ttl_h)
 
 def db_admin_set_auth(chat_id):
     conn = db_connect()

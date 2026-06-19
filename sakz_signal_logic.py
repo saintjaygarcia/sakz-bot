@@ -35,7 +35,7 @@ Behaviours implemented here (mirrors the product spec):
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -406,7 +406,7 @@ def should_clear_dormant(
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Peak-reversal eviction
-# ───────────────────────────────────────────────────────────────���──────────────
+# ────────────────────────────────────────────────────────────────────────────────
 
 def peak_favorable_pct(bias: str, entry: float, peak_price: float) -> float:
     """Favourable % the peak reached vs entry (positive when in profit)."""

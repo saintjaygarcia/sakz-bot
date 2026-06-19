@@ -22,7 +22,7 @@ Design note (important, verified against sakz_scanner.py):
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 # ── Tunables (env-overridable) ────────────────────────────────────────────────
 PRIME_BAR    = float(os.environ.get("PRIME_BAR", "8.5"))     # composite floor

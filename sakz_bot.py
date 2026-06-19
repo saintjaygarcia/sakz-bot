@@ -1,5 +1,7 @@
 import logging
 import os
+import hashlib
+import hmac
 import sakz_state as state
 import re
 import time
@@ -24,13 +26,11 @@ try:
 except Exception:  # pragma: no cover - very old urllib3 layout
     from requests.packages.urllib3.util.retry import Retry
 import pandas as pd
-import ta
 import io
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend — no display needed
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyArrowPatch
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
@@ -51,6 +51,22 @@ except ImportError:
     print("[sakz_bot] WARNING: sakz_conviction.py not found — conviction layer disabled")
     _CONVICTION_AVAILABLE = False
 
+# ---------------------------------------------
+# SIGNAL EXPLANATION LAYER - sakz_explain (display only)
+# Wires the previously-dormant explanation helpers into the Details card.
+# Toggle live via env ENABLE_SIGNAL_EXPLAIN=0 (default on).
+# ---------------------------------------------
+try:
+    import os as _os_explain
+    ENABLE_SIGNAL_EXPLAIN = _os_explain.getenv('ENABLE_SIGNAL_EXPLAIN', '1') not in ('0', 'false', 'False')
+except Exception:
+    ENABLE_SIGNAL_EXPLAIN = True
+try:
+    from sakz_explain import explanation_block
+    _EXPLAIN_AVAILABLE = True
+except Exception:
+    _EXPLAIN_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # CCXT EXCHANGE LAYER — sakz_ccxt.py
 # Provides rate-limit-safe, unified OHLCV / price / funding / symbol fetchers.
@@ -68,10 +84,52 @@ except ImportError:
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+def _setup_logging():
+    """Console + optional rotating file logging, configurable via env.
+
+    SAKZ_LOG_LEVEL   log level (default INFO)
+    SAKZ_LOG_FILE    path to a rotating log file (optional; off if unset)
+    SAKZ_LOG_MAX_MB  max size per file before rotation (default 10)
+    SAKZ_LOG_BACKUPS number of rotated files to keep (default 5)
+    """
+    import logging.handlers
+
+    level_name = os.environ.get("SAKZ_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Avoid duplicate handlers if this is called more than once.
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    log_file = os.environ.get("SAKZ_LOG_FILE")
+    if log_file:
+        try:
+            max_bytes = int(float(os.environ.get("SAKZ_LOG_MAX_MB", "10")) * 1024 * 1024)
+            backups = int(os.environ.get("SAKZ_LOG_BACKUPS", "5"))
+            fh = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+            )
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+        except Exception:
+            root.warning("Could not set up file logging at %s", log_file, exc_info=True)
+
+    # Quiet chatty third-party loggers so our signal logs stay readable.
+    for noisy in ("httpx", "httpcore", "urllib3", "telegram", "telegram.ext",
+                  "apscheduler", "websockets", "ccxt", "matplotlib"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
@@ -160,7 +218,7 @@ def fetch_token_logo(symbol, *, timeout=3):
         try:
             os.makedirs(_TOKEN_LOGO_DIR, exist_ok=True)
         except Exception:
-            pass
+            logger.debug("suppressed exception in fetch_token_logo", exc_info=True)
         cache_png = os.path.join(_TOKEN_LOGO_DIR, base.lower() + ".png")
         data = None
         if os.path.exists(cache_png) and os.path.getsize(cache_png) > 0:
@@ -176,7 +234,7 @@ def fetch_token_logo(symbol, *, timeout=3):
                             with open(cache_png, "wb") as f:
                                 f.write(data)
                         except Exception:
-                            pass
+                            logger.debug("suppressed exception in fetch_token_logo", exc_info=True)
                         break
                 except Exception as _e:
                     logger.debug("token logo fetch failed %s: %s", url, _e)
@@ -313,8 +371,6 @@ if not TELEGRAM_TOKEN:
 # and _cscan_pair_mtf when we can identify *why* a signal was suppressed.
 # cscan_command aggregates these and produces a meaningful error message.
 
-from dataclasses import dataclass, field
-from typing import Optional
 
 # Signal engine extracted to sakz_scanner.py (Stage 2 of monolith refactor)
 from sakz_scanner import (
@@ -322,23 +378,15 @@ from sakz_scanner import (
     score_pair,
     add_indicators,
     get_btc_regime,
-    confirm_rr,
     _rr_ratio,
     calculate_leverage,
-    candle_quality_score,
-    fib_confluence_score,
-    find_pivot_support,
-    find_pivot_resistance,
     _get_btc_dominance,
     _get_btc_price_cached,
-    session_context,
     # Phase 0 — signal surfacing
-    SCAN_DISPLAY_CONF_MIN,
     AUTOSCAN_DISPLAY_CONF_MIN,
     _SCAN_SHOW_ALL_FLAGS,
     _conf_of,
     passes_display_floor,
-    risk_reasons,
 )
 
 # Reason constants — used for aggregation in cscan_command
@@ -398,7 +446,7 @@ ADMIN_ALERT_CHAT   = os.environ.get("ADMIN_ALERT_CHAT", "")   # chat_id to recei
 # 🐌 SNAIL MODE — Hidden easter egg feature
 # Activated ONLY via secret command /scan1234JP$$
 # /snail alone does nothing unless user is unlocked
-# ──�������������������������������������������������������������������──────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 SNAIL_SECRET_CMD   = "scan1234JP$$"      # secret unlock passphrase
 snail_active       = {}                  # chat_id → { activated_at, expires_at, signals_sent, week_log }
 
@@ -478,7 +526,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── Gainers log ──────────���───────────────────────────────────────────────────────
+# ── Gainers log ────────────────────────────────────────────────────────────────────
 
 
 
@@ -491,7 +539,7 @@ snail_active       = {}                  # chat_id → { activated_at, expires_a
 
 
 
-# ── /pro Detection engine ────────────────���─������������������─────────────────────────────────��────
+# ── /pro Detection engine ─────────────────────────────────────────────────────────────────────────────
 
 def _pro_fetch_top_gainers(limit: int = 20) -> list:
     """
@@ -526,7 +574,7 @@ def _pro_fetch_top_gainers(limit: int = 20) -> list:
     except Exception as _e:
         logger.debug("_pro_fetch_top_gainers CoinGecko: %s", _e)
 
-    # MEXC fallback ───────────────────────────��─────────────────────────────────
+    # MEXC fallback ──────────────────────────────────────────────────────────────
     try:
         resp = http_get(
             "https://api.mexc.com/api/v3/ticker/24hr", timeout=10, headers=HEADERS
@@ -769,7 +817,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
                         f"⚠️ Unstable volume (CV={cv:.2f}) — abnormal participation"
                     )
 
-        # 5-7 — CoinGecko fundamentals (best-effort) ��─────────��────���───���─���─���─���──
+        # 5-7 — CoinGecko fundamentals (best-effort) ────────────────────────────────────────
         try:
             slug    = symbol.replace("USDT", "").lower()
             cg_resp = http_get(
@@ -817,7 +865,7 @@ def _pro_detect_manipulation(symbol: str, exchange: str) -> dict:
                         f"🚩 +{pc_7d:.0f}% in 7 days on small/unknown cap — parabolic pump"
                     )
         except Exception:
-            pass
+            logger.debug("suppressed exception in _pro_detect_manipulation", exc_info=True)
 
         score = min(score, 180)
         out["manip_score"] = score
@@ -859,7 +907,7 @@ def _pro_format_uptrend_card(uptrend: dict, rank: int = 1) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {exch} | {sym}\n"
         f"\n"
-        f"��� BIAS: LONG (trend confirmed)\n"
+        f"🟢 BIAS: LONG (trend confirmed)\n"
         f"⭐ AVG DAILY GAIN: {bar} +{avg:.1f}%/day\n"
         f"\n"
         f"⏱ STREAK DURATION: {lbl}\n"
@@ -891,7 +939,7 @@ def _pro_format_gainer_card(row: dict, rank: int = 1) -> str:
     return (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🏆 PRO ALERT — PERSISTENT TOP-10 GAINER\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"#{rank}  {sym}\n"
         f"\n"
         f"📈 IN TOP-10 GAINERS:  {times}x check(s)\n"
@@ -903,7 +951,7 @@ def _pro_format_gainer_card(row: dict, rank: int = 1) -> str:
         "   • Momentum likely to continue short-term\n"
         f"\n"
         f"⚠️ Run /cscan {sym.replace('USDT', '')} for entry zone & stop-loss.\n"
-        "━━━━━━━━━━━━━━���━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 /pro alert  ·  /cscan {sym.replace('USDT', '')} for full signal"
     )
 
@@ -943,7 +991,7 @@ def _pro_format_manip_card(manip: dict, rank: int = 1) -> str:
     )
 
 
-# ── /pro In-memory dedup ───────────────────────────────���─────���──���──────────────────
+# ── /pro In-memory dedup ────────────────────────────────────────────────────────────────────
 
 _pro_alerted_uptrend: set = set()
 _pro_alerted_gainers: set = set()
@@ -1003,7 +1051,7 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 state._scan_durations = []   # reset after alert
             except Exception:
-                pass
+                logger.debug("suppressed exception in heartbeat_job", exc_info=True)
 
 
 async def pro_fast_job(context):
@@ -1102,7 +1150,7 @@ async def pro_fast_job(context):
                     except Exception as e:
                         logger.warning("pro_scan: db_pro_mark_manip_alerted failed for %s/%s: %s", sym, exchange, e)
 
-    # Broadcast ────────────────────────────────────────────────────────────────
+    # Broadcast ──────────────────────────────────────────────────────────────────
     if not (uptrend_alerts or manip_alerts):
         return
 
@@ -1200,7 +1248,7 @@ async def pro_gainers_job(context):
             logger.warning("pro_gainers_job send %s: %s", chat_id, _e)
 
 
-# ── /pro Command handler ───────────────────────────────────────������───���������─────────────
+# ── /pro Command handler ──────────────────────────────────────────────────────────────────────
 
 def _pro_full_command_guide() -> str:
     """Single source of truth for the bot's full PUBLIC command list.
@@ -1208,9 +1256,9 @@ def _pro_full_command_guide() -> str:
     and secret commands are intentionally excluded."""
     return (
         "📖  SAKZ BOT — FULL COMMAND GUIDE\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━��━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Everything the bot can do, in one place.\n\n"
-        "���  SCANNING\n"
+        "🔍  SCANNING\n"
         "/scan                Full market scan (4H, top pairs)\n"
         "/scan BTC            Scan a specific pair\n"
         "/scan BTC 1h         Specific pair on a custom timeframe\n"
@@ -1261,7 +1309,7 @@ def _pro_full_command_guide() -> str:
         "/pro on | /pro off   Subscribe / unsubscribe to PRO alerts\n"
         "/pro status          Live PRO tracking stats\n"
         "/pro alerts          PRO alert suite overview\n\n"
-        "⚙���  GENERAL\n"
+        "⚙️  GENERAL\n"
         "/status              Bot health & uptime\n"
         "/menu                Interactive command menu\n"
         "/start               Welcome message\n"
@@ -1270,7 +1318,7 @@ def _pro_full_command_guide() -> str:
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PRIME — secret high-conviction subscription, per-user GMT alerts, 15-min cache
-# ═════════��════���════���═══���═══�����══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════════
 import sakz_prime as prime
 import json as _json
 import sakz_signal_logic as _SIGLOGIC   # FIX #SIGLOGIC-UNDEFINED — this module
@@ -1287,6 +1335,7 @@ from sakz_db import (
     db_prime_alert_already_sent, db_prime_mark_alert_sent, db_prime_cleanup_alert_sent,
     db_lifecycle_track, db_lifecycle_active, db_lifecycle_mark,
     db_lifecycle_close, db_lifecycle_prune,
+    db_lifecycle_timing_stats, lifecycle_dur_label,   # FIX #8: time-to-target stats
 )
 
 PRIME_UNLOCK_CODE = os.environ.get("PRIME_UNLOCK_CODE", "").strip()
@@ -1350,7 +1399,7 @@ async def prime_refresh_job(context):
                 if px and px > 0:
                     live_prices[sym] = px
             except Exception:
-                pass
+                logger.debug("suppressed exception in prime_refresh_job", exc_info=True)
         # Pass 2 — final ranking with entry-distance decay applied.
         ranked = prime.rank_prime(results, current_prices=live_prices,
                                   bar=prime.PRIME_BAR, top_n=prime.PRIME_TOP_N)
@@ -1406,7 +1455,7 @@ def _prime_render_dashboard(picks, refreshed_at=None):
         try:
             lines.append(f"     \U0001F3AF {float(p['t1']):.4f} / {float(p['t2']):.4f} / {float(p['t3']):.4f}")
         except Exception:
-            pass
+            logger.debug("suppressed exception in _prime_render_dashboard", exc_info=True)
         lines.append("")
     if refreshed_at:
         ts = str(refreshed_at).replace("T", " ")[:16]
@@ -1499,7 +1548,7 @@ async def prime_slot_callback(update, context):
     try:
         await query.edit_message_reply_markup(reply_markup=_prime_main_keyboard(chat_id))
     except Exception:
-        pass
+        logger.debug("suppressed exception in prime_slot_callback", exc_info=True)
 
 
 async def prime_show_callback(update, context):
@@ -1511,7 +1560,7 @@ async def prime_show_callback(update, context):
         await query.edit_message_text(_prime_render_dashboard(picks, refreshed),
                                       reply_markup=_prime_main_keyboard(chat_id))
     except Exception:
-        pass
+        logger.debug("suppressed exception in prime_show_callback", exc_info=True)
 
 
 async def prime_off_callback(update, context):
@@ -1539,6 +1588,7 @@ async def prime_alert_scheduler_job(context):
         try:
             slots = db_prime_get_slots(chat_id)
         except Exception:
+            logger.debug("suppressed exception in prime_alert_scheduler_job", exc_info=True)
             continue
         if not slots:
             continue
@@ -1629,7 +1679,7 @@ async def pro_command(update, context):
         )
         return
 
-    # Toggle ─────────────────────��──────────────────────────────────────────────
+    # Toggle ─────────────────────────────────────────────────────────────────────
     subscribed = db_pro_is_subscribed(chat_id)
     if cmd == "on":
         want_off = False
@@ -1701,7 +1751,7 @@ def _safemode_store_signals(chat_id: int, signals: list):
     safemode_last_signals[chat_id] = merged[-_SAFEMODE_MAX_SIGNALS:]
 
 
-# ── Concurrency & caching ────────────────────��
+# ── Concurrency & caching ──────────────────────
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
@@ -1748,7 +1798,7 @@ _BTC_ALERT_CONFIRM_PCT  = 0.2   # BTC must move >=0.2% in the regime direction o
 _BTC_BULL_REGIMES = ("STRONG_BULL", "BULL")
 _BTC_BEAR_REGIMES = ("STRONG_BEAR", "BEAR")
 
-# ── BTC Dominance Cache ─────────────────────────��───��─��───��──���───����������─��─��─��─��
+# ── BTC Dominance Cache ──────────────────────────────────────────────────────────────────────
 # BTC.D rising = capital flowing out of alts → penalise altcoin LONGs
 # Fetched from Bybit BTCDOMUSDT or Binance BTCDOMUSDT (may not always be available)
 # { 'btcd': float, 'trend': 'rising'|'falling'|'flat', 'time': datetime }
@@ -1782,7 +1832,7 @@ def get_chat_lock(chat_id):
 # ML MODEL AVAILABILITY FLAGS
 # Graceful fallback — bot runs normally if these
 # optional modules are not installed.
-# ───────────────────────────────────��─────────
+# ──────────────────────────────────────────────
 try:
     from xgboost_train import predict_signal as xgb_predict_signal, train as xgb_train, model_meta as xgb_model_meta
     _XGB_AVAILABLE = True
@@ -1809,7 +1859,7 @@ except ImportError:
     _OPTIMIZE_AVAILABLE = False
     logger.warning("optimize.py not found — /optimize disabled")
 
-# ───────────��─────────────────────────────────
+# ────────────────────────────────────────────────
 # HISTORICAL WALK-FORWARD BACKTEST — sakz_backtest_hist.py
 # ─────────────────────────────────────────────
 try:
@@ -1822,7 +1872,7 @@ except ImportError:
 
 # ─────────────────────────────────────────────
 # AUTO PAPER TRADING — sakz_paper.py
-# ─────��───────────────────────���───────────────
+# ────────────────────────────────────────────────
 try:
     from sakz_paper import (
         paper_init_db, paper_maybe_open, paper_mark_all,
@@ -1834,13 +1884,26 @@ try:
     logger.info("Paper trading module loaded")
 except ImportError:
     _PAPER_AVAILABLE = False
+
+# EXECUTION SAFETY LAYER - sakz_orders.py
+try:
+    from sakz_orders import (
+        orders_init_db,
+        set_kill_switch as orders_set_kill_switch,
+        is_halted as orders_is_halted,
+        orders_status_text,
+    )
+    _ORDERS_AVAILABLE = True
+    logger.info("Execution/orders module loaded")
+except ImportError:
+    _ORDERS_AVAILABLE = False
     logger.warning("sakz_paper.py not found — /paper disabled")
 
-# ─────────────���───────────────────────────────
+# ───────────────────────────────────────────────
 # REAL-TIME WEBSOCKET LAYER — sakz_ws.py
 # Streams live price, funding, liquidation, volume spikes from MEXC.
 # ws_price() / ws_funding() are used as a fast cache before REST fallback.
-# ────────────────────────────────────���─────���──
+# ─────────────────────────────────────────────────
 try:
     from sakz_ws import (
         start_ws,
@@ -1893,8 +1956,8 @@ def _load_best_params():
 
 
 
-# ───────���─────��������──────────────────────────────
-# ───────────────────────────────────���─────────
+# ─────────────────────────────────────────────────────
+# ───────────────────────────────────────────────
 # IMPROVEMENT #7 — BINANCE PERPETUALS (free public API)
 # Graceful skip if Binance blocks Railway's IP.
 # ─────────────────────────────────────────────
@@ -1985,6 +2048,7 @@ def analyze_binance(symbol):
             result['exchange'] = 'BINANCE'
         return result
     except Exception:
+        logger.debug("suppressed exception in analyze_binance", exc_info=True)
         return None
 
 
@@ -2034,7 +2098,7 @@ def analyze_binance(symbol):
 #   NEUTRAL      → All signals blocked below conf 8 (not just -1 penalty)
 #
 # Cached 15 minutes — same as before.
-# ──────────────���────────────────��─────────────
+# ────────────────────────────────────────────────
 # ── BTC spot price cache (for regime invalidation) ────────────────────────────
 _BTC_PRICE_TTL = 60           # refresh every 60 s
 
@@ -2056,10 +2120,10 @@ _BTC_PRICE_TTL = 60           # refresh every 60 s
 # it's technically still mid-Asian-close, because the London open is the dominant
 # driver in that window.  The OVERLAP tag is given to 12:00–17:00 only, when both
 # London and NY are simultaneously active — this is the cleanest trend window.
-# ────────────────────────���────────────────────
+# ───────────────────────────────────────────────
 
 
-# ────────────────────���────────────────────────
+# ────────────────────────────────────────────────
 # FEATURE: FIBONACCI RETRACEMENT CONFLUENCE
 # ─────────────────────────────────────────────
 # Auto-compute 0.382, 0.5, and 0.618 Fibonacci retracement levels between
@@ -2077,7 +2141,7 @@ _FIB_RATIOS = (0.236, 0.382, 0.500, 0.618, 0.786)
 
 # ─────────────────────────────────────────────
 # SCORING ENGINE
-# ───────────────────────────────────��─────────
+# ──────────────────────────────────────────────
 
 
 # ── FIX #RR-GATE — Minimum entry Risk:Reward enforcement ──────────────────
@@ -2096,21 +2160,21 @@ _MIN_SIGNAL_RR = max(0.1, float(os.getenv("MIN_SIGNAL_RR", "1.5")))
 
 
 
-# ──────────────────────────────────────��──────
+# ──────────────────────────────────────────────
 # MULTI-TIMEFRAME ENGINE
-# ───────��─────────────────────────────────────
+# ──────────────────────────────────────────────
 # TF_CONFIGS defines every supported timeframe.
 # Each entry specifies:
 #   primary      — candle interval fed to score_pair as df4h (the "fast" TF)
 #   confirm      — confirmation candle interval fed as df1d (the "slow" TF)
 #   bybit_pri    — Bybit API interval string for primary
 #   bybit_con    — Bybit API interval string for confirmation
-#   mexc_pri     �� MEXC interval string for primary
+#   mexc_pri     → MEXC interval string for primary
 #   mexc_con     — MEXC interval string for confirmation
 #   binance_pri  — Binance interval string for primary
 #   binance_con  — Binance interval string for confirmation
 #   min_candles  — minimum closed candles required on the primary TF
-#   label        ��� human-readable label shown in signals
+#   label        → human-readable label shown in signals
 #   hold_map     — dur_score → (hold_hours, hold_label) overrides for this TF
 #   weight       — confidence multiplier when auto-selecting best TF
 #                  (lower TFs get slight penalty to avoid noise dominance)
@@ -2239,7 +2303,7 @@ def _fetch_tf_candles(exchange, symbol, tf_key, role='pri'):
                            detail=f"{exchange} {symbol} fetch exception: {e}")
 
 
-# ── NEW-LISTING DYNAMIC SCAN ─────────────────────�����────────────────────────────
+# ── NEW-LISTING DYNAMIC SCAN ──────────────────────────────────────────────────────
 # Handles tokens listed minutes or hours ago that don't yet have enough
 # candle history for the standard 4H + 1D analysis.
 #
@@ -2259,7 +2323,7 @@ def _fetch_tf_candles(exchange, symbol, tf_key, role='pri'):
 #   15m → 10 candles (~2.5 hours)
 #   1h  → 6 candles  (~6 hours)
 #   4h  → 4 candles  (~16 hours)
-# ───────────────────���─────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 
 # Min candles per TF (much lower than normal — new listings have thin history)
 #   5m  → 3 candles  (~15 minutes of data — ultra-early floor)
@@ -2425,7 +2489,7 @@ def analyze_symbol_mtf(symbol, exchange, tf_key=None, funding=0.0, user_requeste
     for tf in tfs_to_try:
         cfg = TF_CONFIGS[tf]
         try:
-            # ── LIQUIDITY FILTER — skip for user-requested scans ─────────��────
+            # ── LIQUIDITY FILTER — skip for user-requested scans ───────────────
             passes_vol, vol_usdt, vol_threshold = _passes_volume_filter(exchange, symbol, tf)
             if not passes_vol and not user_requested:
                 vol_m = vol_usdt / 1_000_000
@@ -2476,7 +2540,7 @@ def analyze_symbol_mtf(symbol, exchange, tf_key=None, funding=0.0, user_requeste
                                    exchange, symbol, tf, _age_minutes)
                     continue
             except Exception:
-                pass   # timestamp check failed — continue with analysis
+                logger.debug("suppressed exception in analyze_symbol_mtf", exc_info=True)
 
             stoch_tf = '4h' if cfg['stoch_window'] == 5 else '1d'
             df_pri   = add_indicators(df_pri, timeframe=stoch_tf)
@@ -2606,7 +2670,32 @@ def _cscan_pair_mtf(symbol, tf_key=None):
         )
         return signals
 
-    # ── NEW-LISTING FALLBACK ───────────────────���──────────────────────────────
+    # ── FIX #5: BYBIT FALLBACK (MEXC missing contract) ───────────────────────
+    # MEXC doesn't list every perpetual. If the MEXC scan produced no signal and
+    # the contract simply wasn't found there, retry the full MTF scan on Bybit
+    # (when reachable) before the new-listing fallback. Recovers Bybit-only pairs
+    # without weakening MEXC-first behaviour for pairs MEXC does list.
+    if (sakz_exchanges.BYBIT_AVAILABLE is not False
+            and any(getattr(f, 'reason', None) == REASON_NO_CONTRACT for f in failures)):
+        try:
+            bybit_result = analyze_symbol_mtf(symbol, 'BYBIT', tf_key=tf_key,
+                                              funding=0.0, user_requested=True)
+            if isinstance(bybit_result, ScanFailure):
+                failures.append(bybit_result)
+            elif bybit_result:
+                signals.append(bybit_result)
+        except Exception as e:
+            logger.warning("_cscan_pair_mtf BYBIT fallback %s: %s", symbol, e)
+            failures.append(ScanFailure(REASON_NO_CONTRACT, exchange='BYBIT', detail=str(e)))
+
+    if signals:
+        signals.sort(
+            key=lambda r: (r['confidence'], r.get('dur_score', 0)),
+            reverse=True
+        )
+        return signals
+
+    # ── NEW-LISTING FALLBACK ────────────────────────────────────────────────────
     # If every standard TF failed due to insufficient history (new listing) or
     # no contract found, try the dynamic new-listing scanner which accepts
     # as few as 20 candles on the shortest available TF.
@@ -2632,9 +2721,9 @@ def _cscan_pair_mtf(symbol, tf_key=None):
 #   • EMA20 / EMA50 overlaid on candles
 #   • Bollinger Bands (shaded)
 #   • Entry zone (green), Stop Loss (red), T1/T2/T3 dashed lines
-#   ��� Volume bars    (panel 2, coloured by candle direction)
+#   • Volume bars    (panel 2, coloured by candle direction)
 #   • RSI with 30/70 levels (panel 3)
-# ──���─���────────────────────────────────────────
+# ─────────────────────────────────────────────────
 def generate_chart(signal, df4h):
     """
     Generate a chart PNG (bytes) for the given signal using the 4H OHLCV dataframe
@@ -2797,13 +2886,13 @@ def generate_chart(signal, df4h):
         try:
             plt.close('all')
         except Exception:
-            pass
+            logger.debug("suppressed exception in generate_chart", exc_info=True)
         return None
 
 
-# ───────────���───────────���─������─���─���──────────────
+# ─────────────────────────────────────────────────────────
 # ANALYZE FUNCTIONS
-# ────────���───���────────────────────────────────
+# ─────────────────────────────────────────────────
 def analyze_bybit(symbol):
     try:
         df4h = bybit_fetch_ohlcv(symbol, '240', 100)
@@ -2947,10 +3036,10 @@ def run_mid_scan(rank_from=51, rank_to=200):
 # • 3-thread executor allows concurrent scans
 # • 15-minute cache — second user within TTL
 #   gets instant results, no duplicate API calls
-# ─────────────────────────────────────────────
-# ��════════════════��════����══��══����══����══����══════════════����═══════════════════════
+# ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════════════════
 # LIQUIDITY FILTER
-# ───────────────��──────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Every signal must clear a minimum 24h USDT volume before scoring begins.
 # Thresholds by timeframe:
 #   SCALP  (15m / 1h)  →  $5M   — need tight spreads and fast fills
@@ -2965,7 +3054,7 @@ def run_mid_scan(rank_from=51, rank_to=200):
 #   A signal on a $500k/day pair is noise — spread alone can eat the TP.
 #   Filtering these out has an outsized effect on reported win rate because
 #   low-volume pairs are disproportionately represented in false breakouts.
-# ═��════════════════════════════════════════════════════���═══════════════════════
+# ═════════════════════════════════════════════════════════════════════════════════
 
 # Volume thresholds in USDT — keyed by TF role
 VOL_THRESHOLDS = {
@@ -3334,7 +3423,7 @@ async def get_scan_results(force=False):
         return results, False  # (results, from_cache)
 
 
-# ──����─────────────────────────────────────────
+# ───────────────────────────────────────────────
 # IMPROVEMENT #3 — SIGNAL OUTCOME TRACKER
 # Background job that checks signal outcomes at
 # 4h, 8h, 24h, 48h intervals and updates the DB.
@@ -3432,7 +3521,7 @@ def _compute_peak_pct(signal, current_price=None):
             try:
                 best_at = best_at.replace(tzinfo=None)
             except Exception:
-                pass
+                logger.debug("suppressed exception in _compute_peak_pct", exc_info=True)
         return best, best_at
     except Exception as e:
         logger.warning("_compute_peak_pct error: %s", e)
@@ -3811,7 +3900,7 @@ def _check_signal_outcomes_blocking(context: ContextTypes.DEFAULT_TYPE):
 #   every signal in the window — the same approach /compare uses.
 #   Reported as Raw PnL (unlevered) + a win count based on green/red move.
 #   This gives instant feedback without waiting for the 4h outcome checker.
-# ───────────────────────────────────────────��─
+# ──────────────────────────────────────────────
 
 def _parse_stats_arg(arg: str):
     """
@@ -4020,7 +4109,7 @@ async def _stats_live(update_or_query, label: str, minutes: int, *, is_callback=
 # A bare number is treated as hours (legacy). No argument = last 15 minutes.
 # The card ranks every signal scanned in the window by leverage-adjusted
 # return (live price vs the scan entry, in the signal's direction).
-# ──────────────────────────────���─────
+# ──────────────────────────────────────
 _STATS_UNIT_MIN = {"m": 1, "h": 60, "d": 1440, "w": 10080}
 _STATS_MAX_SYMBOLS = 60   # cap live-price lookups so the card stays snappy
 
@@ -4361,7 +4450,7 @@ async def _stats_winrate_command(update: Update, context: ContextTypes.DEFAULT_T
 
     bar_filled = int(win_rate / 10)
     bar_empty  = 10 - bar_filled
-    bar        = "█" * bar_filled + "���" * bar_empty
+    bar        = "█" * bar_filled + "░" * bar_empty
 
     longs      = [r for r in confirmed_rows if r['bias'] == 'LONG']
     shorts     = [r for r in confirmed_rows if r['bias'] == 'SHORT']
@@ -4423,8 +4512,8 @@ async def _stats_winrate_command(update: Update, context: ContextTypes.DEFAULT_T
 #
 # Usage:
 #   /backtest          → full breakdown, all time
-#   /backtest 168      ��� last 7 days only
-# ─��───────────��───────────────────────────────
+#   /backtest 168      → last 7 days only
+# ───────────────────────────────────────────────
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     args         = context.args
@@ -4446,7 +4535,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    await update.message.reply_text("🔬 Running backtest analysis���")
+    await update.message.reply_text("🔬 Running backtest analysis…")
 
     conn = db_connect()
     c    = conn.cursor()
@@ -4482,7 +4571,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ��─ Win rate by confidence band ���───────────────────────────────────
+    # ─── Win rate by confidence band ──────────────────────────────────────
     bands = [
         ('4–5', lambda r: r['confidence'] in (4, 5)),
         ('6–7', lambda r: r['confidence'] in (6, 7)),
@@ -4562,7 +4651,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recommendations.append("📈 T2 reached > 50% — targets may be too conservative. Consider expanding T2/T3 multipliers.")
 
     if lr < 40 and len(longs) >= 10:
-        recommendations.append("🔴 LONG win rate < 40% — regime gate may need tightening (lower threshold from conf��9 to conf≥8 in BEAR).")
+        recommendations.append("🔴 LONG win rate < 40% — regime gate may need tightening (lower threshold from conf≥9 to conf≥8 in BEAR).")
     if sr < 40 and len(shorts) >= 10:
         recommendations.append("🔴 SHORT win rate < 40% — consider tightening short qualification bar.")
 
@@ -4577,7 +4666,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "   No band with ≥50% win rate yet — not enough data.\n")
 
     msg = (
-        f"��� BACKTEST ANALYSIS — {label}\n"
+        f"📊 BACKTEST ANALYSIS — {label}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Confirmed trades: {tot}  |  Overall WR: {overall_wr:.1f}%\n\n"
         f"📊 WIN RATE BY CONFIDENCE BAND\n"
@@ -4595,7 +4684,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   SL hit      : {sl_c}/{tot} ({sl_c/tot*100:.0f}%)\n\n"
         f"🛠 CALIBRATION RECOMMENDATIONS\n"
         f"{rec_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━��━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 Tip: run /backtest 168 weekly to track drift"
     )
 
@@ -4824,7 +4913,7 @@ async def notify_alerts(results, bot):
 # IMPROVEMENT #6 — /filter COMMAND
 # Filter current results by bias and min confidence.
 # e.g. /filter LONG 8
-# ───────────────��─────────────────────────────
+# ──────────────────────────────────────────────
 async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
 
@@ -5077,7 +5166,7 @@ async def continuous_scan_job(context: ContextTypes.DEFAULT_TYPE):
         conf      = r['confidence']
         dedup_key = f"{exch}_{sym}_{bias}_{sig_tf}"
 
-        # FIX #SL-SUPPRESS ��� don't keep re-surfacing a setup that already hit
+        # FIX #SL-SUPPRESS — don't keep re-surfacing a setup that already hit
         # its stop-loss recently. Re-pushing a freshly stopped-out pair spams
         # subscribers and pollutes the win streak with the same repeat loser.
         if _autoscan_recently_stopped(exch, sym, bias):
@@ -5389,9 +5478,13 @@ def _lifecycle_alerts_apply(rows, prices, now):
                 fire_key = (key, tag)
                 if fire_key in _fired:
                     continue
-                # ── Write DB FIRST; only send if the mark succeeds ──────────
-                db_lifecycle_mark(key, f"{tag}_alerted")
+                # ── FIX #1: claim the milestone atomically; only send if THIS
+                #    call flipped the flag. db_lifecycle_mark returns False when
+                #    the milestone was already alerted (another tick / restart),
+                #    which is the SL/TP duplicate-alert guard.
                 _fired.add(fire_key)
+                if not db_lifecycle_mark(key, f"{tag}_alerted"):
+                    continue   # already alerted — suppress duplicate
                 text = _lifecycle_alert_text(tag, rec, price)
                 for chat_id in recips:
                     out.append((chat_id, text))
@@ -5452,7 +5545,7 @@ async def autoscan_lifecycle_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         await loop.run_in_executor(SCAN_EXECUTOR, db_lifecycle_prune, 72)
     except Exception:
-        pass
+        logger.debug("suppressed exception in autoscan_lifecycle_job", exc_info=True)
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -5695,7 +5788,7 @@ async def autoscan_custom_tf_handler(update: Update, context: ContextTypes.DEFAU
 # ─────────────────────────────────────────────
 # FORMAT SIGNAL
 # IMPROVEMENT #8 — deeplinks to exchange added
-# ──────��──────────────────────────────────────
+# ──────────────────────────────────────────────
 def get_exchange_link(exchange, symbol):
     clean = symbol.replace('_USDT', 'USDT').replace('/', '')
     if exchange == 'BYBIT':
@@ -5837,21 +5930,21 @@ def format_signal_primary(r, rank):
       /scan number tap, /cscan, /scalp, auto-signal detection.
 
     Layout:
-      ━━━━━��━━━━━━━━━━━━━━━━━━━━━━
+      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         ⚡️ SWING | SIGNAL
         CONFIDENCE: 🟩🟩🟩🟩🟩 10/10
       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       📊 Token: XMRUSDT
       🟢 Direction: LONG
-      ��� Entry: $x – $x
-      ��️ Leverage: 8x
+      📍 Entry: $x – $x
+      ⚡️ Leverage: 8x
       📐 R:R: 1:2.3
       🎯 TP1: $x  (+X% profit) 💰
       🎯 TP2: $x
       🎯 TP3: $x
       🛑 Stop Loss: $x
 
-    Buttons: [🔄 Refresh]  [��� Details]
+    Buttons: [🔄 Refresh]  [📊 Details]
     Details button edits this same panel in-place (no new message).
     """
     c          = _build_signal_common(r)
@@ -5959,7 +6052,7 @@ def format_signal_primary(r, rank):
             if (rf_model_meta() or {}).get('calibrated'):
                 _cal = " ✓cal"
         except Exception:
-            pass
+            logger.debug("suppressed exception in format_signal_primary", exc_info=True)
         lines.append(f"🤖 ML: {pct}% win prob{_cal} — {consensus_verdict}{_adj_txt}")
     elif ml_score is not None and rf_score is not None:
         lines.append(f"🤖 ML: XGB {int(round(ml_score*100))}%  |  RF {int(round(rf_score*100))}%")
@@ -6030,7 +6123,7 @@ def format_signal_details(r, rank):
     lines = [
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"#{rank}  {exchange} | {r['symbol']}  [{c['tf_label']}] — DETAILS",
-        f"━━━━━━━━━━━━━━━━━━━━━━���━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"",
         regime_line,
         f"",
@@ -6047,6 +6140,24 @@ def format_signal_details(r, rank):
     vol_str = (f"${vol_24h/1_000_000:.1f}M" if vol_24h >= 1_000_000
                else f"${vol_24h/1_000:.0f}K" if vol_24h > 0 else "N/A")
     lines.append(f"   24h Vol:   {vol_str}")
+
+    # SIGNAL EXPLANATION LAYER (sakz_explain) - compact Why / Score / Regime summary
+    if ENABLE_SIGNAL_EXPLAIN and _EXPLAIN_AVAILABLE:
+        try:
+            _expl_txt = explanation_block(
+                r.get('score_buckets', {}) or {},
+                r.get('btc_regime', 'NEUTRAL'),
+                r.get('reasons', []),
+                counter_trend_active=bool(r.get('counter_trend')),
+                top_n=2,
+            )
+            if _expl_txt:
+                lines.append("")
+                lines.append("WHY THIS SIGNAL:")
+                for _expl_line in _expl_txt.split("\n"):
+                    lines.append(f"   {_expl_line}")
+        except Exception as _expl_e:
+            logger.debug("explain block render error: %s", _expl_e)
 
     lines += [f"", f"✅ CONVICTION REASONS:"]
     for reason in r['reasons']:
@@ -6206,7 +6317,7 @@ async def signal_refresh_callback(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=keyboard,
         )
     except Exception:
-        pass
+        logger.debug("suppressed exception in signal_refresh_callback", exc_info=True)
 
 
 async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6238,9 +6349,9 @@ async def signal_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-# ───────────────────────────────��─────────────
+# ──────────────────────────────────────────────
 # TRADE REMINDER JOB
-# ───────────────────��─────────────────────────
+# ──────────────────────────────────────────────
 async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     chat_id  = context.job.chat_id
     trade_id = (context.job.data or {}).get('trade_id')
@@ -6276,7 +6387,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     else:
         if current <= signal['t1']: alerts.append("🎯 TARGET 1 HIT!")
         if current <= signal['t2']: alerts.append("🎯🎯 TARGET 2 HIT!")
-        if current <= signal['t3']: alerts.append("���🎯🎯 TARGET 3 HIT!")
+        if current <= signal['t3']: alerts.append("🎯🎯🎯 TARGET 3 HIT!")
         if current >= signal['stop_loss']: alerts.append("🛑 STOP LOSS HIT — Consider closing!")
 
     link = get_exchange_link(exchange, symbol)
@@ -6289,7 +6400,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
         f"📥 Entry:   ${entry:.6f}\n"
         f"💰 Current: ${current:.6f}\n"
         f"🛑 SL:      ${signal['stop_loss']:.6f}\n"
-        f"���� T1:      ${signal['t1']:.6f}\n\n"
+        f"🎯 T1:      ${signal['t1']:.6f}\n\n"
         f"{pnl_emoji} PnL: {pnl_pct:+.2f}%\n"
         f"⏱ Open: {hours:.1f} hours\n"
     )
@@ -6300,7 +6411,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     hold_label = signal.get('hold', f'{max_hold}h')
     warn_at    = max_hold * 0.85
     if hours >= max_hold:
-        msg += f"\n��� RECOMMENDED HOLD ({hold_label}) REACHED. Close this trade now!\n"
+        msg += f"\n🎯 RECOMMENDED HOLD ({hold_label}) REACHED. Close this trade now!\n"
     elif hours >= warn_at:
         msg += f"\n⚠️ Approaching recommended hold duration ({hold_label}). Consider closing soon.\n"
 
@@ -6313,7 +6424,7 @@ async def send_trade_update(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=keyboard)
 
 
-# ───────────────────────────────���─────────────
+# ───────────────────────────────────────────────
 # CONVERSATION: PICK → REMINDER → INTERVAL
 # ─────────────────────────────────────────────
 async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6376,7 +6487,7 @@ async def receive_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         interval_mins = int(text)
         if interval_mins < 1:
-            await update.message.reply_text("��️ Minimum interval is 1 minute.")
+            await update.message.reply_text("⚠️ Minimum interval is 1 minute.")
             return ASK_INTERVAL
         if interval_mins > 1440:
             await update.message.reply_text("⚠️ Maximum interval is 1440 minutes (24 hours).")
@@ -6431,7 +6542,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # STOP TRADE
 # ─────────────────────────────────────────────
 async def stoptrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6486,7 +6597,8 @@ async def stop_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         for tid, data in trades.items():
             try:
                 if data.get('job'): data['job'].schedule_removal()
-            except Exception: pass
+            except Exception:
+                logger.debug("suppressed exception in stop_trade_callback", exc_info=True)
             db_remove_trade(tid)
             # FIX: clear flip-cooldown so stopped pairs can be re-scanned immediately
             stopped_sym = data.get('signal', {}).get('symbol', '')
@@ -6502,7 +6614,8 @@ async def stop_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data:
             try:
                 if data.get('job'): data['job'].schedule_removal()
-            except Exception: pass
+            except Exception:
+                logger.debug("suppressed exception in stop_trade_callback", exc_info=True)
             db_remove_trade(trade_id)
             sig       = data['signal']
             remaining = len(trades)
@@ -6573,7 +6686,7 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # PRICE-LEVEL ALERTS  (/palert, /unpalert)
-# ────────────────���────────────────────────────
+# ───────────────────────────────────────────────
 
 async def palert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -6724,7 +6837,7 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # PNL CARD — /pnl command + inline keyboard
 # Users can query PnL with bot leverage or custom
-# ───────────────────────────────��─────��─��──����─
+# ──────────────────────────────────────────────────
 def build_pnl_card(signal, leverage, capital, custom=False):
     """Generate a full PnL card for a signal at given leverage and capital."""
     bias       = signal['bias']
@@ -6759,7 +6872,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
 
     lines = [
         f"💰 PNL CARD — {exchange} | {symbol}",
-        f"━━━━━━━���━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"{bias_emoji} {bias}  |  {signal['confidence']}/10  |  {lev_note} leverage",
         f"",
         f"💵 Capital:       ${capital:,.2f}",
@@ -6769,7 +6882,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
         f"📥 Entry:         ${entry:.6f}",
         f"💀 Liq. Price:    ${liq_price:.6f}",
         f"",
-        f"━━━━━━━━��━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📊 SCENARIO ANALYSIS",
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"",
@@ -6777,7 +6890,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
         f"   Move: {sl_pct:+.2f}%  →  {'🔴 -$' if sl_pnl < 0 else '🟢 +$'}{abs(sl_pnl):,.2f}",
         f"",
         f"🎯 Target 1    ${t1:.6f}",
-        f"   Move: {t1_pct:+.2f}%  ��  🟢 +${t1_pnl:,.2f}",
+        f"   Move: {t1_pct:+.2f}%  →  🟢 +${t1_pnl:,.2f}",
         f"",
         f"🎯 Target 2    ${t2:.6f}",
         f"   Move: {t2_pct:+.2f}%  →  🟢 +${t2_pnl:,.2f}",
@@ -6785,7 +6898,7 @@ def build_pnl_card(signal, leverage, capital, custom=False):
         f"🎯 Target 3    ${t3:.6f}",
         f"   Move: {t3_pct:+.2f}%  →  🟢 +${t3_pnl:,.2f}",
         f"",
-        f"━━━━���━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
     if bot_lev and not custom:
@@ -7395,7 +7508,7 @@ def render_pnl_card_flat_v2(signal, current_price, leverage, capital=None, close
 
 # ──────────────────────────────────────────────
 # 3D PnL card compositor (light tilt + stacked deck + glow/shadow)
-# ─────────────────────────���──���────���───���────────
+# ──────────────────────────────────────────────────────
 def _persp_coeffs(dst, src):
     """Solve the 8 perspective coefficients mapping output->input for PIL."""
     import numpy as np
@@ -7547,7 +7660,7 @@ def render_pnl_card_tablet_v3(signal, current_price, leverage, capital=None, clo
     """
     import io
     import numpy as np
-    from matplotlib.patches import FancyBboxPatch, Polygon, Ellipse, Arc, Circle
+    from matplotlib.patches import FancyBboxPatch, Polygon, Ellipse
 
     # ── palette (dark glass, silver edge, green/red accent) ──────────────
     BG        = "#05070A"
@@ -7906,7 +8019,7 @@ def _build_sl_loss_card(signal, record=None):
         lev = lev.get('suggested')
     bot_lev = float(lev or 10)
     loss_pct = _SIGLOGIC.loss_at_sl_pct(bias, entry, sl, bot_lev)
-    bias_emoji = "��" if bias == 'LONG' else "🔴"
+    bias_emoji = "🟢" if bias == 'LONG' else "🔴"
     return (
         f"💥 PNL CARD — {exch} | {sym}\n"
         f"{'━'*30}\n"
@@ -8079,7 +8192,7 @@ async def send_pnl_image_card(update, context):
     msg = update.effective_message
     signal = context.user_data.get('pnl_signal')
     if not signal:
-        await msg.reply_text("⚠�� Signal data lost. Run /pnl again.")
+        await msg.reply_text("⚠️ Signal data lost. Run /pnl again.")
         return
 
     capital  = context.user_data.get('pnl_capital')
@@ -8224,7 +8337,7 @@ def _gather_pnl_matches(arg, results):
             if isinstance(st, str) and st:
                 return datetime.fromisoformat(st).replace(tzinfo=None)
         except Exception:
-            pass
+            logger.debug("suppressed exception in _ts", exc_info=True)
         return datetime.max
 
     grouped = {}
@@ -8294,7 +8407,7 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total = len(state.last_scan_results)
-    lines = [f"��� PNL CALCULATOR\n\nPick a signal:\n"]
+    lines = [f"💰 PNL CALCULATOR\n\nPick a signal:\n"]
     for i, r in enumerate(state.last_scan_results[:20], 1):
         emoji  = "🟢" if r['bias'] == "LONG" else "🔴"
         lev    = r.get('leverage')
@@ -8445,7 +8558,7 @@ async def pnl_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─────────────────────────────────────────────
 # /best
-# ──────────────────────────────��──��───────────
+# ───────────────────────────────────────────────
 async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Buttons under the image PnL card: add capital / refresh / done."""
     query = update.callback_query
@@ -8503,7 +8616,7 @@ async def pnl_img_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
-            pass
+            logger.debug("suppressed exception in pnl_img_callback", exc_info=True)
 
 
 async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8532,7 +8645,7 @@ async def best_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /tg — TOP GAINS
-# ─────────────────���───────────────────────────
+# ───────────────────────────────────────────────
 async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     ph = db_load_price_history() if not state.price_history else state.price_history
@@ -8621,7 +8734,7 @@ async def tl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-# ────────────────���──────����─────���───────────────
+# ────────────────────────────────────────────────────
 # /menu
 # ─────────────────────────────────────────────
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8654,7 +8767,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # MENU CALLBACK HANDLER — sub-menus per section
-# ─────────────────────���───────────────────────
+# ───────────────────────────────────────────────
 async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8666,7 +8779,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔍 Scanning",      callback_data="menu|scanning"),
-                InlineKeyboardButton("�� Alerts",         callback_data="menu|alerts"),
+                InlineKeyboardButton("🔔 Alerts",         callback_data="menu|alerts"),
             ],
             [
                 InlineKeyboardButton("📊 Performance",   callback_data="menu|performance"),
@@ -8702,7 +8815,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ])
         await query.edit_message_text(
             "🔍 *SCANNING*\n"
-            "━━━━━━━━━━━━━━━━━━━━━���━━━━━━━━\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "• *Full Scan* — analyses top 50 pairs on Bybit, MEXC & Binance\n"
             "  ⏱ Runs on the *4H timeframe* — swing trade signals only\n\n"
             "• *Custom Pair Scan* — analyse any coin on *your preferred timeframe*\n"
@@ -8710,7 +8823,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "  `/cscan ZEC 15m`   15-min chart → scalp signals (mins–2h)\n"
             "  `/cscan ZEC 1h`    1H chart → intraday signals (30min–8h)\n"
             "  `/cscan ZEC 4h`    4H chart → swing signals (4h–3 days)\n"
-            "  `/cscan ZEC 1d`    Daily chart → position signals (1d��2wks)\n\n"
+            "  `/cscan ZEC 1d`    Daily chart → position signals (1d→2wks)\n\n"
             "• *New Listings* — `/scan new 24h` scans recently listed pairs\n"
             "• *Best Trade Now* — highest conviction signal from last scan\n"
             "• *Top 5 / Top 10* — ranked list of the best current signals\n"
@@ -8738,7 +8851,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "• *Coin Alert* — get notified when a specific coin hits a signal\n"
             "• *Watchlist* — monitor your favourite pairs automatically\n"
             "• *Auto-Scan* — bot runs a fresh scan every 4 hours for you\n"
-            "• *Broadcast* ��� auto-post signals to your group or channel\n"
+            "• *Broadcast* — auto-post signals to your group or channel\n"
             "• *Pick & Track* — set up live PnL reminders for a trade\n"
             "• *PnL Calculator* — calculate profit/loss with leverage",
             parse_mode="Markdown",
@@ -8783,7 +8896,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "• Scans 150+ pairs simultaneously\n"
             "• Uses RSI, MACD, EMA, Bollinger Bands, Stochastic & ATR\n"
             "• Funding rate analysis included\n"
-            "�� Auto-calculates suggested leverage per signal\n"
+            "⚡ Auto-calculates suggested leverage per signal\n"
             "• Tracks signal outcomes at 4h, 8h, 24h & 48h\n\n"
             "Free to use — no API key required.",
             parse_mode="Markdown",
@@ -8842,7 +8955,7 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-# ────────────────────────────────────────���────
+# ───────────────────────────────────────────────
 # MENU RUN CALLBACK — execute commands from menu buttons
 # ─────────────────────────────────────────────
 async def menu_run_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8866,7 +8979,7 @@ async def menu_run_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "The bot analyses the coin on that chart and decides the bias."
         ),
         "chart":       "/chart — type `/chart SOL` or `/chart BTC t1h` to generate a TA chart image.",
-        "best":        "/best ��� fetching best signal now...",
+        "best":        "/best — fetching best signal now...",
         "top5":        "/top5",
         "top10":       "/top10",
         "filter":      "/filter — type `/filter LONG 8` to filter by bias and confidence.",
@@ -8969,7 +9082,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────────
 # /status
 # ─────────────────────────────────────────────
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9063,10 +9176,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /scan
-# ──────────────────────────────────���──────────
+# ───────────────────────────────────────────────
 # ─────────────────────────────────────────────
 # COMPACT SIGNAL CARDS — inline button display
-# ────────────────��────────────────────────────
+# ──────────────────────────────────────────────
 def format_compact_card(rank, r, current_price=None):
     """
     One-line summary shown in the /scan list panel.
@@ -9320,7 +9433,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /top[n]
-# ────────────────────��────────────────────────
+# ───────────────────────────────────────────────
 async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     text  = update.message.text.strip()
@@ -9335,7 +9448,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Maximum is 100."); return
 
     if not state.last_scan_results:
-        await update.message.reply_text("⏳ No scan yet. Fetching now...")
+        await update.message.reply_text("🔍 No scan yet. Fetching now...")
         results, _ = await get_scan_results()
     else:
         results = state.last_scan_results
@@ -9348,7 +9461,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if not results:
-        await update.message.reply_text("⚠��� No signals. Try /scan first.")
+        await update.message.reply_text("⚠️ No signals. Try /scan first.")
         return
 
     chat_id  = update.effective_chat.id
@@ -9422,7 +9535,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
 
 
-# ����────────────────────────────────────────────
+# ────────────────────────────────────────────────
 # /compare
 # ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
@@ -9519,7 +9632,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not results or all_failures:
         failures = [r for r in (results or []) if isinstance(r, ScanFailure)]
 
-        # ── Aggregate failures by reason ──────────────────────────────
+        # ── Aggregate failures by reason ───────────────────────────────
         reason_counts = {}
         for f in failures:
             reason_counts[f.reason] = reason_counts.get(f.reason, 0) + 1
@@ -9572,7 +9685,7 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔄 The dynamic new-listing scanner was attempted but also\n"
                 f"couldn't produce a signal (not enough candles on any timeframe yet).\n\n"
                 f"💡 Options:\n"
-                f"��� Wait ~1–2 hours and try again — new listings fill up fast\n"
+                f"⏳ Wait ~1–2 hours and try again — new listings fill up fast\n"
                 f"• Try /cscan {sym_base} 15m once more candles accumulate\n"
                 f"• Check the pair exists as a perpetual on MEXC/Bybit futures"
             )
@@ -9591,42 +9704,6 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await update.message.reply_text(diag_msg)
             return
-            # legacy fall-through (now unreachable — regime-blocked pairs redirect to /analyse)
-            loop2 = asyncio.get_event_loop()
-            regime_results = await loop2.run_in_executor(
-                SCAN_EXECUTOR, lambda: _cscan_pair_mtf(symbol, tf_key)
-            )
-            valid_regime = [r for r in (regime_results or []) if not isinstance(r, ScanFailure)]
-            if valid_regime:
-                valid_regime.sort(key=lambda x: (x['confidence'], x.get('dur_score', 0)), reverse=True)
-                best_r = valid_regime[0]
-                if 'signal_tf_label' not in best_r:
-                    best_r['signal_tf_label'] = '4H'
-                cscan_results[chat_id] = valid_regime
-                _chat_scan_ctx[chat_id] = {
-                    'source':   'custom',
-                    'results':  valid_regime,
-                    'title':    f"���� {best_r['symbol']}  [{tf_display}]",
-                    'max_show': 15,
-                }
-                _safemode_store_signals(chat_id, valid_regime)
-                lev2 = best_r.get('leverage')
-                compare_snapshot[chat_id] = {
-                    f"{best_r['exchange']}_{best_r['symbol']}": {
-                        'entry_price': best_r['price'],
-                        'leverage':    lev2['suggested'] if lev2 else 1,
-                        'bias':        best_r['bias'],
-                        'scan_time':   datetime.now(),
-                        'signal':      best_r,
-                    }
-                }
-                keyboard2 = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔗 Trade Now",
-                        url=get_exchange_link(best_r['exchange'], best_r['symbol']))]
-                ])
-                _ck2, keyboard2 = cache_signal_card(best_r, 1, keyboard2)
-                await update.message.reply_text(format_signal_primary(best_r, 1), reply_markup=keyboard2)
-            return
         elif dominant_reason in (REASON_LOW_CONF, REASON_GAP_BLOCK):
             diag_msg = (
                 f"🟠 {symbol} — Doesn't pass the signal requirements\n\n"
@@ -9636,41 +9713,6 @@ async def cscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   and see the full breakdown (information only)."
             )
             await update.message.reply_text(diag_msg)
-            return
-            loop3 = asyncio.get_event_loop()
-            lc_results = await loop3.run_in_executor(
-                SCAN_EXECUTOR, lambda: _cscan_pair_mtf(symbol, tf_key)
-            )
-            valid_lc = [r for r in (lc_results or []) if not isinstance(r, ScanFailure)]
-            if valid_lc:
-                valid_lc.sort(key=lambda x: (x['confidence'], x.get('dur_score', 0)), reverse=True)
-                best_lc = valid_lc[0]
-                if 'signal_tf_label' not in best_lc:
-                    best_lc['signal_tf_label'] = '4H'
-                cscan_results[chat_id] = valid_lc
-                _chat_scan_ctx[chat_id] = {
-                    'source':   'custom',
-                    'results':  valid_lc,
-                    'title':    f"📡 {best_lc['symbol']}  [{tf_display}]",
-                    'max_show': 15,
-                }
-                _safemode_store_signals(chat_id, valid_lc)
-                lev_lc = best_lc.get('leverage')
-                compare_snapshot[chat_id] = {
-                    f"{best_lc['exchange']}_{best_lc['symbol']}": {
-                        'entry_price': best_lc['price'],
-                        'leverage':    lev_lc['suggested'] if lev_lc else 1,
-                        'bias':        best_lc['bias'],
-                        'scan_time':   datetime.now(),
-                        'signal':      best_lc,
-                    }
-                }
-                kb_lc = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔗 Trade Now",
-                        url=get_exchange_link(best_lc['exchange'], best_lc['symbol']))
-                ]])
-                _ck_lc, kb_lc = cache_signal_card(best_lc, 1, kb_lc)
-                await update.message.reply_text(format_signal_primary(best_lc, 1), reply_markup=kb_lc)
             return
 
         elif dominant_reason == REASON_COUNTER_TREND:
@@ -9842,7 +9884,7 @@ async def cscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _chat_scan_ctx[chat_id] = {
         'source':   'custom',
         'results':  results,
-        'title':    f"���� {best['symbol']}",
+        'title':    f"🎯 {best['symbol']}",
         'max_show': 15,
     }
     _safemode_store_signals(chat_id, results)
@@ -9866,7 +9908,7 @@ async def cscan_tf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         tf_buttons,
-        [InlineKeyboardButton("���� Refresh (live price + PnL)",
+        [InlineKeyboardButton("🔄 Refresh (live price + PnL)",
                               callback_data=f"cscan_refresh|{chat_id}|{best['exchange']}|{symbol}")],
         [
             InlineKeyboardButton("💰 PnL Calculator", callback_data=f"pnl_from_cscan|{chat_id}"),
@@ -10032,7 +10074,7 @@ async def cscan_refresh_callback(update: Update, context: ContextTypes.DEFAULT_T
         msg = signal_card + pnl_block
     else:
         msg = (
-            f"�� CSCAN — {exchange} | {symbol}\n"
+            f"📊 CSCAN — {exchange} | {symbol}\n"
             f"{'━'*30}\n"
             f"💰 Current: ${current:.6f}  |  🔄 {now_str}\n\n"
             f"ℹ️ Run /cscan {symbol.replace('USDT','')} again to track PnL from entry."
@@ -10044,14 +10086,14 @@ async def cscan_refresh_callback(update: Update, context: ContextTypes.DEFAULT_T
     try:
         await query.edit_message_text(msg, reply_markup=keyboard)
     except Exception:
-        pass
+        logger.debug("suppressed exception in cscan_refresh_callback", exc_info=True)
 
 
 # ─────────────────────────────────────────────
 # SCAN FEED REFRESH — for /scan and /top results
 # Refreshes live prices of all signals in the
 # last scan feed, shown as a PnL table.
-# ───────────────────────────────��─────────────
+# ──────────────────────────────────────────────
 async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Refresh handler for /scan, /scalp, /swing, and single-pair scan feeds.
@@ -10068,7 +10110,7 @@ async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
     n_show  = int(parts[2]) if len(parts) > 2 else 10
     source  = parts[3] if len(parts) > 3 else 'scan'
 
-    # ── Resolve result set by source ────────��─────────────────────────
+    # ── Resolve result set by source ───────────────────────────────────
     if source == 'scan':
         if not state.last_scan_results:
             await query.edit_message_text("⚠️ No scan data. Run /scan first.")
@@ -10161,7 +10203,7 @@ async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
     except Exception:
-        pass
+        logger.debug("suppressed exception in feed_refresh_callback", exc_info=True)
 
 # ─────────────────────────────────────────────
 # /compare — Enhanced per-symbol price tracker
@@ -10180,7 +10222,7 @@ async def feed_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
 #   • Milestone (T1/T2/T3/SL hit indicator)
 #   • Age of signal
 #   • Refresh button (live, one-tap)
-# ─────────────��─────────────────────���─────────
+# ────────────────────────────────────────────────
 def _compare_fetch_swing(exchange, symbol, since: datetime):
     """
     Fetch 1H OHLC candles since `since` and return (high, low, candle_count).
@@ -10603,7 +10645,7 @@ async def compare_refresh_callback(update: Update, context: ContextTypes.DEFAULT
     try:
         await query.edit_message_text(msg, reply_markup=keyboard)
     except Exception:
-        pass
+        logger.debug("suppressed exception in compare_refresh_callback", exc_info=True)
 
 
 async def custom_compare_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10650,7 +10692,7 @@ async def custom_compare_refresh_callback(update: Update, context: ContextTypes.
     try:
         await query.edit_message_text(msg, reply_markup=keyboard)
     except Exception:
-        pass
+        logger.debug("suppressed exception in custom_compare_refresh_callback", exc_info=True)
 
 async def compare_full_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -10666,7 +10708,7 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
         try:
             await query.edit_message_text("⚠️ No scan data. Run /scan first.")
         except Exception:
-            pass
+            logger.debug("suppressed exception in compare_full_refresh_callback", exc_info=True)
         return
 
     age   = datetime.now() - state.last_scan_time
@@ -10728,7 +10770,7 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
 
     total_done = winners + losers
     lines.append(f"{'━'*30}")
-    lines.append(f"�� Winning: {winners}  🔴 Losing: {losers}  📊 Tracked: {total_done}")
+    lines.append(f"🟢 Winning: {winners}  🔴 Losing: {losers}  📊 Tracked: {total_done}")
     if best_pnl[0]:  lines.append(f"🏆 Best:  {best_pnl[0]}  {best_pnl[1]:+.2f}%")
     if worst_pnl[0]: lines.append(f"💀 Worst: {worst_pnl[0]}  {worst_pnl[1]:+.2f}%")
     lines.append(f"\n💡 /compare ZEC — track a specific pair")
@@ -10740,12 +10782,12 @@ async def compare_full_refresh_callback(update: Update, context: ContextTypes.DE
     try:
         await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
     except Exception:
-        pass
+        logger.debug("suppressed exception in compare_full_refresh_callback", exc_info=True)
 
 
 
 # Filters out signals older than their hold_hours
-# ───────────────����────��───────────────────��────
+# ──────────────────────────────────────────────────
 def filter_live_signals(results):
     """Return signals that have not yet exceeded their recommended hold duration."""
     now = datetime.now()
@@ -10768,7 +10810,7 @@ def filter_live_signals(results):
 # /watch                     — show watchlist
 # /unwatch BTCUSDT           — remove
 # Bot pings every 30 min when signal appears
-# ─────��───��───��───────────────────────────────
+# ────────────────────────────────────────────────
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -10787,7 +10829,7 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Bot checks your watchlist every 30 minutes."
             )
         else:
-            lines = ["👁 YOUR WATCHLIST\n━━━━━━━━━━━━━━━���━━━━━━━━━━━━━━\n"]
+            lines = ["👁 YOUR WATCHLIST\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
             for sym, mc in wl:
                 lines.append(f"  • {sym}  (min confidence: {mc}/10)")
             lines.append("\n/unwatch SYMBOL to remove")
@@ -10964,7 +11006,7 @@ async def funding_alert_job(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Funding alert failed for %s: %s", chat_id, e)
 
 
-# ───────────────────────────────────────────���─
+# ───────────────────────────────────────────────
 # BTC VOLATILITY MONITOR — Smart re-scan trigger
 # Checks BTC price every 15 min.
 # If BTC moved >3% in 1 hour → emergency re-scan
@@ -11072,7 +11114,7 @@ async def btc_regime_alert_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         db_save_btc_price(btc_price)
     except Exception:
-        pass
+        logger.debug("suppressed exception in btc_regime_alert_job", exc_info=True)
 
     bucket = _btc_regime_bucket(get_btc_regime())
     now    = datetime.now()
@@ -11179,7 +11221,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"BTC {direction}: {pct_change:+.2f}% in 1 hour\n"
         f"BTC: ${price_1h_ago:.0f} → ${btc_price:.0f}\n\n"
-        f"��� Triggered emergency market scan\n"
+        f"🚨 Triggered emergency market scan\n"
         f"📊 {len(results)} signals | 🟢 {longs}L  🔴 {shorts}S\n\n"
         f"🏆 BEST NOW: {emoji} {best['exchange']} {best['symbol']}\n"
         f"   {best['bias']} | {best['confidence']}/10 | Hold {best['hold']}\n\n"
@@ -11198,7 +11240,7 @@ async def btc_volatility_job(context: ContextTypes.DEFAULT_TYPE):
 # Usage: run in the target channel as admin.
 # /broadcast on   — enable for this chat
 # /broadcast off  — disable for this chat
-# ─────────────────────���─────────���────────��────
+# ──────────────────────────────────────────────────
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     chat_id = update.effective_chat.id
@@ -11256,7 +11298,7 @@ async def post_broadcast(results, bot):
         f"🏆 BEST: {emoji} {best['exchange']} {best['symbol']} "
         f"{best['bias']} {best['confidence']}/10 | Hold {best['hold']}\n\n"
         f"TOP 5 SIGNALS\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━��━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
     lines = [header]
     for i, r in enumerate(top5, 1):
@@ -11278,12 +11320,12 @@ async def post_broadcast(results, bot):
             logger.warning("Broadcast failed for chat %s: %s", chat_id, e)
 
 
-# ──────────��──────────────────────���─────���─────
+# ──────────────────────────────────────────────────
 # /leaderboard [hours] — Best performing pairs
 # Usage: /leaderboard          → all time
 #        /leaderboard 24       → last 24 hours
 #        /leaderboard 168      → last 7 days
-# ──────────────────────────────────��──────────
+# ──────────────────────────────────────────────
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _track(update)
     args = context.args
@@ -11459,9 +11501,9 @@ async def leaderboard_time_callback(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
 
 
-# ═════════════════════════════════════════════��═════════════════
+# ════════════════════════════════════════════════════════════════
 # 🐌  S N A I L   M O D E  — HIDDEN PREMIUM FEATURE
-# ═══════════════���═════════════════════════════���═══���════════════��
+# ══════════════════════════════════════════════════════════════════════
 # Access gate: user must first type the secret passphrase
 #   /scan1234JP$$
 # That unlocks the /snail command for that chat permanently.
@@ -11527,7 +11569,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             if price < ema20_4h < ema50_4h:
                 score += 15; reasons.append("✅ 4H EMA stack fully bearish (price < EMA20 < EMA50)")
             if ema20_1d < ema50_1d:
-                score += 15; reasons.append("✅ Daily EMA stack bearish �� macro trend aligned")
+                score += 15; reasons.append("✅ Daily EMA stack bearish — macro trend aligned")
             elif ema20_1d > ema50_1d:
                 score -= 10; warnings.append("⚠️ Daily EMAs bullish — counter-trend short, higher risk")
 
@@ -11568,7 +11610,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             if 40 <= rsi_d <= 60:
                 score += 7; reasons.append(f"✅ Daily RSI in bearish zone ({rsi_d:.1f}) — sustainable")
 
-        # ── 4. VOLUME CONVICTION ─��───────────────────────────
+        # ── 4. VOLUME CONVICTION ────────────────────────────────
         vol_ratio       = vol / vol_ma if vol_ma > 0 else 1.0
         price_change_pct = abs(price - P['close']) / P['close'] * 100 if P['close'] > 0 else 0
 
@@ -11586,7 +11628,7 @@ def snail_score_signal(r, df4h, df1d, funding):
         elif vol_ratio < 0.7:
             score -= 5; warnings.append(f"⚠️ Low volume ({vol_ratio:.1f}x avg) — weak conviction")
 
-        # ── 5. CANDLE PATTERN QUALITY ─────────────────��──────
+        # ── 5. CANDLE PATTERN QUALITY ─────────────────────────
         candles         = df4h.iloc[-4:-1]
         bullish_candles = sum(1 for _, c in candles.iterrows() if c['close'] > c['open'])
         bearish_candles = 3 - bullish_candles
@@ -11608,7 +11650,7 @@ def snail_score_signal(r, df4h, df1d, funding):
                 score += 10; reasons.append(f"✅ Price near key support (${support:.4f}) — strong bounce base")
             r_space = (resistance - price) / atr if atr > 0 else 0
             if r_space > 3.0:
-                score += 8; reasons.append(f"✅ Wide runway to resistance �� {r_space:.1f}x ATR of clear space")
+                score += 8; reasons.append(f"✅ Wide runway to resistance — {r_space:.1f}x ATR of clear space")
             elif r_space < 1.5:
                 score -= 8; warnings.append(f"⚠️ Resistance close ({r_space:.1f}x ATR) — limited upside before wall")
         else:
@@ -11621,7 +11663,7 @@ def snail_score_signal(r, df4h, df1d, funding):
             elif s_space < 1.5:
                 score -= 8; warnings.append(f"⚠️ Support close ({s_space:.1f}x ATR) — limited downside before floor")
 
-        # ── 7. FUNDING RATE ANALYSIS ──��─────────────────��────
+        # ── 7. FUNDING RATE ANALYSIS ───────────────────────────
         fp = funding * 100
         if bias == 'LONG':
             if funding < -0.015:
@@ -11688,7 +11730,7 @@ def snail_score_signal(r, df4h, df1d, funding):
                 elif rank and rank > 500:
                     fa_score -= 5;  fa_notes.append(f"⚠️ Rank #{rank} — small cap, higher manipulation risk")
                     manip_risk += 10
-                    manip_notes.append(f"🚩 Small-cap asset (rank #{rank}) ��� easier to manipulate")
+                    manip_notes.append(f"🚩 Small-cap asset (rank #{rank}) — easier to manipulate")
 
                 dev = cg.get('developer_data', {})
                 commits = dev.get('commit_count_4_weeks', 0) or 0
@@ -11817,7 +11859,7 @@ def snail_full_analyze(symbol):
 
 def format_snail_signal(r, sa, day_num, days_left):
     """Format a full SNAIL TRADE alert message."""
-    bias_e = "���" if r['bias'] == 'LONG' else "🔴"
+    bias_e = "🟢" if r['bias'] == 'LONG' else "🔴"
     lev    = r.get('leverage')
     link   = get_exchange_link(r['exchange'], r['symbol'])
     bar_w  = int(sa['snail_score'] / 10)
@@ -11858,7 +11900,7 @@ def format_snail_signal(r, sa, day_num, days_left):
         ]
 
     lines += [
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━���━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📈 TECHNICAL ANALYSIS",
     ]
     for note in sa['ta_reasons'][:6]:
@@ -11896,7 +11938,7 @@ def format_snail_signal(r, sa, day_num, days_left):
         f"  {sa['verdict']}",
         f"",
         f"🔗 Trade on {r['exchange']}: {link}",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📌 /snailvault — view your week log",
     ]
     return "\n".join(lines)
@@ -12012,7 +12054,7 @@ async def snail_daily_job(context: ContextTypes.DEFAULT_TYPE):
             if not found_signal:
                 await context.bot.send_message(chat_id=chat_id, text=(
                     f"🐌 SNAIL DAILY SCAN — Day {days_elapsed}/7\n"
-                    f"━━━━━━━━━━━━━━━━━━���━━━━━━━━━━━\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"No signal reached SNAIL standards today.\n"
                     f"Requirements: 10/10 confidence + Snail Score ≥ 80 + Low manipulation risk\n\n"
                     f"📊 Scanned: {len(state.last_scan_results)} pairs\n"
@@ -12042,7 +12084,7 @@ async def _send_snail_final_report(bot, chat_id):
 
     lines = [
         f"🐌  SNAIL WEEK COMPLETE!\n",
-        f"━━━━━��━━━━━━━━━━━━���━━━━━━━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"Your 7-day SNAIL session has ended.\n",
         f"📊 SESSION RESULTS",
         f"   Signals fired: {total}",
@@ -12053,7 +12095,7 @@ async def _send_snail_final_report(bot, chat_id):
         f"🎯 WIN RATE",
         f"   {bar} {win_rt:.0f}%",
         f"",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━���━━━━━",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     if wins >= 5:
         lines.append("🏆 LEGENDARY SNAIL WEEK. Maximum execution.")
@@ -12130,7 +12172,7 @@ async def snail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🐌  S N A I L   M O D E\n"
-        f"━━━━━━━━━━�����━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Status: {status_str}\n\n"
         f"Goal: 2x per day | Criteria: 10/10 + Snail Score ≥ 80\n"
         f"Use /snailvault to view your signal log.\n",
@@ -12158,8 +12200,8 @@ async def snailvault_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    lines = ["🐌 SNAIL VAULT — Signal Log\n━━━━━━━━━━━━━━━━━━━━━━━━━��━━━━\n"]
-    outcome_map = {'win_2x': '�� WIN 2x', 'stopped': '🛑 Stopped', 'pending': '⏳ Open'}
+    lines = ["🐌 SNAIL VAULT — Signal Log\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    outcome_map = {'win_2x': '🏆 WIN 2x', 'stopped': '🛑 Stopped', 'pending': '⏳ Open'}
     for r in rows:
         e       = "🟢" if r['bias'] == 'LONG' else "🔴"
         outcome = outcome_map.get(r['outcome'], r['outcome'])
@@ -12255,7 +12297,7 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 
-# ═══════���═══════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════
 # ── FEATURE BLOCK — v5 additions ────────────────────────────────
 # 1. Timeframe argument for /scan and /cscan  (e.g. /scan t15m)
 # 2. Trend-dying notification job
@@ -12263,9 +12305,9 @@ async def snail_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # 4. /chart — generate TA chart image
 # 5. /lb alias for /leaderboard
 # 6. Admin user-count tracking (/admin)
-# ══════════════════════════════════════════════════════════���════
+# ═════════════════════════════════════════════════════════════════
 
-# ─── TIMEFRAME HELPERS ──────────────────────────────────���─────
+# ─── TIMEFRAME HELPERS ──────────────────────────────────────────
 TF_MAP_MEXC   = {'1m':'Min1','3m':'Min3','5m':'Min5','15m':'Min15',
                  '30m':'Min30','1h':'Min60','2h':'Hour2','4h':'Hour4',
                  '6h':'Hour6','12h':'Hour12','1d':'Day1','1w':'Week1'}
@@ -12405,7 +12447,7 @@ def _cscan_pair_tf(symbol: str, tf: str):
             logger.warning("cscan_tf MEXC %s %s: %s", symbol, attempt_tf, e)
             failures.append(ScanFailure(REASON_NO_CONTRACT, exchange='MEXC', tf=attempt_tf, detail=str(e)))
 
-    # ── Score the pair on whichever TF had data ────────────────────────────���──
+    # ── Score the pair on whichever TF had data ─────────────────────────────────
     if tf_used is not None and df_p_found is not None:
         try:
             df_p2 = add_indicators(df_p_found, timeframe=tf_used)
@@ -12462,7 +12504,7 @@ def _cscan_pair_tf(symbol: str, tf: str):
     return results, failures
 
 
-# ��── PATCHED scan_command (timeframe support) ─────────────────
+# ──── PATCHED scan_command (timeframe support) ─────────────────
 async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Unified /scan dispatcher.  Handles all variants:
@@ -12500,7 +12542,7 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif sym_arg is None and not parsed:
             sym_arg = a
 
-    # ��─ /scan [pair] or /scan [pair] [tf] ─────────────────────
+    # ─── /scan [pair] or /scan [pair] [tf] ─────────────────────
     if sym_arg is not None:
         track_user_interaction(chat_id)
         raw    = sym_arg.upper().replace('/', '').strip()
@@ -12522,7 +12564,7 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not results:
-            # ── Real reason diagnosis ────────────────��──────────────────��─
+            # ── Real reason diagnosis ───────────────────────────────────────
             reasons_seen = [f.reason for f in failures]
             details      = [f.detail for f in failures if f.detail]
 
@@ -12667,7 +12709,7 @@ async def scan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 BTC Regime: *{btc_regime}*",
         ]
         if regime_warn:
-            banner_lines.append(f"���️ Regime caution: {regime_warn}")
+            banner_lines.append(f"⚠️ Regime caution: {regime_warn}")
         if low_conf_warn:
             banner_lines.append(f"⚠️ Low confidence: {low_conf_warn}")
         if regime_warn or low_conf_warn:
@@ -12834,6 +12876,7 @@ def _get_new_listings_mexc(since_seconds: int):
                     candidates.append({'symbol': clean, 'price': price,
                                        'listed_ts': oldest_ts})
             except Exception:
+                logger.debug("suppressed exception in _get_new_listings_mexc", exc_info=True)
                 continue
             time.sleep(0.1)
 
@@ -12867,6 +12910,7 @@ def _get_new_listings_bybit(since_seconds: int):
                 if launch_ms >= cutoff_ms:
                     symbols.append(sym)
             except Exception:
+                logger.debug("suppressed exception in _get_new_listings_bybit", exc_info=True)
                 continue
         return symbols
     except Exception as e:
@@ -12906,7 +12950,7 @@ async def scan_new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /scan new [window]
     Examples:
-      /scan new 24h   ����� pairs listed in last 24 hours
+      /scan new 24h   → pairs listed in last 24 hours
       /scan new 30m   — last 30 minutes
       /scan new 7d    — last 7 days
       /scan new 2w    — last 2 weeks
@@ -13107,7 +13151,7 @@ async def cscan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             best_detail = next((f.detail for f in failures
                                 if f.reason == REASON_LOW_VOLUME and f.detail), "")
             msg = (
-                f"💧 *{symbol}* ��� Insufficient liquidity\n\n"
+                f"💧 *{symbol}* — Insufficient liquidity\n\n"
                 f"{best_detail}\n\n"
                 f"This pair doesn't have enough 24h volume for reliable signals.\n"
                 f"Try higher-volume pairs from /scan instead."
@@ -13165,7 +13209,7 @@ async def cscan_tf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_signal_primary(best, 1), reply_markup=keyboard)
 
 
-# ─── TREND-DYING MONITOR ─────────────────────────────���────────
+# ─── TREND-DYING MONITOR ────────────────────────────────────────
 # Stored as { chat_id: { symbol+exchange: {signal, notified_dying} } }
 _trend_monitor_cache = {}
 
@@ -13214,14 +13258,14 @@ def _check_trend_dying(r: dict, df4h, df1d) -> tuple[bool, str]:
     return len(warns) >= 2, "\n".join(f"  {w}" for w in warns)
 
 
-# ─────────────────────────────────���───────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # /analyse — Raw market analysis, no regime gate, no confidence floor
 #
 # Usage:
 #   /analyse ZBT          → auto-selects 4H, MEXC
 #   /analyse ZBT 1h       → pins to 1H
 #   /analyse ZBT 10m      → maps 10m to nearest supported TF (15m)
-#   /analyse BTCUSDT 4h   ��� explicit USDT pair
+#   /analyse BTCUSDT 4h   → explicit USDT pair
 #
 # Emits a raw indicator snapshot and directional read regardless of whether
 # the market is trending, ranging, or regime-divergent. Always preceded by
@@ -13230,7 +13274,7 @@ def _check_trend_dying(r: dict, df4h, df1d) -> tuple[bool, str]:
 # TF mapping for non-standard timeframes:
 #   ≤7 min  → 15m   |   8–22 min  → 15m   |   23–90 min → 1h
 #   91–360 min → 4h  |   >360 min → 1d
-# ───────────────────────────────────────��────────────────────────────────────���
+# ────────────────────────────────────────────────────────────────────────────────
 
 # Extended TF alias map that includes non-standard intervals (maps to nearest
 # supported TF).  Values are TF_CONFIGS keys: '15m' | '1h' | '4h' | '1d'.
@@ -13528,6 +13572,23 @@ def _analyse_kb(symbol: str, tf_key: str, chat_id, n_bull: int, n_bear: int,
     return InlineKeyboardMarkup(rows)
 
 
+def _analyse_scan_bias(symbol: str):
+    """FIX #2 — authoritative directional bias from the SAME engine that powers
+    /scan and /cscan, so /analyse can align to it. Returns 'LONG'/'SHORT' when
+    the gated MTF scanner yields a directional signal, else None (no override).
+    Blocking (network + indicators) — call inside SCAN_EXECUTOR.
+    """
+    try:
+        results = _cscan_pair_mtf(symbol)
+        if results and isinstance(results[0], dict):
+            b = results[0].get('bias')
+            if b in ('LONG', 'SHORT'):
+                return b
+    except Exception as e:
+        logger.debug("_analyse_scan_bias %s: %s", symbol, e)
+    return None
+
+
 def _analyse_build_signal(data: dict):
     """Convert a raw /analyse indicator snapshot into a scan-style signal dict,
     or return None when the market is genuinely neutral (no directional edge).
@@ -13543,6 +13604,15 @@ def _analyse_build_signal(data: dict):
             bias = 'SHORT'
         else:
             return None   # FLAT / MIXED → neutral, no confidence
+
+        # FIX #2: align /analyse direction with the gated /scan engine. When the
+        # scanner produced a directional signal for this pair, defer to it so
+        # /analyse and /scan never show opposite directions. The raw single-TF
+        # lean is preserved for transparency in the reasons list below.
+        raw_bias  = bias
+        scan_bias = data.get('scan_bias')
+        if scan_bias in ('LONG', 'SHORT'):
+            bias = scan_bias
 
         price = float(data.get('price') or 0)
         if price <= 0:
@@ -13570,6 +13640,9 @@ def _analyse_build_signal(data: dict):
             lev = None
 
         reasons = (data.get('bull_signals') if bias == 'LONG' else data.get('bear_signals')) or []
+        if bias != raw_bias:
+            reasons = [f"⚙️ Direction aligned to /scan engine: {bias} "
+                       f"(raw single-TF lean was {raw_bias})"] + list(reasons)
         return {
             'symbol': data['symbol'], 'exchange': 'MEXC', 'bias': bias,
             'confidence': conf, 'price': price,
@@ -13603,14 +13676,14 @@ def _format_analyse_signal_card(r: dict) -> str:
     rr_str = f"1:{rr:.1f}" if rr is not None else "N/A"
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"  🔬 {panel} | ANALYSE",
         f"  CONFIDENCE: {_conf_bar_emoji(conf)} {conf}/10",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         f"📊 Token: {r['symbol']}",
         f"{bias_emoji} Direction: {bias}",
-        f"💰 Entry: ${r['entry_low']:.4f} - ${r['entry_high']:.4f}",
+        f"📍 Entry: ${r['entry_low']:.4f} - ${r['entry_high']:.4f}",
         f"⚡️ Leverage: {lev_str}",
         f"📐 R:R: {rr_str}",
         "",
@@ -13701,7 +13774,7 @@ def _format_analyse_indicators(data: dict) -> str:
         return f"  {label:<12}{value}"
     lines = [
         f"📊 INDICATORS — {data['symbol']} · {data['tf_label']}",
-        "══════════���════════════════",
+        "═════════════════════════════",
         _row("Price", f"${data['price']:.6g}"),
         _row("RSI", f"{data['rsi']:.1f}"),
         _row("MACD hist", f"{data['macd_diff']:+.5f}"),
@@ -13725,13 +13798,58 @@ def _format_analyse_signals(data: dict, side: str) -> str:
     else:
         title = f"🔴 BEARISH SIGNALS — {data['symbol']} · {data['tf_label']}"
         sigs  = data['bear_signals']
-    lines = [title, "═══��═══════════════════════"]
+    lines = [title, "════════════════════════════"]
     if sigs:
         for s in sigs:
             lines.append(f"• {s}")
     else:
         lines.append("(none)")
     return _an_pre(lines)
+
+
+async def holdstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/holdstats — FIX #8 time-to-target stats: how long tracked autoscan
+    signals typically take to reach T1/T2/T3 or hit their stop-loss."""
+    _track(update)
+    loop = asyncio.get_event_loop()
+    try:
+        stats = await loop.run_in_executor(SCAN_EXECUTOR, db_lifecycle_timing_stats)
+    except Exception as e:
+        logger.warning("holdstats_command: %s", e)
+        await update.message.reply_text("⚠️ Could not compute hold stats right now.")
+        return
+
+    tracked = stats.get('tracked', 0)
+    if not tracked:
+        await update.message.reply_text(
+            "⏱️ HOLD STATS — TIME TO TARGET\n\n"
+            "No tracked autoscan signals yet. Once autoscan signals start\n"
+            "reaching their targets, this will show the typical time to\n"
+            "T1/T2/T3 and to stop-loss."
+        )
+        return
+
+    def _row(label, d):
+        n = d.get('count', 0)
+        if not n:
+            return f"  {label:<3} —  (0 samples)"
+        avg = lifecycle_dur_label(d.get('avg_secs'))
+        med = lifecycle_dur_label(d.get('median_secs'))
+        return f"  {label:<3} avg {avg:<9} median {med:<9} (n={n})"
+
+    lines = [
+        "⏱️ HOLD STATS — TIME TO TARGET",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"Tracked signals: {tracked}",
+        "",
+        _row("T1", stats['t1']),
+        _row("T2", stats['t2']),
+        _row("T3", stats['t3']),
+        _row("SL", stats['sl']),
+        "",
+        "Measured from signal creation to when each milestone was alerted.",
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13788,7 +13906,7 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tf_label = TF_CONFIGS[tf_key]['label']
 
-    # ── HOT-GROUND WARNING — sent before the analysis ─────��────────────��─────
+    # ── HOT-GROUND WARNING — sent before the analysis ──────────────────────────
     warning_msg = (
         "⚠️⚠️ HOT GROUND — READ BEFORE PROCEEDING ⚠️⚠️\n\n"
         "You are using /analyse — the unfiltered analysis mode.\n\n"
@@ -13803,7 +13921,7 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "what the indicators say — not whether you should act on it.\n\n"
         "🔥 Trading on /analyse output without your own analysis\n"
         "   carries significantly higher risk. Proceed with caution.\n\n"
-        "──────────────���───────────────────────\n"
+        "────────────────────────────────────────\n"
         f"⏳ Fetching {symbol} on {tf_label}..."
     )
     await update.message.reply_text(warning_msg)
@@ -13823,9 +13941,19 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💡 Tips:\n"
             f"• Verify the pair exists as a MEXC perpetual\n"
             f"• Try: /analyse {raw.replace('USDT','')} 4h\n"
-            f"�� Some tokens use 1000{raw.replace('USDT','')} format"
+            f"💡 Some tokens use 1000{raw.replace('USDT','')} format"
         )
         return
+
+    # FIX #2: align /analyse direction with the gated /scan engine (when it has
+    # a directional view for this pair). Runs in the executor — blocking I/O.
+    try:
+        _scan_bias = await loop.run_in_executor(
+            SCAN_EXECUTOR, lambda: _analyse_scan_bias(symbol))
+        if _scan_bias:
+            result['scan_bias'] = _scan_bias
+    except Exception as e:
+        logger.debug("analyse scan_bias fetch failed: %s", e)
 
     # Cache the full result so the section buttons can rebuild each view in-place.
     _analyse_cache[f"{chat_id}:{symbol}:{tf_key}"] = result
@@ -13919,7 +14047,7 @@ async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
                 price  = df4h.iloc[-1]['close'] if df4h is not None and len(df4h) > 0 else 0
                 # Different footer depending on source so users know why they got the alert
                 if source_label == 'safemode':
-                    footer = "���️ Safe Mode alert — trend detected from your recent scan.\nUse /safemode to disable."
+                    footer = "⚠️ Safe Mode alert — trend detected from your recent scan.\nUse /safemode to disable."
                 else:
                     footer = "This is an alert, not a close signal.\nUse /stoptrade to stop trade reminders."
                 msg = (
@@ -13951,6 +14079,7 @@ async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
                 sig = json.loads(row['signal_json'])
                 await _check_and_notify(row['chat_id'], sig, source_label='tracked')
             except Exception:
+                logger.debug("suppressed exception in trend_dying_job", exc_info=True)
                 continue
     except Exception as e:
         logger.warning("trend_dying_job legacy pool error: %s", e)
@@ -13962,6 +14091,7 @@ async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
                 sig = tdata.get('signal', {})
                 await _check_and_notify(chat_id, sig, source_label='tracked')
             except Exception:
+                logger.debug("suppressed exception in trend_dying_job", exc_info=True)
                 continue
 
     # ── Pool 3: Safe Mode users — any signal from any scan ────────────────────
@@ -13971,10 +14101,11 @@ async def trend_dying_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await _check_and_notify(chat_id, sig, source_label='safemode')
             except Exception:
+                logger.debug("suppressed exception in trend_dying_job", exc_info=True)
                 continue
 
 
-# ─── SNAIL 2x TARGET — leverage-aware ���────────────────────────
+# ─── SNAIL 2x TARGET — leverage-aware ───────────────────────────
 def _snail_2x_target(r: dict) -> tuple[float, str]:
     """
     Calculate what '2x' means based on leverage.
@@ -14029,7 +14160,7 @@ async def _snail_activate_patched(query, chat_id):
     )
 
 
-# ─── /chart COMMAND ─────────────────────────��─────────────────
+# ─── /chart COMMAND ────────────────────────────────────────────
 async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /chart SOL  — generates a TA chart image for the specified pair.
@@ -14076,7 +14207,6 @@ async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         from matplotlib.gridspec import GridSpec
-        import matplotlib.dates as mdates
         import io
 
         loop = asyncio.get_event_loop()
@@ -14450,7 +14580,6 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
     try:
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec
-        import matplotlib.dates as mdates
 
         BG   = '#0d1117'; GRID = '#1c2433'; UP = '#26a641'; DN = '#e3434d'
         TEXT = '#c9d1d9'; BLUE = '#58a6ff'; ORANGE = '#f78166'; PURPLE = '#bc8cff'
@@ -14548,7 +14677,7 @@ async def chart_tf_refresh_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(f"❌ Chart refresh failed: {e}")
 
 
-# ─── USER TRACKING ────────────────────────────────���───────��───
+# ─── USER TRACKING ───────────────────────────────────────────────
 def track_user_interaction(chat_id: int):
     """Record a unique user interaction in the DB."""
     try:
@@ -14574,11 +14703,35 @@ def track_user_interaction(chat_id: int):
 # ─── ADMIN COMMAND ────────────────────────────────────────────
 # Supports two auth methods:
 #   1. ADMIN_IDS env variable (original) — silent allow/deny by chat_id
-#   2. Password gate (from sakz_bot.py) — password "Sakazuki01" for full dashboard
+#   2. Password gate (from sakz_bot.py) — password gate (env-configured) for full dashboard
 ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = set(int(x.strip()) for x in ADMIN_IDS_ENV.split(',') if x.strip().isdigit())
 
-ADMIN_PASSWORD    = "Sakazuki01"
+# SECURITY: the admin password is no longer hardcoded in source. Provide it
+# via environment variable, preferred as a hash so the plaintext never lives
+#   * SAKZ_ADMIN_PASSWORD_HASH - sha256 hex of the password (preferred), OR
+#   * SAKZ_ADMIN_PASSWORD      - raw password (hashed in-memory at load).
+# If neither is set the password gate FAILS CLOSED (disabled); use ADMIN_IDS.
+def _admin_pw_hash_from_env():
+    h = os.environ.get("SAKZ_ADMIN_PASSWORD_HASH", "").strip().lower()
+    if h:
+        return h
+    raw = os.environ.get("SAKZ_ADMIN_PASSWORD", "")
+    if raw:
+        return hashlib.sha256(raw.encode()).hexdigest()
+    return ""
+
+ADMIN_PASSWORD_HASH = _admin_pw_hash_from_env()
+if not ADMIN_PASSWORD_HASH:
+    logger.warning("[admin] No SAKZ_ADMIN_PASSWORD_HASH/SAKZ_ADMIN_PASSWORD set "
+                   "- password admin gate DISABLED (use ADMIN_IDS instead).")
+
+def _admin_password_ok(text):
+    """Constant-time check of a candidate password against the env hash."""
+    if not ADMIN_PASSWORD_HASH:
+        return False
+    cand = hashlib.sha256((text or "").encode()).hexdigest()
+    return hmac.compare_digest(cand, ADMIN_PASSWORD_HASH)
 
 # ── Admin DB helpers ──────────────────────────
 
@@ -14596,7 +14749,7 @@ def _track(update: Update):
         logger.error("_track failed: %s", e)
 
 
-# ���─ Top-level activity middleware (registered in main with group=-1) ──
+# ──── Top-level activity middleware (registered in main with group=-1) ──
 async def _activity_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Fires on EVERY Telegram update before any handler.
@@ -14658,12 +14811,12 @@ async def admin_password_handler(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     _admin_pending_auth.discard(chat_id)
 
-    if text == ADMIN_PASSWORD:
+    if _admin_password_ok(text):
         db_admin_set_auth(chat_id)
         try:
             await update.message.delete()
         except Exception:
-            pass
+            logger.debug("suppressed exception in admin_password_handler", exc_info=True)
         await update.message.reply_text("✅ Authenticated. Welcome, Admin.")
         await _send_admin_dashboard(update, context)
     else:
@@ -14720,17 +14873,17 @@ async def _send_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TY
         f"   Total users ever:        {total}\n"
         f"   🟢 Active now (≤30 min): {len(active_now)}\n"
         f"   📅 Active last 7 days:   {len(active_7d)}\n"
-        f"   ��� New today:            {len(new_today)}\n\n"
+        f"   🆕 New today:            {len(new_today)}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🟢 CURRENTLY ACTIVE ({len(active_now)})\n"
         f"{active_block}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆕 NEW TODAY ({len(new_today)})\n"
         f"{new_block}\n\n"
-        f"━━━━━��━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 TOP USERS BY ACTIVITY\n"
         f"{top_block}\n\n"
-        f"��━━━��━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 BOT STATUS\n"
         f"   Last scan signals: {len(state.last_scan_results)}\n"
         f"   Tracking active:   {len(state.user_tracking)}\n"
@@ -14810,7 +14963,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"🟢 CURRENTLY ACTIVE ({len(active_now)})\n"
             f"{active_block}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"�� NEW TODAY ({len(new_today)})\n"
+            f"🆕 NEW TODAY ({len(new_today)})\n"
             f"{new_block}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏆 TOP USERS BY ACTIVITY\n"
@@ -14842,7 +14995,7 @@ async def lb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /fgi — Fear & Greed Index
 # Uses alternative.me free API (no key needed)
 # Gives market sentiment + trading recommendation
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 def _fetch_fgi():
     """Fetch Fear & Greed Index from alternative.me. Returns dict or None."""
     try:
@@ -14883,7 +15036,7 @@ def render_fgi_card(data):
     """
     import math
     import numpy as np
-    from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon, Arc
+    from matplotlib.patches import FancyBboxPatch, Rectangle, Ellipse, Polygon
 
     BG       = "#0e0e0f"; PANEL    = "#111215"; PANEL_ED = "#1e2028"
     AMBER    = "#EF9F27"; AMBER_DK = "#BA7517"; AMBER_XDK = "#854F0B"
@@ -14920,12 +15073,12 @@ def render_fgi_card(data):
     ax  = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
 
-    # ── card panel ───────────────────────────────────────────��────────────
+    # ── card panel ─────────────────────────────────────────────────────────
     ax.add_patch(FancyBboxPatch((0.014, 0.035), 0.972, 0.93,
         boxstyle="round,pad=0,rounding_size=0.035",
         linewidth=1.3, edgecolor=PANEL_ED, facecolor=PANEL, zorder=1))
 
-    # ── amber glow accent (top-right) ──────────────────────────────��──────
+    # ── amber glow accent (top-right) ──────────────────────────────────────
     _gx = np.linspace(0, 1, 200); _gy = np.linspace(0, 1, 200)
     _GX, _GY = np.meshgrid(_gx, _gy)
     _dist = np.sqrt((_GX - 0.95)**2 + (_GY - 0.95)**2)
@@ -14933,7 +15086,7 @@ def render_fgi_card(data):
     ax.imshow(_alpha, extent=[0, 1, 0, 1], aspect='auto', origin='lower',
               cmap='YlOrBr', alpha=0.55, zorder=0, interpolation='bilinear')
 
-    # ── wings logo ──────────────────────��────��────────────────────────────
+    # ── wings logo ──────────────────────────────────────────────────────────
     lx, ly = 0.072, 0.872
     left_wing  = [(lx-0.030,ly+0.000),(lx-0.004,ly+0.026),(lx-0.010,ly+0.008),(lx-0.003,ly+0.016),(lx-0.003,ly-0.010)]
     right_wing = [(lx+0.030,ly+0.000),(lx+0.004,ly+0.026),(lx+0.010,ly+0.008),(lx+0.003,ly+0.016),(lx+0.003,ly-0.010)]
@@ -14954,7 +15107,7 @@ def render_fgi_card(data):
     ax.text(px+0.022, 0.879, tag, color=SOFT, fontsize=11.5, fontweight='bold', va='center', ha='left', zorder=4)
     ax.add_patch(Rectangle((px+pw-0.016, 0.863), 0.0035, 0.032, facecolor=AMBER_DK, edgecolor='none', zorder=4))
 
-    # ── title ────────────────────────────────────────────���────────────────
+    # ── title ───────────────────────────────────────────────────────────────
     ax.text(0.05, 0.690, "FEAR & GREED", color=WHITE, fontsize=30, fontweight='bold', va='center', ha='left', zorder=3)
 
     # ── score badge ───────────────────────────────────────────────────────
@@ -15122,7 +15275,7 @@ async def fgi_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 
-# ─────────────────���───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # CEILING #6 — MID-TIER UNIVERSE SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 # Problem:  The standard /scan covers only the top-50 pairs by volume on each
@@ -15182,7 +15335,7 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 MID-TIER SCAN — ranks {rank_from}–{rank_to}\n\n"
         f"Scanning ~{span} coins per exchange (Bybit + MEXC + Binance)…\n"
         f"These are the less-watched, higher-inefficiency pairs.\n"
-        f"⏳ Please wait 60����90 seconds…"
+        f"⏳ Please wait 60–90 seconds…"
     )
 
     loop = asyncio.get_event_loop()
@@ -15228,14 +15381,14 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_signal_cards(
         update.message, results,
-        title=f"��� MID-TIER SIGNALS (rank {rank_from}–{rank_to})",
+        title=f"📊 MID-TIER SIGNALS (rank {rank_from}–{rank_to})",
         max_show=15, chat_id=chat_id, source="scan"
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CEILING #5 — EMPIRICAL PARAMETER CALIBRATION
-# ──────────────────────────────────────────────────────────��──────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Problem:  Every ATR multiplier (T1=1.6×, T2=3.0×, SL=1.0× in LOW regime),
 #           every scoring cap (OSC_CAP=3, CROSS_CAP=3…), and every funding
 #           threshold (0.0003 / 0.0007) was set by reasoning alone.
@@ -15268,7 +15421,7 @@ async def scanmid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   /calibrate              — BTCUSDT on Bybit, 500 candles
 #   /calibrate ETH          — ETHUSDT on Bybit
 #   /calibrate SOL BINANCE  — SOLUSDT on Binance
-# ────────────────────────────────────────────────────────────────────────────��
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _calib_score_fast(df4h_slice, df1d_slice, funding=0.0):
     """
@@ -15395,7 +15548,7 @@ def _calib_score_fast(df4h_slice, df1d_slice, funding=0.0):
                 if clv_ma > 0.3:   ig_l+=1
                 elif clv_ma < -0.3: ig_s+=1
         except Exception:
-            pass
+            logger.debug("suppressed exception in _calib_score_fast", exc_info=True)
 
         OSC_CAP = 3; MTF_CAP = 2; CROSS_CAP = 3; POS_CAP = 3; STRUCTURE_CAP = 4
         ls = (min(osc_g_l,OSC_CAP) + min(mtf_g_l,MTF_CAP) +
@@ -15452,6 +15605,7 @@ def _calib_score_fast(df4h_slice, df1d_slice, funding=0.0):
             'vol_regime': vol_regime, 'winning': winning
         }
     except Exception:
+        logger.debug("suppressed exception in _calib_score_fast", exc_info=True)
         return None
 
 
@@ -15616,7 +15770,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Running parameter sweep… (~3 ATR variants × 3 conf gates)"
     )
 
-    # ── Section 1 — ATR T1 multiplier sweep (at conf≥5, baseline) ────────���────
+    # ── Section 1 — ATR T1 multiplier sweep (at conf≥5, baseline) ───────────────
     # Three variants: TIGHT (×0.75), CURRENT (×1.0), WIDE (×1.25)
     atr_variants = [
         ('TIGHT',   0.75),
@@ -15658,7 +15812,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conf_results[gate] = {'total': total, 'wins': wins, 'losses': losses, 'wr': wr,
                                'avg_rr': avg_rr, 'ev': ev}
 
-    # ── Section 3 — Vol regime breakdown (current params, conf≥5) ��────────────
+    # ── Section 3 — Vol regime breakdown (current params, conf≥5) ──────────────
     cur_trades = await loop.run_in_executor(None, _calib_run, df4h, df1d, 5, 1.0, 18)
     regime_stats = {}
     for vr in ['RANGING', 'LOW', 'MEDIUM', 'HIGH', 'EXTREME']:
@@ -15718,7 +15872,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif wide_ev > cur_ev + 0.05:
         recs.append(
-            f"��� WIDER T1 (×1.25) has higher EV ({wide_ev:+.3f} vs {cur_ev:+.3f}) — "
+            f"💡 WIDER T1 (×1.25) has higher EV ({wide_ev:+.3f} vs {cur_ev:+.3f}) — "
             f"current T1 multipliers are leaving money on the table. Consider increasing by ~15–20%."
         )
     else:
@@ -15767,7 +15921,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"🔬 PARAM CALIBRATION — {exchange} | {symbol}\n"
-        f"━━���━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Historical window: {days_covered:.0f} days | {candles_4h} bars\n"
         f"Sim: signals fired at each bar, outcome resolved within 18×4H candles\n\n"
 
@@ -15782,7 +15936,7 @@ async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         f"🛠 CALIBRATION RECOMMENDATIONS\n"
         f"{rec_block}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━��━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 /calibrate ETH — test on ETHUSDT\n"
         f"💡 /calibrate SOL BINANCE — test specific exchange\n"
         f"💡 /backtest — check live signal outcomes from DB"
@@ -15829,7 +15983,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trade = (
         "\n💼  T R A D E  M A N A G E R\n"
-        "━━━━━━━━━━━━━━━━━━━���━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "/pick                  Track a trade with auto-reminders\n"
         "/stoptrade             Stop tracking your current trade\n"
         "/check BTC LONG 98000 95000\n"
@@ -15839,7 +15993,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     analytics = (
         "\n📊  A N A L Y T I C S\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━��\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "/compare               All signals vs current prices\n"
         "/compare BTC           One pair — signal vs current price\n"
         "/stats 168             Win rate stats  (24 / 168 / 720 hrs)\n"
@@ -15876,7 +16030,7 @@ async def manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ────────────────��────────────────────────────
+# ──────────────────────────────────────────────
 # /scalp — Scalp signal scanner (15m + 1h TFs)
 # ─────────────────────────────────────────────
 async def scalp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15905,7 +16059,7 @@ async def scalp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{scan_desc}\n"
         f"📡 Checking MEXC perpetuals\n"
-        f"��� Please wait ~60 seconds..."
+        f"⏳ Please wait ~60 seconds..."
     )
 
     loop    = asyncio.get_event_loop()
@@ -15942,9 +16096,9 @@ async def scalp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ SCALP SCAN COMPLETE\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━���━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 {len(deduped)} signals  🟢 {longs}L  🔴 {shorts}S\n"
-        f"�� 15M: {tf_15}   1H: {tf_1h}\n\n"
+        f"📊 15M: {tf_15}   1H: {tf_1h}\n\n"
         f"⚠️ Scalp signals carry higher risk — shorter holds,\n"
         f"   tighter SLs, and smaller position sizes recommended.\n\n"
         f"Showing top {min(15, len(deduped))}:"
@@ -15957,7 +16111,7 @@ async def scalp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # /swing — Swing signal scanner (4h + 1d TFs)
-# ─────────────────��───────────────────────────
+# ──────────────────────────────────────────────
 async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /swing          — Scan top 30 pairs on 4h and 1d for swing signals.
@@ -16039,10 +16193,10 @@ async def swing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──���──────��───────────────────────────────────
+# ──────────────────────────────────────────────────
 # /check PAIR DIR ENTRY SL — Validate open trade
 # Example: /check BTCUSDT LONG 98000 95000
-# ──────────────────────────���──────────────────
+# ───────────────────────────────────────────────
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /check PAIR DIR ENTRY SL
@@ -16148,7 +16302,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if verdict == "✅ STILL VALID":
                 verdict = "⚠️ WEAKENING"
         elif direction == 'SHORT' and rsi < 28:
-            notes.append(f"��� RSI oversold ({rsi:.1f}) — consider taking partial profits")
+            notes.append(f"📉 RSI oversold ({rsi:.1f}) — consider taking partial profits")
             if verdict == "✅ STILL VALID":
                 verdict = "⚠️ WEAKENING"
     else:
@@ -16158,7 +16312,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sl_pct_str = f"{abs(pct_from_sl):.2f}% from SL"
 
     msg = (
-        f"��� TRADE CHECK — {symbol} {direction}\n"
+        f"🔍 TRADE CHECK — {symbol} {direction}\n"
         f"{'━'*30}\n"
         f"Entry:        ${entry_price:,.4f}\n"
         f"Stop Loss:    ${stop_loss:,.4f}\n"
@@ -16177,7 +16331,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # /confirm PAIR — Re-validate a signal on demand
 # Example: /confirm BTC
-# ─────────────────���────────────────────────���──
+# ─────────────────────────────────────────────────
 async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /confirm PAIR — Re-runs full analysis and compares to last stored signal.
@@ -16285,7 +16439,7 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ───────────────────────────────────���─────────
+# ───────────────────────────────────────────────
 # /optimize — Hyperopt parameter search (admin)
 # ─────────────────────────────────────────────
 async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -16328,7 +16482,7 @@ async def optimize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Optimization failed: {e}")
 
 
-# ──────────────────────────────��──────────────
+# ──────────────────────────────────────────────
 # /xgtrain — Retrain XGBoost signal classifier
 # Admin only. Uses outcomes already in sakz_data.db.
 # ─────────────────────────────────────────────
@@ -16379,7 +16533,7 @@ async def xgtrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # /rftrain — Retrain Random Forest signal classifier
 # Admin only. Mirrors /xgtrain.
-# ────────────��───────────────────────────���────
+# ────────────────────────────────────────────────
 async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Retrain the Random Forest win-probability model from historical outcomes."""
     _track(update)
@@ -16395,7 +16549,7 @@ async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "��� Starting Random Forest training...\n"
+        "🌲 Starting Random Forest training...\n"
         "Reads signal outcomes from DB and trains a win-probability model.\n"
         "Usually completes in 10–30 seconds."
     )
@@ -16424,7 +16578,7 @@ async def rftrain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ RF training failed: {e}")
 
 
-# ──────────────────────────���──────────────────
+# ───────────────────────────────────────────────
 # /btfull — Historical Walk-Forward Backtest
 # Requires sakz_backtest_hist.py in the same directory.
 # ─────────────────────────────────────────────
@@ -16487,6 +16641,7 @@ async def paper_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             return _get_live_price(symbol, exchange) or None
         except Exception:
+            logger.debug("suppressed exception in _price", exc_info=True)
             return None
 
     try:
@@ -16525,7 +16680,7 @@ async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text("📋 No closed paper positions yet.")
             return
-        lines = ["📋 *Paper Trading ��� Last 20 Closed*", ""]
+        lines = ["📋 *Paper Trading — Last 20 Closed*", ""]
         for r in rows:
             oc_e = '✅' if r.get('outcome') not in ('SL', 'EXPIRED') else '❌'
             lines.append(
@@ -16645,12 +16800,12 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────���────────────────────��──────────
+# ────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-# ────────────────────────────────────────────────────────────────────────���─────────
+# ────────────────────────────────────────────────────────────────────────────────────
 # AUTO-REFRESH ENGINE  (FIX #AUTOREFRESH)
-# ────────────────────────���─────────────���──────��────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────────────
 # Every card that carries a 🔄 Refresh button also refreshes itself on a fixed
 # cadence (default 30s) — WITHOUT removing the manual button (users can still
 # tap it whenever they want).
@@ -16661,7 +16816,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   real button press. The shim:
 #     • routes edit_message_text/caption/reply_markup to bot.edit_* on the
 #       stored (chat_id, message_id), so the card refreshes IN PLACE;
-#     ���� makes query.answer(...) and message.reply_*(...) no-ops, so a scheduled
+#     — makes query.answer(...) and message.reply_*(...) no-ops, so a scheduled
 #       refresh never pops a toast or posts a brand-new message (no spam);
 #     • cancels its own timer if the card was deleted or the bot was blocked.
 #
@@ -16714,7 +16869,7 @@ def _autorefresh_pause(query):
         m = query.message
         _autorefresh_paused.add((m.chat_id, m.message_id))
     except Exception:
-        pass
+        logger.debug("suppressed exception in _autorefresh_pause", exc_info=True)
 
 
 def _autorefresh_resume(query):
@@ -16723,7 +16878,7 @@ def _autorefresh_resume(query):
         m = query.message
         _autorefresh_paused.discard((m.chat_id, m.message_id))
     except Exception:
-        pass
+        logger.debug("suppressed exception in _autorefresh_resume", exc_info=True)
 
 
 class _HeadlessMessage:
@@ -16899,6 +17054,47 @@ def _install_auto_refresh(app):
                 AUTO_REFRESH_SECS, AUTO_REFRESH_MAX_CYCLES, AUTO_REFRESH_MAX_JOBS)
 
 
+async def halt_command(update, context):
+    """/halt - admin: engage the global kill switch (stops all new orders)."""
+    chat_id = update.effective_chat.id
+    if not db_admin_is_authed(chat_id) and not (ADMIN_IDS and chat_id in ADMIN_IDS):
+        await update.message.reply_text("\U0001F512 Admins only. Authenticate first.")
+        return
+    if not _ORDERS_AVAILABLE:
+        await update.message.reply_text("Execution module not available.")
+        return
+    reason = " ".join(getattr(context, "args", []) or []) or "manual /halt"
+    orders_set_kill_switch(db_connect, True, reason)
+    await update.message.reply_text(
+        "\U0001F6D1 Trading HALTED. No new orders will be placed.\nReason: " + reason
+        + "\nUse /resume to re-enable.")
+
+
+async def resume_command(update, context):
+    """/resume - admin: release the global kill switch."""
+    chat_id = update.effective_chat.id
+    if not db_admin_is_authed(chat_id) and not (ADMIN_IDS and chat_id in ADMIN_IDS):
+        await update.message.reply_text("\U0001F512 Admins only. Authenticate first.")
+        return
+    if not _ORDERS_AVAILABLE:
+        await update.message.reply_text("Execution module not available.")
+        return
+    orders_set_kill_switch(db_connect, False, "")
+    await update.message.reply_text("\u2705 Trading RESUMED. Kill switch released.")
+
+
+async def orders_command(update, context):
+    """/orders - admin: show kill-switch state, open exposure, today PnL."""
+    chat_id = update.effective_chat.id
+    if not db_admin_is_authed(chat_id) and not (ADMIN_IDS and chat_id in ADMIN_IDS):
+        await update.message.reply_text("\U0001F512 Admins only. Authenticate first.")
+        return
+    if not _ORDERS_AVAILABLE:
+        await update.message.reply_text("Execution module not available.")
+        return
+    await update.message.reply_text(orders_status_text(db_connect))
+
+
 def main():
 
 
@@ -16932,10 +17128,13 @@ def main():
 
     _load_best_params()   # load calibrated params from best_params.json if present
 
-    # AUTO PAPER TRADING ��� initialise paper DB tables if module is available
+    # AUTO PAPER TRADING — initialise paper DB tables if module is available
     if _PAPER_AVAILABLE:
         paper_init_db(db_connect)
         logger.info("Paper trading DB tables ready")
+    if _ORDERS_AVAILABLE:
+        orders_init_db(db_connect)
+        logger.info("Execution/orders DB tables ready")
     restored, ts = db_load_last_scan()
     if restored:
         state.last_scan_results = restored
@@ -17166,6 +17365,10 @@ def main():
     app.add_handler(CommandHandler("prime", prime_command))
     # Unlisted autoscan diagnostic — explains why autoscan is/ isn't pushing
     app.add_handler(CommandHandler("autoscandiag", autoscandiag_command))
+    if _ORDERS_AVAILABLE:
+        app.add_handler(CommandHandler("halt", halt_command))
+        app.add_handler(CommandHandler("resume", resume_command))
+        app.add_handler(CommandHandler("orders", orders_command))
     # 15-minute live cache refresh of the ranked Top picks
     app.job_queue.run_repeating(
         prime_refresh_job,
@@ -17230,6 +17433,7 @@ def main():
     app.add_handler(CommandHandler("tg",         tg_command))
     app.add_handler(CommandHandler("tl",         tl_command))
     app.add_handler(CommandHandler("stats",      stats_command))
+    app.add_handler(CommandHandler("holdstats",  holdstats_command))  # FIX #8: time-to-target stats
     app.add_handler(CommandHandler("backtest",   backtest_command))
     app.add_handler(CommandHandler("alert",      alert_command))
     app.add_handler(CommandHandler("unalert",    unalert_command))
@@ -17292,7 +17496,7 @@ def main():
     app.add_handler(CallbackQueryHandler(compare_refresh_callback,         pattern=r'^cmp_refresh\|'))
     app.add_handler(CallbackQueryHandler(compare_full_refresh_callback,    pattern=r'^cmp_full_refresh\|'))
     app.add_handler(CallbackQueryHandler(fgi_refresh_callback,             pattern=r'^fgi_refresh'))
-    # �� SNAIL callbacks — handles activate/status/report/stop buttons
+    # • SNAIL callbacks — handles activate/status/report/stop buttons
     app.add_handler(CallbackQueryHandler(snail_callback_handler,    pattern=r'^snail_'))
     # 📋 MENU interactive button callbacks
     app.add_handler(CallbackQueryHandler(menu_callback_handler,     pattern=r'^menu\|'))

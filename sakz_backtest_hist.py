@@ -76,6 +76,27 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------
+# STATISTICAL VALIDATION LAYER - sakz_validation (backtest-only, no live impact)
+# Adds walk-forward, regime-split and Monte-Carlo edge testing to /btfull.
+# Toggle live via env ENABLE_VALIDATION_REPORT=0 (default on).
+# ---------------------------------------------
+try:
+    import os as _os_val
+    ENABLE_VALIDATION_REPORT = _os_val.getenv('ENABLE_VALIDATION_REPORT', '1') not in ('0', 'false', 'False')
+except Exception:
+    ENABLE_VALIDATION_REPORT = True
+try:
+    from sakz_validation import (
+        walk_forward_splits,
+        regime_split_report,
+        max_drawdown,
+        monte_carlo_edge_test,
+    )
+    _VALIDATION_AVAILABLE = True
+except Exception:
+    _VALIDATION_AVAILABLE = False
+
 # ── Config ────────────────────────────────────────────────────────────────────
 FEE_PCT        = 0.00075   # 0.075% per side (standard taker perp fee)
 MIN_BARS       = 120       # minimum history bars needed before first test
@@ -248,6 +269,7 @@ def run_hist_backtest(
             'exit':    round(exit_px, 6),
             'rr':      round(rr, 3),
             'pnl_pct': round(net_pct * 100, 4),
+            'btc_regime': sig.get('btc_regime', 'UNKNOWN'),
         })
 
         # Skip bars consumed by the trade to avoid overlapping signals
@@ -374,7 +396,51 @@ def _aggregate(trades: list, equity: float, max_dd: float,
     # Expectancy per trade (% terms)
     expectancy = float(np.mean(pnls))
 
+    # -- STATISTICAL VALIDATION (sakz_validation) --------------------------
+    validation = None
+    if ENABLE_VALIDATION_REPORT and _VALIDATION_AVAILABLE:
+        try:
+            _omap = {'T1': 't1_hit', 'T2': 't2_hit', 'T3': 't3_hit',
+                     'SL': 'sl_hit', 'TIMEOUT': 'timeout'}
+            _vtrades = [dict(t, outcome=_omap.get(t['outcome'], t['outcome']),
+                             pnl=t['pnl_pct']) for t in trades]
+            _eq_curve = []
+            _eq = 1.0
+            for _t in trades:
+                _eq *= (1.0 + _t['pnl_pct'] / 100.0)
+                _eq_curve.append(_eq)
+            _mc = monte_carlo_edge_test([_t['pnl_pct'] for _t in trades])
+            _regime = regime_split_report(_vtrades, regime_key='btc_regime',
+                                          outcome_key='outcome', pnl_key='pnl')
+            _fold_count = min(4, len(trades))
+            _wf = []
+            if _fold_count >= 2:
+                _per = max(1, len(trades) // _fold_count)
+                _fold_trades = []
+                for _fi in range(_fold_count):
+                    _seg = (trades[_fi * _per:(_fi + 1) * _per]
+                            if _fi < _fold_count - 1 else trades[_fi * _per:])
+                    _fold_trades.append(_seg)
+                for (_train, _test) in walk_forward_splits(list(range(_fold_count)),
+                                                           train_span=1, test_span=1):
+                    _seg = _fold_trades[_test[0]]
+                    if _seg:
+                        _w = sum(1 for _t in _seg if _t['outcome'] != 'SL')
+                        _wf.append({'fold': _test[0] + 1, 'trades': len(_seg),
+                                    'win_rate': round(_w / len(_seg) * 100, 1),
+                                    'pnl': round(sum(_t['pnl_pct'] for _t in _seg), 2)})
+            validation = {
+                'monte_carlo':  _mc,
+                'regime_split': _regime,
+                'walk_forward': _wf,
+                'val_max_dd':   round(max_drawdown(_eq_curve) * 100, 2),
+            }
+        except Exception as _val_e:
+            logger.debug("validation block error: %s", _val_e)
+            validation = None
+
     return {
+        'validation': validation,
         'symbol':     symbol,
         'exchange':   exchange,
         'tf':         tf,
@@ -411,7 +477,7 @@ def _empty(symbol, exchange, tf, error) -> dict:
         'total_pnl': 0, 'max_dd': 0, 'sharpe': 0,
         'best_trade': 0, 'worst_trade': 0,
         'total_bars': 0, 'min_conf': 0, 'fee_pct': 0,
-        'all_trades': [], 'error': error,
+        'all_trades': [], 'error': error, 'validation': None,
     }
 
 
@@ -472,4 +538,32 @@ def format_hist_result(r: dict) -> str:
         f"⚠️ Fees deducted: {r['fee_pct']*200:.2f}% round-trip · No slippage model",
         f"📌 This replays score\\_pair() on historical bars — comparable to /stats",
     ]
+    _val = r.get('validation')
+    if _val:
+        _mc = _val.get('monte_carlo', {})
+        _edge = 'OK' if _mc.get('has_edge') else 'WARN'
+        lines += ["", "*Statistical Validation*"]
+        lines.append(
+            f"  [{_edge}] Monte Carlo edge: p={_mc.get('p_value', 1.0):.3f} "
+            f"({'real edge' if _mc.get('has_edge') else 'could be luck'} - "
+            f"{_mc.get('n_iter', 0):,} sims)"
+        )
+        lines.append(f"  Validated max DD: {_val.get('val_max_dd', 0):.2f}%")
+        _rs = _val.get('regime_split', {})
+        if _rs:
+            lines.append("  By BTC regime:")
+            for _rg, _st in _rs.items():
+                lines.append(
+                    f"     {_rg}: {_st['trades']}t - "
+                    f"{_st['win_rate'] * 100:.0f}% win - {_st['total_pnl']:+.2f}%"
+                )
+        _wf = _val.get('walk_forward', [])
+        if _wf:
+            lines.append("  Walk-forward folds (out-of-sample):")
+            for _f in _wf:
+                lines.append(
+                    f"     Fold {_f['fold']}: {_f['trades']}t - "
+                    f"{_f['win_rate']:.0f}% win - {_f['pnl']:+.2f}%"
+                )
+
     return "\n".join(lines)

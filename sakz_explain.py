@@ -15,8 +15,8 @@ BUCKET_LABELS = [
     ("mtf_g", "MTF"),
     ("cross_g", "MACD"),
     ("pos_g", "EMA"),
-    ("vg", "Vol"),
-    ("ig", "Struct"),
+    ("vg", "Struct"),
+    ("ig", "Indep"),
 ]
 
 REGIME_EMOJI = {

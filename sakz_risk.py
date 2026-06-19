@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 WIN_OUTCOMES = ("t1_hit", "t2_hit", "t3_hit")

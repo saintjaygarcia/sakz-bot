@@ -56,7 +56,7 @@ All three sources are genuinely uncorrelated:
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +510,6 @@ STEP 4: Display in format_signal() (optional but recommended)
 
 if __name__ == "__main__":
     # Quick smoke-test — does not require a running bot
-    import sys
     import numpy as np
 
     print(CONVICTION_DISPLAY)
